@@ -430,10 +430,14 @@ Backend: **http://localhost:8000**
 
 ```bash
 cd frontend
-npm run dev          # or: yarn dev
+npm run dev          # or: yarn dev  (needs Yarn 4 - see Troubleshooting)
 ```
 
 Frontend: **http://localhost:3000**
+
+> Or just run `./start.sh` (Linux/macOS) or `start_windows.bat` (Windows). Both launch all three
+> services, wait for their ports to bind, and print the tail of `logs/backend.log` and
+> `logs/frontend.log` if anything fails to start.
 
 > The dev server port is pinned to **3000** in `frontend/vite.config.js`, which proxies `/api` to `http://localhost:8000`. If you see `5173`, that is Vite's automatic port fallback after 3000 was already taken — free the port rather than following the fallback link.
 
@@ -710,6 +714,36 @@ curl http://localhost:11434/api/tags        # Linux / macOS
 ```
 
 Start `ollama serve` first, then retry. Generation is unavailable until the service responds.
+
+---
+
+### `yarn dev` fails with `'vite' is not recognized`
+
+The frontend scripts are normally run through Yarn 4 (`frontend/.yarnrc.yml` sets
+`yarnPath` and `packageManager`). The **global Yarn 1.x shim on Windows ignores both**, so
+`yarn dev` cannot find the `vite` binary:
+
+```
+'vite' is not recognized as an internal or external command
+command not found: vite
+```
+
+This is a Yarn version problem, not a missing dependency — `frontend/node_modules/.bin/vite.cmd`
+exists. Fixes, in order of preference:
+
+```cmd
+:: Option 1 - enable the bundled Yarn 4 via corepack (matches the committed yarn.lock)
+corepack enable
+yarn --version        REM should print 4.x
+cd frontend && yarn dev
+
+:: Option 2 - use npm instead
+cd frontend && npm install && npm run dev
+```
+
+`start_windows.bat` and `start.sh` do **not** depend on either package manager: they invoke
+`frontend/node_modules/.bin/vite` directly, so the launcher works regardless of which one you
+have installed.
 
 ---
 

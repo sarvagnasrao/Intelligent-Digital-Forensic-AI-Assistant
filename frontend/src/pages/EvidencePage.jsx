@@ -17,7 +17,7 @@ import {
   getEvidence, uploadEvidence,
   getEvidenceItem, archiveEvidence,
   verifyEvidence,
-  getSystemInfo, addToQueue, estimateTime,
+  addToQueue, estimateTime,
   getStorageStats,
   getQueue, getQueueHistory, cancelJob,
   forceStartJob, stopJob, updateJobSettings
@@ -25,6 +25,7 @@ import {
 import Badge from "../components/Badge"
 import ConfirmDialog from "../components/ConfirmDialog"
 import PageLayout from "../components/PageLayout"
+import ResourceMonitor from "../components/ResourceMonitor"
 import toast from "react-hot-toast"
 import { formatDistanceToNow } from "date-fns"
 import { fromUtc } from '../utils/time'
@@ -509,7 +510,6 @@ export default function EvidencePage() {
   const pollRef = useRef({})
 
   // Queue state
-  const [sysInfo, setSysInfo] = useState(null)
   const [queuingEv, setQueuingEv] = useState(null)
   const [estimates, setEstimates] = useState({})
   const [addingToQueue, setAddingToQueue] = useState({})
@@ -645,7 +645,10 @@ export default function EvidencePage() {
   }, []))
 
   const loadAll = async () => {
-    await Promise.all([loadQueue(), loadHistory(), loadSysInfo()])
+    // Hardware telemetry is fetched by <ResourceMonitor />, which owns its
+    // own polling and respects the Preferences toggle. This only covers the
+    // queue data the page itself renders.
+    await Promise.all([loadQueue(), loadHistory()])
   }
 
   const loadQueue = async () => {
@@ -662,13 +665,6 @@ export default function EvidencePage() {
       setHistory(Array.isArray(res.data) ? res.data : [])
     } catch {}
     finally { setLoadingHistory(false) }
-  }
-
-  const loadSysInfo = async () => {
-    try {
-      const res = await getSystemInfo()
-      setSysInfo(res.data)
-    } catch {}
   }
 
   const handleCancel = async (jobId) => {
@@ -727,13 +723,8 @@ export default function EvidencePage() {
     }
   }
 
-  const ramColor = !sysInfo ? 'text-ink-2'
-    : sysInfo.system.available_ram_mb < 2048 ? 'text-danger'
-    : sysInfo.system.available_ram_mb < 3072 ? 'text-warning'
-    : 'text-success'
-
-
   useEffect(() => { loadAll(); const qPoll = setInterval(loadAll, 10000); return () => clearInterval(qPoll); }, [caseId])
+
   return (
     <PageLayout
       title="Evidence & Ingestion"
@@ -745,30 +736,11 @@ export default function EvidencePage() {
         {/* MAIN CONTENT AREA: RESOURCES, UPLOAD, EVIDENCE */}
         <div className="xl:col-span-8 space-y-8">
           
-          {/* 1. System Resources (Top) */}
-          {sysInfo && (
-            <div className="bg-surface-1 border border-line rounded-xl p-5 shadow-sm flex flex-col justify-center">
-              <div className="flex items-center justify-between mb-4">
-                 <h2 className="text-sm font-bold text-ink-0 flex items-center gap-2"><Cpu size={16} className="text-accent" /> System Resources</h2>
-                 <div className="flex items-center gap-2">
-                   <button onClick={loadAll} className="text-[10px] flex items-center gap-1 font-mono text-ink-2 hover:text-accent transition-colors uppercase tracking-widest bg-surface-3 px-2 py-1 rounded cursor-pointer">
-                     <RefreshCw size={10} /> Refresh
-                   </button>
-                 </div>
-              </div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div>
-                  <p className="text-xs text-ink-2 mb-1">Available RAM</p>
-                  <p className={`text-xl font-bold ${ramColor}`}>
-                    {(sysInfo.system.available_ram_mb / 1024).toFixed(1)} <span className="text-sm font-normal text-ink-2">GB</span>
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-ink-2 mb-1">CPU Usage</p>
-                  <p className="text-xl font-bold text-ink-0">
-                    {sysInfo.system.cpu_percent}% <span className="text-sm font-normal text-ink-2">({sysInfo.system.cpu_count} cores)</span>
-                  </p>
-                </div>
+          {/* 1. System Resources (Top) - hidden if opted out in Preferences.
+                 Shares the hardware spec with the Queue page. */}
+          <ResourceMonitor
+            extra={(
+              <div className="grid grid-cols-2 gap-4 border-t border-line mt-4 pt-4">
                 <div>
                   <p className="text-xs text-ink-2 mb-1">Pipeline Activity</p>
                   <p className="text-xl font-bold text-ink-0">
@@ -782,8 +754,8 @@ export default function EvidencePage() {
                   </p>
                 </div>
               </div>
-            </div>
-          )}
+            )}
+          />
 
           {/* 2. Upload Section (Middle) */}
           <div>

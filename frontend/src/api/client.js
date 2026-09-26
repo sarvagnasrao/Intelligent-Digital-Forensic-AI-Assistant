@@ -204,6 +204,11 @@ export const crossCaseSearch = (name) =>
 export const getSystemInfo = () =>
   api.get('/queue/system-info')
 
+// Force an immediate hardware/device re-scan (after plugging in an
+// evidence drive or an eGPU). Bypasses the short server-side cache.
+export const rescanSystemInfo = () =>
+  api.post('/queue/system-info/rescan')
+
 export const estimateTime = (evidenceIds, throttle) =>
   api.post('/queue/estimate', {
     evidence_ids: evidenceIds,

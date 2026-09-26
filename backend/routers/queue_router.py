@@ -11,6 +11,7 @@ from backend.modules.time_estimator import (
     estimate_queue_total)
 from backend.modules.resource_governor import (
     get_system_info, suggest_resource_budget)
+from backend.modules.hardware_probe import rescan_hardware
 from pydantic import BaseModel
 from typing import Optional
 import uuid
@@ -35,14 +36,43 @@ def get_system_info_endpoint(
     current_user = Depends(get_current_user)
 ):
     """
-    Returns current system hardware info
-    and suggested resource budget.
+    Returns the live hardware + device inventory of this machine
+    and the suggested resource budget.
+
+    The inventory is re-scanned whenever the set of attached devices
+    changes (see hardware_probe.DEFAULT_TTL_SECONDS), so hot-plugged
+    evidence drives and eGPUs show up without restarting the backend.
+    Use POST /queue/system-info/rescan to force an immediate re-walk.
     """
     info = get_system_info()
     budget = suggest_resource_budget(info["total_ram_mb"])
     return {
         "system": info,
+        # Same payload under a clearer name. The System Resource monitor
+        # (Evidence page and Queue page) reads this so both surfaces show
+        # an identical hardware description.
+        "hardware": info,
         "suggested_budget": budget
+    }
+
+@router.post("/system-info/rescan")
+def rescan_system_info_endpoint(
+    current_user = Depends(get_current_user)
+):
+    """
+    Forces an immediate full re-scan of the hardware and device
+    inventory, bypassing the short cache. Call this after attaching
+    evidence media or an external GPU.
+    """
+    info = rescan_hardware()
+    # Keep the legacy aliases the rest of the codebase expects.
+    info["cpu_count"] = info.get("cpu_count_logical") or 0
+    info["platform"] = info.get("platform_machine") or "unknown"
+    return {
+        "system": info,
+        "hardware": info,
+        "suggested_budget": suggest_resource_budget(info["total_ram_mb"]),
+        "rescanned": True
     }
 
 @router.post("/estimate")

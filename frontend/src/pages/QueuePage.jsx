@@ -5,6 +5,7 @@ import {
 } from 'lucide-react'
 import { getQueueList, deleteQueueJob, addToQueue } from '../api/client'
 import PageLayout from '../components/PageLayout'
+import ResourceMonitor from '../components/ResourceMonitor'
 import toast from 'react-hot-toast'
 import { formatDistanceToNow, intervalToDuration } from 'date-fns'
 import { fromUtc } from '../utils/time'
@@ -441,6 +442,29 @@ export default function QueuePage() {
           onClick={() => setFilter(f => f === 'failed' ? 'all' : 'failed')}
         />
       </div>
+
+      {/* Live hardware + device inventory. Same component the Evidence
+          page uses, so both surfaces agree, and hidden when the operator
+          turns system resource monitoring off in Settings > Preferences. */}
+      <ResourceMonitor
+        className="mb-5"
+        extra={(
+          <div className="grid grid-cols-3 gap-4 border-t border-line mt-4 pt-4">
+            <div>
+              <p className="text-xs text-ink-2 mb-1">Running</p>
+              <p className="text-xl font-bold text-ink-0">{running}</p>
+            </div>
+            <div>
+              <p className="text-xs text-ink-2 mb-1">Queued</p>
+              <p className="text-xl font-bold text-ink-0">{queued}</p>
+            </div>
+            <div>
+              <p className="text-xs text-ink-2 mb-1">Failed</p>
+              <p className="text-xl font-bold text-ink-0">{failed}</p>
+            </div>
+          </div>
+        )}
+      />
 
       {/* Table */}
       <div style={{

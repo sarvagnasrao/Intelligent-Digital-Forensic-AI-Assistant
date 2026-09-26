@@ -3,25 +3,25 @@ import time
 import os
 from typing import Optional
 
+from backend.modules.hardware_probe import get_hardware_spec
+
 def get_system_info() -> dict:
     """
     Auto-detects system hardware specs.
     Returns current and total resources.
-    """
-    mem = psutil.virtual_memory()
-    cpu_count = psutil.cpu_count(logical=True)
-    cpu_freq = psutil.cpu_freq()
 
-    return {
-        "total_ram_mb": int(mem.total / 1024 / 1024),
-        "available_ram_mb": int(mem.available / 1024 / 1024),
-        "used_ram_mb": int(mem.used / 1024 / 1024),
-        "ram_percent": mem.percent,
-        "cpu_count": cpu_count,
-        "cpu_percent": psutil.cpu_percent(interval=0.5),
-        "cpu_freq_mhz": int(cpu_freq.current) if cpu_freq else None,
-        "platform": os.uname().machine if hasattr(os, 'uname') else "unknown"
-    }
+    Delegates the detection itself to hardware_probe, then keeps the
+    original flat keys (cpu_count, platform, ...) that existing callers
+    still read, alongside the richer spec.
+    """
+    spec = get_hardware_spec()
+
+    # Backwards-compatible aliases for callers written before the richer
+    # spec existed. cpu_count in particular is read by the Evidence page.
+    spec["cpu_count"] = spec.get("cpu_count_logical") or 0
+    spec["platform"] = spec.get("platform_machine") or "unknown"
+
+    return spec
 
 def suggest_resource_budget(total_ram_mb: int) -> dict:
     """

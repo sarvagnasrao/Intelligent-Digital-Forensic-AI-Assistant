@@ -39,6 +39,7 @@ SEVERITY_MAP = {
     "INTEGRITY_FAILED":    "critical",
     "2FA_DISABLED":        "warning",
     "CONTRADICTION_ANALYSIS": "warning",
+    "FILE_INGEST_FAILED":  "error",
 }
 
 def write_audit(

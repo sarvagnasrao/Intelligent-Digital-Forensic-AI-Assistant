@@ -106,7 +106,7 @@ echo -e "${YELLOW}[5/8] NLP model...${NC}"
 if python3 -c "import spacy; spacy.load('en_core_web_lg')" 2>/dev/null; then
   echo -e "${GREEN}✓ en_core_web_lg already installed${NC}"
 else
-  python3 -m spacy download en_core_web_lg -q
+  pip install --no-index --find-links=vendor/python vendor/python/en_core_web_lg-3.7.1.tar.gz -q
   echo -e "${GREEN}✓ en_core_web_lg downloaded${NC}"
 fi
 
@@ -125,7 +125,7 @@ echo -e "${GREEN}✓ Migrations complete${NC}"
 # ── 8. Frontend packages ──────────────────────────────────────────────────────
 echo ""
 echo -e "${YELLOW}[8/8] Frontend packages...${NC}"
-cd frontend && npm install --silent && cd ..
+cd frontend && yarn install --silent && cd ..
 echo -e "${GREEN}✓ Frontend packages installed${NC}"
 
 # ── Pull Ollama models ────────────────────────────────────────────────────────

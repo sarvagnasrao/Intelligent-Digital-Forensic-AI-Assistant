@@ -4,7 +4,8 @@ from backend.modules.vector_store import store_chunks
 from backend.modules.graph_builder import build_graph
 from backend.modules.forensic_ingestion import (
     ingest_e01, ingest_raw,
-    extract_file_content, compute_sha256)
+    extract_file_content, compute_sha256,
+    detect_image_format, inspect_raw_image)
 from backend.modules.resource_governor import ResourceGovernor
 from backend.database import SessionLocal
 from backend import models
@@ -457,16 +458,37 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
         db.commit()
         print(f"[FORENSIC] SHA-256: {image_hash[:16]}...")
 
-        # Determine image type
+        # Determine image type.
+        # Extension is NOT trusted - '.001' is the split-EWF
+        # segment extension but is often a plain raw image,
+        # and routing by extension sends real EWF sets to
+        # pytsk3, which cannot read EWF-compressed segments.
+        # The container is sniffed from the file header.
         ext = os.path.splitext(filename.lower())[1]
+        container = detect_image_format(file_path)
+        print(f"[FORENSIC] Extension '{ext}' -> "
+              f"detected container '{container}'")
 
         # Step 2: Create temp directory for intermediate files
         temp_dir = tempfile.mkdtemp(prefix="cfi_forensic_")
 
         _update_job_progress(job_id, 5, "Step 2: Mounting image")
         print(f"[FORENSIC] Mounting image...")
+
+        # Pre-flight the raw layout so a partial copy is
+        # reported up-front instead of silently yielding 0.
+        truncation_warning = None
+        if container == "raw":
+            report = inspect_raw_image(file_path)
+            if report["summary"]:
+                print(f"[FORENSIC] Layout: {report['summary']}")
+            if report["truncated"]:
+                truncation_warning = report["summary"]
+                evidence.notes = truncation_warning
+                db.commit()
+
         try:
-            if ext == '.e01':
+            if container == "ewf":
                 file_generator = ingest_e01(
                     file_path, temp_dir,
                     include_deleted=include_deleted)
@@ -720,6 +742,46 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                 print(f"[FORENSIC] Credential scan error: {cred_err2}")
 
             # Step 7: Update Evidence record
+            #
+            # A truncated image that yielded nothing is NOT a success.
+            # Marking it 'Indexed' tells the investigator their evidence
+            # was processed when in fact not a single file was recovered.
+            if artifact_count == 0 and truncation_warning:
+                evidence.status = "Failed"
+                evidence.error_message = truncation_warning
+                evidence.chunk_count = 0
+                evidence.entity_count = 0
+                db.commit()
+
+                _create_audit_log(
+                    db, case_id, "FILE_INGEST_FAILED",
+                    {
+                        "filename": filename,
+                        "type": "forensic_image",
+                        "reason": "truncated_image",
+                        "detail": truncation_warning,
+                        "artifacts_extracted": 0,
+                    }
+                )
+                db.commit()
+
+                if job_id:
+                    db2 = SessionLocal()
+                    try:
+                        j = db2.query(models.IngestionJob).filter(
+                            models.IngestionJob.id == job_id).first()
+                        if j:
+                            j.status = "Failed"
+                            j.error_message = truncation_warning
+                            j.current_step = (
+                                "Failed — image is truncated, "
+                                "0 files recoverable")
+                            db2.commit()
+                    finally:
+                        db2.close()
+
+                raise RuntimeError(truncation_warning)
+
             evidence.status = "Indexed"
             evidence.chunk_count = total_chunks
             evidence.entity_count = total_entities

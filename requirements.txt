@@ -4,22 +4,23 @@ sqlalchemy==2.0.30
 pydantic==2.13.4
 pydantic-settings==2.15.0
 python-dotenv==1.0.1
-python-multipart==0.0.9
+python-multipart==0.9.9
 aiofiles==23.2.1
 qdrant-client==1.9.1
-sentence-transformers==2.7.0
 spacy==3.7.4
 pdfminer.six==20221105
 networkx==3.3
 rapidfuzz==3.9.3
-torch==2.3.0
-einops
+# NOTE: torch / sentence-transformers are intentionally ABSENT.
+# Embeddings are served by Ollama (see backend/modules/ollama_client.py).
+# Commit 0be7d9a removed them to stop PyTorch OOM crashes on this
+# hardware. Do not re-add without reading AGENTS.md section 6 (B4).
 # --- Forensic disk image support ---
-# pyewf and pytsk3 are C extensions requiring
-# libewf and TSK (The Sleuth Kit) system libraries.
-# Install system deps first:
+# pyewf and pytsk3 are C extensions requiring libewf and
+# TSK (The Sleuth Kit) system libraries. On Debian/Ubuntu:
+#   sudo apt install libewf-dev ewf-tools sleuthkit
+# On macOS:
 #   brew install libewf sleuthkit
-# Then: pip install libewf-python pytsk3
 libewf-python
 pytsk3
 exifread==3.0.0
@@ -32,7 +33,6 @@ pytesseract==0.3.10
 python-docx==1.1.0
 openpyxl==3.1.2
 python-pptx==0.6.23
-openai-whisper==20231117
 ffmpeg-python==0.2.0
 extract-msg==0.48.0
 slowapi==0.1.9
@@ -42,3 +42,4 @@ qrcode==7.4.2
 Pillow==10.3.0
 psutil==7.2.2
 websockets==17.0.1
+openai-whisper==20231117

@@ -8,7 +8,7 @@ echo Starting Backend...
 start "Backend" cmd /c "set PYTHONPATH=. && .\venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port 8000"
 
 echo Starting Frontend...
-start "Frontend" cmd /c "cd frontend && npm run dev"
+start "Frontend" cmd /c "cd frontend && yarn dev"
 
 echo.
 echo All services have been started in separate windows!

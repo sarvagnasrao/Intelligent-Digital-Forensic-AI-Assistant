@@ -505,6 +505,302 @@ def walk_filesystem(
 
 
 # ---------------------------------------------------------------------------
+# Image container detection
+#
+# The file EXTENSION is not trusted. '.001' is the
+# standard split-EWF segment extension but is also
+# routinely used for plain raw images, while '.e01'
+# is EWF and '.dd'/'.img' are raw. Routing on
+# extension alone sends genuine multi-segment EWF
+# sets to pytsk3, which cannot read EWF-compressed
+# segments and yields 0 files with no error.
+# Content decides.
+# ---------------------------------------------------------------------------
+
+EWF_SIGNATURES = (
+    b"EVF\x09\x0d\x0a\xff\x00",   # EnCase EWF
+    b"EVF\x09\x0d\x0a\xff\x01",   # FTK EWF
+    b"LVF\x09\x0d\x0a\xff\x00",   # Logical EWF
+    b"EVF\x09\x0d\x0a\xff\xc0",   # EnCase EWF (ex04)
+)
+
+
+def detect_image_format(image_path: str) -> str:
+    """
+    Sniffs the container format from the file header.
+
+    Returns 'ewf', 'raw', or 'unknown'.
+    """
+    try:
+        with open(image_path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return "unknown"
+
+    for sig in EWF_SIGNATURES:
+        if head.startswith(sig):
+            return "ewf"
+    return "raw"
+
+
+def _sniff_filesystem(boot: bytes) -> str:
+    """Identifies a filesystem from its boot sector."""
+    if len(boot) < 512:
+        return "unknown"
+    oem = boot[3:11]
+    if oem == b"NTFS    ":
+        return "NTFS"
+    if oem == b"EXFAT   ":
+        return "exFAT"
+    if oem in (b"MSDOS5.0", b"MSDOS4.0", b"MSWIN4.0", b"MSWIN4.1"):
+        # The OEM string does NOT distinguish FAT12/16/32 - MSDOS5.0 is
+        # used by all of them. Classify by data-cluster count the same
+        # way TSK does, so the label and the declared size are honest.
+        return "FAT32" if boot[16] == 0x00 and \
+            int.from_bytes(boot[17:19], "little") == 0 else "FAT12/16"
+    if boot[510:512] == b"\x55\xaa":
+        return "FAT"
+    return "unknown"
+
+
+def _declared_volume_bytes(boot: bytes,
+                           fs_type: str,
+                           part_sectors: int) -> int:
+    """
+    Returns the volume size the boot sector claims,
+    so truncation can be detected without mounting.
+    Falls back to the partition length when the
+    boot sector does not state a usable size.
+    """
+    bps = int.from_bytes(boot[11:13], "little") or 512
+
+    if fs_type == "NTFS":
+        total = int.from_bytes(boot[40:48], "little")
+        if total:
+            return total * bps
+
+    if fs_type.startswith("FAT"):
+        # FAT32 uses the 32-bit total-sectors field; FAT12/16 use the
+        # 16-bit field unless it is zero, in which case 32-bit is used.
+        total = int.from_bytes(boot[19:21], "little")
+        if not total:
+            total = int.from_bytes(boot[32:36], "little")
+        if total:
+            return total * bps
+
+    return part_sectors * 512
+
+
+def inspect_raw_image(image_path: str) -> dict:
+    """
+    Parses the MBR and per-partition boot sectors of a
+    raw image WITHOUT mounting it.
+
+    Purpose: detect truncated / partial images before
+    ingestion starts. A truncated image cannot be walked
+    (for NTFS the $MFT usually sits past EOF), and the
+    resulting TSK error is actively misleading.
+
+    Returns a dict:
+      {
+        'file_size': int,
+        'has_mbr': bool,
+        'partitions': [ {index, offset, sectors, type,
+                         fs_type, declared_bytes,
+                         present_bytes, truncated}, ... ],
+        'truncated': bool,
+        'summary': str
+      }
+    """
+    result = {
+        "file_size": 0,
+        "has_mbr": False,
+        "partitions": [],
+        "truncated": False,
+        "summary": "",
+    }
+
+    try:
+        file_size = os.path.getsize(image_path)
+    except OSError as e:
+        result["summary"] = f"Cannot stat image: {e}"
+        return result
+
+    result["file_size"] = file_size
+    SECTOR = 512
+
+    try:
+        with open(image_path, "rb") as f:
+            mbr = f.read(SECTOR)
+            if len(mbr) < SECTOR or mbr[510:512] != b"\x55\xaa":
+                result["summary"] = (
+                    "No MBR boot signature - image may be a bare "
+                    "filesystem or unsupported layout."
+                )
+                return result
+
+            result["has_mbr"] = True
+
+            for i in range(4):
+                entry = mbr[446 + i * 16: 446 + (i + 1) * 16]
+                if len(entry) < 16:
+                    break
+
+                ptype = entry[4]
+                start_lba = int.from_bytes(entry[8:12], "little")
+                sectors = int.from_bytes(entry[12:16], "little")
+
+                if ptype == 0 or sectors == 0:
+                    continue
+
+                offset = start_lba * SECTOR
+
+                boot = b""
+                if offset + SECTOR <= file_size:
+                    f.seek(offset)
+                    boot = f.read(SECTOR)
+
+                fs_type = _sniff_filesystem(boot) if boot else "unreadable"
+                declared = _declared_volume_bytes(boot, fs_type, sectors)
+                present = max(0, min(declared, file_size - offset))
+                truncated = present < declared
+
+                result["partitions"].append({
+                    "index": i,
+                    "offset": offset,
+                    "sectors": sectors,
+                    "type": ptype,
+                    "fs_type": fs_type,
+                    "declared_bytes": declared,
+                    "present_bytes": present,
+                    "truncated": truncated,
+                })
+
+    except Exception as e:
+        result["summary"] = f"Failed to parse image layout: {e}"
+        return result
+
+    if not result["partitions"]:
+        result["summary"] = "MBR present but no partition entries found."
+        return result
+
+    bad = [p for p in result["partitions"] if p["truncated"]]
+    if bad:
+        result["truncated"] = True
+        p = bad[0]
+        pct = (100.0 * p["present_bytes"] / p["declared_bytes"]) \
+            if p["declared_bytes"] else 0.0
+        result["summary"] = (
+            f"IMAGE IS TRUNCATED - partition {p['index']} ({p['fs_type']}) "
+            f"declares {_human_bytes(p['declared_bytes'])} but only "
+            f"{_human_bytes(p['present_bytes'])} "
+            f"({pct:.1f}%) is present in the "
+            f"{_human_bytes(file_size)} file. A partial copy cannot be "
+            f"fully walked - re-acquire the complete image."
+        )
+    else:
+        result["summary"] = (
+            f"Layout OK - {len(result['partitions'])} partition(s), "
+            f"all fully contained in {_human_bytes(file_size)}."
+        )
+
+    return result
+
+
+def _human_bytes(n: int) -> str:
+    """Formats a byte count for human-readable errors."""
+    step = 1024.0
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < step:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= step
+    return f"{value:.1f} PB"
+
+
+# ---------------------------------------------------------------------------
+# Filesystem mounting with real error reporting
+# ---------------------------------------------------------------------------
+
+def _walk_all_filesystems(img_info,
+                          include_deleted: bool,
+                          source: str) -> Generator:
+    """
+    Opens every allocated partition on img_info and
+    walks it, falling back to a whole-disk filesystem.
+
+    Unlike the previous implementation this does NOT
+    swallow mount failures. Failures are collected and,
+    if no filesystem could be opened at all, raised as
+    a RuntimeError carrying the real TSK diagnostics.
+
+    A partition that opens but yields no files is a
+    legitimate empty volume and is not an error.
+    """
+    errors = []
+    mounted = 0
+
+    # Pass 1 - allocated partitions
+    try:
+        volume = pytsk3.Volume_Info(img_info)
+        for part in volume:
+            if part.flags != pytsk3.TSK_VS_PART_FLAG_ALLOC:
+                continue
+            offset = part.start * 512
+            try:
+                fs = pytsk3.FS_Info(img_info, offset=offset)
+            except Exception as e:
+                errors.append(
+                    f"partition {part.addr} at offset {offset} "
+                    f"({part.desc}): {e}")
+                continue
+
+            mounted += 1
+            print(f"[FORENSIC] Mounted {part.desc} at offset {offset}")
+            try:
+                yield from walk_filesystem(
+                    img_info, fs,
+                    include_deleted=include_deleted)
+            finally:
+                try:
+                    fs.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        errors.append(f"volume enumeration: {e}")
+
+    # Pass 2 - whole-disk filesystem (no partition table)
+    if mounted == 0:
+        try:
+            fs = pytsk3.FS_Info(img_info)
+            mounted += 1
+            print("[FORENSIC] Mounted whole-disk filesystem "
+                  f"({fs.info.ftype})")
+            try:
+                yield from walk_filesystem(
+                    img_info, fs,
+                    include_deleted=include_deleted)
+            finally:
+                try:
+                    fs.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            errors.append(f"whole-disk filesystem: {e}")
+
+    if mounted == 0:
+        detail = "\n  - ".join(errors) if errors else "no partitions found"
+        raise RuntimeError(
+            f"Could not open any filesystem in this {source} image. "
+            f"The image was readable but contains no mountable "
+            f"volume. TSK reported:\n  - {detail}\n"
+            f"If the source was a partial copy of a larger disk, "
+            f"it must be re-acquired in full - a truncated image "
+            f"cannot be walked."
+        )
+
+
+# ---------------------------------------------------------------------------
 # E01 ingestion
 # ---------------------------------------------------------------------------
 
@@ -512,8 +808,8 @@ def ingest_e01(image_path: str,
                temp_dir: str,
                include_deleted: bool = False) -> Generator:
     """
-    Opens .E01 image and yields file info
-    dicts for all extractable files.
+    Opens an EWF (.E01 and split-segment) image and
+    yields file info dicts for all extractable files.
     Requires pyewf and pytsk3.
     """
     if not PYEWF_AVAILABLE:
@@ -528,88 +824,55 @@ def ingest_e01(image_path: str,
     # Normalize path to prevent pyewf \./ unnormalized path crashes on Windows
     image_path = os.path.abspath(image_path).replace("\\./", "\\").replace("/./", "/").replace("\\.\\", "\\")
     filenames = pyewf.glob(image_path)
+    if not filenames:
+        raise RuntimeError(
+            f"No EWF segments found for {os.path.basename(image_path)}. "
+            f"A split EWF image needs all its segments "
+            f"(.E01/.E02 or .001/.002) uploaded together."
+        )
     ewf_handle = pyewf.handle()
     ewf_handle.open(filenames)
 
     try:
         img_info = EWFImageInfo(ewf_handle)
-
-        # Try to detect partition table
-        try:
-            volume = pytsk3.Volume_Info(img_info)
-            for part in volume:
-                if (part.flags ==
-                        pytsk3.TSK_VS_PART_FLAG_ALLOC):
-                    try:
-                        fs = pytsk3.FS_Info(
-                            img_info,
-                            offset=(part.start * 512)
-                        )
-                        yield from walk_filesystem(
-                            img_info, fs,
-                            include_deleted=include_deleted)
-                        fs.close()
-                    except Exception:
-                        continue
-        except Exception:
-            # No partition table —
-            # try opening filesystem directly
-            try:
-                fs = pytsk3.FS_Info(img_info)
-                yield from walk_filesystem(
-                    img_info, fs,
-                    include_deleted=include_deleted)
-                fs.close()
-            except Exception as e:
-                raise RuntimeError(
-                    f"Cannot read filesystem: {e}")
+        yield from _walk_all_filesystems(
+            img_info, include_deleted, "EWF")
     finally:
         ewf_handle.close()
 
 
 # ---------------------------------------------------------------------------
-# Raw image ingestion (.001 / .dd)
+# Raw image ingestion (.dd / .img / .raw / .001)
 # ---------------------------------------------------------------------------
 
 def ingest_raw(image_path: str,
                temp_dir: str,
                include_deleted: bool = False) -> Generator:
     """
-    Opens .001 or .dd raw image.
+    Opens a raw (.dd / .img / .raw / .001) image.
     Yields file info dicts.
     """
     if not PYTSK3_AVAILABLE:
         raise RuntimeError(
             "pytsk3 not installed.")
 
+    # Pre-flight: refuse to pretend a partial image is fine.
+    report = inspect_raw_image(image_path)
+    if report["truncated"]:
+        print(f"[FORENSIC] WARNING: {report['summary']}")
+        print("[FORENSIC] Attempting partial recovery anyway - "
+              "results will be incomplete.")
+
     img_info = pytsk3.Img_Info(image_path)
 
     try:
-        # Try partition table first
-        try:
-            volume = pytsk3.Volume_Info(img_info)
-            for part in volume:
-                if (part.flags ==
-                        pytsk3.TSK_VS_PART_FLAG_ALLOC):
-                    try:
-                        fs = pytsk3.FS_Info(
-                            img_info,
-                            offset=(part.start * 512)
-                        )
-                        yield from walk_filesystem(
-                            img_info, fs,
-                            include_deleted=include_deleted)
-                        fs.close()
-                    except Exception:
-                        continue
-        except Exception:
-            fs = pytsk3.FS_Info(img_info)
-            yield from walk_filesystem(
-                img_info, fs,
-                include_deleted=include_deleted)
-            fs.close()
+        yield from _walk_all_filesystems(
+            img_info, include_deleted, "raw")
     finally:
-        img_info.close()
+        try:
+            img_info.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

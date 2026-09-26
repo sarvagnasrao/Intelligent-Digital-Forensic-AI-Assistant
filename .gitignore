@@ -89,3 +89,37 @@ logs/
 # Test evidence files
 # ==========================================
 test_evidence_*.txt
+
+# ==========================================
+# Offline / air-gap install kit — NEVER commit
+# ==========================================
+# vendor/ holds ~1.1 GB of pre-downloaded wheels plus the
+# spaCy en_core_web_lg model, for machines with no internet.
+# Several files exceed GitHub's 100 MB per-file limit, so
+# committing this breaks the push and bloats history forever.
+# It is a LOCAL artefact: regenerate with
+#   pip download -r requirements.txt -d vendor/python
+#   python -m spacy download en_core_web_lg   # then move the
+#                                             # tarball into
+#                                             # vendor/python
+# Distribute it as a zip/release asset if an air-gap
+# installer is needed, not as tracked source.
+vendor/
+
+# ==========================================
+# Yarn 4 build artefacts
+# ==========================================
+# install-state.gz is regenerated on every install.
+# NOTE: .yarn/releases/*.cjs IS intentionally committed —
+# it pins the exact yarn version for every developer.
+**/.yarn/install-state.gz
+**/.yarn/cache/
+**/.pnp.*
+
+# ==========================================
+# Local agent / editor scratch
+# ==========================================
+*.log
+AGENTS.local.md
+.DS_Store
+Thumbs.db

@@ -34,7 +34,7 @@ the others. They share only a common ancestor.
 
 ## 1. What the project is
 
-**Cognitive Forensic Investigator (CFI)** — an offline, local-only AI digital-forensics workstation.
+**Intelligent Digital Forensic AI Assistant** — an offline, local-only AI digital-forensics workstation.
 Upload evidence → extract text/metadata → index into a vector store → query with natural language →
 reconstruct timelines, entity graphs and anomalies. Nothing leaves the machine (air-gap requirement).
 
@@ -50,7 +50,7 @@ Scale: **~13.2k lines** Python (57 files) · **~14.8k lines** React/JS/CSS (58 f
 | Backend | FastAPI 0.110 + Uvicorn | `backend/main.py`, port 8000 |
 | ORM/DB | SQLAlchemy 2.0 + SQLite | `data/forensic.db`, **14 tables** |
 | Vector store | Qdrant (embedded, local) | `data/cases/<case_id>/qdrant/` |
-| Embeddings | **Ollama API** (not SentenceTransformers) | see §7 trap #1 |
+| Embeddings | **SentenceTransformers `all-MiniLM-L6-v2`**, 384-dim | 🔴 `requirements.txt` declares torch/sentence-transformers *absent* (see B4) but `vector_store.py` still imports them — a fresh install per `requirements.txt` will `ImportError`. Unfixed. |
 | LLM | Ollama, default `llama3.2:3b` | |
 | NER | spaCy 3.7 `en_core_web_lg` | GPU disabled by design for cross-platform stability |
 | Disk images | `pyewf` + `pytsk3` (Sleuth Kit) | installed here: pyewf `20260924`, pytsk3 `20260715` |
@@ -76,7 +76,8 @@ backend/
   modules/
     forensic_ingestion.py   ★ pyewf/pytsk3 walk + per-file extraction  (has bugs, §6)
     rag_engine.py           retrieval + prompt + citation processing
-    vector_store.py         Qdrant wrapper
+    vector_store.py         Qdrant wrapper  (🔴 stale torch import, §2)
+    hardware_probe.py       ★ live hardware + device inventory (CPU/GPU/volumes/NICs)
     ollama_client.py        Ollama HTTP client
     graph_builder.py        NetworkX entity graph
     job_worker.py           background ingestion worker
@@ -93,9 +94,11 @@ frontend/src/
   App.jsx                 routing + AppLayout (sidebar + statusbar + <main>)
   api/client.js           axios instance + ~90 API functions
   context/                AuthContext, ThemeContext
-  hooks/                  useNotifications, useWebSocket, useTilt, useCountUp
+  hooks/                  useNotifications, useWebSocket, useTilt, useCountUp,
+                          usePreferences (★ gates the resource monitor)
   components/             Sidebar, StatusBar, PageLayout, AppBackground, FileViewer,
-                          GlobalSearch, cards, ErrorBoundary, ProtectedRoute
+                          GlobalSearch, cards, ErrorBoundary, ProtectedRoute,
+                          ResourceMonitor (★ live hardware panel)
   pages/                  27 route components
   index.css               ★ design tokens  (namespace differs per branch, §7)
 ```
@@ -136,7 +139,7 @@ cd frontend && npm run dev
 PYTHONPATH=. python backend/migrate_all.py     # Windows: venv\Scripts\python.exe backend\migrate_all.py
 PYTHONPATH=. python backend/seed_demo.py       # idempotent
 ```
-Demo logins: `admin` / `Admin@CFI2025` (Admin), `det_markov` / `Markov@2025`, `analyst_chen` / `Chen@2025`.
+Demo logins: `admin` / `Admin@IDF2025` (Admin), `det_markov` / `Markov@2025`, `analyst_chen` / `Chen@2025`.
 
 ### Health checks
 - `GET http://localhost:8000/api/status` — DB + Ollama health
@@ -154,7 +157,8 @@ timeline · anomaly detection (entropy + timestamp) · geo/EXIF map · keyword w
 PDF reports (5 types) · audit log + global activity feed + CSV export · JWT auth, 4-tier roles,
 lockout, rate limiting · **2FA/TOTP** · **credential scanner** · **contradiction detection** ·
 **artifact comparison** · **AI case summary** · **case access control** · **case import/export** ·
-**system health page** · global search · dark/light theming.
+**system health page** · **live hardware & device inventory** · **per-user UI preferences** ·
+global search · dark/light theming.
 
 > The `README.md` on `main3` documents only ~22 of the 27 pages and **omits** 2FA, credentials,
 > contradictions, comparison, case summary, case settings, system health, import/export.
@@ -162,12 +166,54 @@ lockout, rate limiting · **2FA/TOTP** · **credential scanner** · **contradict
 
 ---
 
+## 4b. Hardware & device detection (added this session)
+
+`backend/modules/hardware_probe.py` auto-detects the machine the app runs on. It is **live, not
+static** — a forensics box gains and loses devices between cases, so everything is re-detected.
+
+| Exposed via | What it returns |
+|---|---|
+| `hardware_probe.scan_hardware()` | full re-walk, no cache |
+| `hardware_probe.get_hardware_spec(force=False, ttl=4.0)` | cached ≤4 s, **auto-invalidated by a device fingerprint** (partition list + NIC list), so plugging in a drive takes effect immediately |
+| `hardware_probe.rescan_hardware()` | forced re-scan; backs `POST /api/queue/system-info/rescan` |
+| `resource_governor.get_system_info()` | thin wrapper that adds back the legacy `cpu_count` / `platform` aliases |
+| `GET /api/queue/system-info` | `{ system, hardware, suggested_budget }` |
+| `POST /api/queue/system-info/rescan` | same shape + `rescanned: true` |
+
+**Detected:** CPU model + physical/logical cores + clock · **every** GPU with VRAM and
+shared-vs-dedicated · **every** mounted volume (`all=True`, so USB/removable appears) with
+fstype, rw/ro, free/total, and an `is_evidence_store` flag · network adapters with MAC/IP/up/virtual
+· chassis manufacturer/model/BIOS/hostname · battery + laptop detection · swap/pagefile · OS.
+
+**Constraints honoured** (§9): stdlib + `psutil` only, **no new dependency**, and **no shell calls**.
+Windows reads the registry via `winreg` (`Video\*\0000` for GPUs, `CentralProcessor\<n>` for CPU,
+`BIOS` for the chassis); Linux reads `/proc` and `/sys/class/drm`; macOS reports no GPU rather than
+guessing.
+
+Two traps found while building it — do not reintroduce them:
+- `winreg.OpenKey(... r"CentralProcessor\0")` **intermittently reports zero values**. Enumerate the
+  parent's subkeys instead.
+- `mem.total / 1024 * 1024` is `mem.total` (operator precedence). This shipped once and every
+  memory figure came back as raw bytes. `verify_dynamic.py` now asserts MB ranges to catch it.
+
+**Frontend:** `frontend/src/components/ResourceMonitor.jsx` is shared by the **Evidence page and
+the Queue page** so both show an identical description. It renders `null` and stops polling when
+`show_system_resources` is off — the gate lives in exactly one place, so the preference governs
+both surfaces by construction.
+
+---
+
 ## 5. Work completed (by branch)
 
-**`main3` (current)** — 17 commits, all merged into `main3`:
-baseline v1.0 → docs/setup → UI redesign + ingestion speedup → fixed "No response" bug →
-real-time response display → WebSockets → **dropped PyTorch/SentenceTransformers for Ollama
-embeddings (fixed OOM crashes)** → light-mode CSS-variable refactor → notifications dropdown.
+**`main3` (current)** — baseline v1.0 → docs/setup → UI redesign + ingestion speedup → fixed
+"No response" bug → real-time response display → WebSockets → **dropped PyTorch/SentenceTransformers
+for Ollama embeddings (fixed OOM crashes)** → light-mode CSS-variable refactor → notifications
+dropdown → published to a public GitHub repo → **CFI → "Intelligent Digital Forensic AI Assistant"
+rename** → **Main2 sidebar placement restored** → **per-user UI preferences (resource-monitor
+toggle)** → **live hardware & device inventory**.
+
+> ⚠️ The "dropped PyTorch/SentenceTransformers" entry above is **half true**: the *pins* were
+> removed from `requirements.txt` but `vector_store.py` was never converted. See B6.
 
 **`Main2`** — diverged at `3dbdd49`: amber/steel "government-grade" design system (Barlow Condensed +
 JetBrains Mono, classified status bar, terminal login, command-center layout), complete light-mode

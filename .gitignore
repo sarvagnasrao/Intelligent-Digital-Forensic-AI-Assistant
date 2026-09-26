@@ -28,7 +28,6 @@ build/
 data/
 data/cases/
 data/forensic.db
-data/cfi.db
 data/qdrant_store/
 *.db
 *.sqlite

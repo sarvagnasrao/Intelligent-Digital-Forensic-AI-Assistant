@@ -70,7 +70,7 @@ export default function CaseDetailPage() {
       const url = URL.createObjectURL(res.data)
       const a   = document.createElement('a')
       a.href    = url
-      a.download = `cfi_case_${(caseData?.case_name || caseId).replace(/\s+/g, '_')}.zip`
+      a.download = `idfai_case_${(caseData?.case_name || caseId).replace(/\s+/g, '_')}.zip`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)

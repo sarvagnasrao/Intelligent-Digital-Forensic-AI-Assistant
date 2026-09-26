@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     app_name: str
     app_version: str
     debug: bool = False
-    secret_key: str = "cfi-secret-key-change-in-production"
+    secret_key: str = "idfai-secret-key-change-in-production"
     ollama_model: str = "llama3.2:3b"
     ollama_base_url: str = "http://localhost:11434"
 

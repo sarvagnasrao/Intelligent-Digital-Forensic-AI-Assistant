@@ -151,7 +151,7 @@ export default function ReportsPage() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `CFI_Report_${reportType.replace(/ /g,'_')}_${reportId.slice(0,8)}.pdf`
+      a.download = `IDF_AI_Report_${reportType.replace(/ /g,'_')}_${reportId.slice(0,8)}.pdf`
       a.click()
       URL.revokeObjectURL(url)
     } catch {

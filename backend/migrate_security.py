@@ -5,7 +5,7 @@ and locked_until columns to the users table.
 Run with:
     python -m backend.migrate_security
 or:
-    cd cfi_project && python backend/migrate_security.py
+    cd IDFA_main3 && python backend/migrate_security.py
 """
 from backend.database import engine
 from sqlalchemy import text

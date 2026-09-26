@@ -9,7 +9,7 @@ NC='\033[0m'
 
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║   Cognitive Forensic Investigator    ║${NC}"
+echo -e "${BLUE}║   Intelligent Digital Forensic AI Assistant   ║${NC}"
 echo -e "${BLUE}║         Setup Script v2.0            ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
 echo ""

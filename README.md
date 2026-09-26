@@ -1,4 +1,4 @@
-# Cognitive Forensic Investigator (CFI)
+# Intelligent Digital Forensic AI Assistant
 
 > **An AI-powered digital forensics platform for investigative analysis of evidence — built entirely offline, on your machine.**
 
@@ -26,7 +26,7 @@
 
 ## Project Overview
 
-**Cognitive Forensic Investigator (CFI)** is a full-stack digital forensics workstation that enables investigators to upload evidence files, automatically extract text and metadata, query that evidence using a local large language model (LLM), and reconstruct timelines and entity relationships — all without sending any data to external servers.
+**Intelligent Digital Forensic AI Assistant** is a full-stack digital forensics workstation that enables investigators to upload evidence files, automatically extract text and metadata, query that evidence using a local large language model (LLM), and reconstruct timelines and entity relationships — all without sending any data to external servers.
 
 The system implements a **Retrieval-Augmented Generation (RAG)** pipeline: evidence is chunked, embedded into a vector database (Qdrant), and retrieved as context for a locally-running Ollama LLM. Investigators interact with the evidence through a natural-language chat interface, while the backend simultaneously extracts named entities, builds relationship graphs, detects anomalies, and generates structured forensic reports.
 
@@ -119,7 +119,7 @@ This project was developed as a semester-long final project exploring the inters
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                       CFI System                         │
+│                 IDF AI Assistant System                 │
 │                                                          │
 │  ┌───────────┐       ┌─────────────────────────────┐    │
 │  │  React    │──────▶│      FastAPI Backend         │    │
@@ -273,7 +273,7 @@ The fastest way to get started on a fresh machine. `setup.sh` **auto-detects you
 
 ```bash
 # 1. Clone or extract the project
-cd cfi_project/
+cd IDFA_main3/
 
 # 2. Run the automated setup script
 ./setup.sh
@@ -299,7 +299,7 @@ If you prefer to set up manually or the automated script encounters issues:
 ### Step 1 — Python Environment
 
 ```bash
-cd cfi_project/
+cd IDFA_main3/
 
 # Create virtual environment
 python3 -m venv venv
@@ -366,7 +366,7 @@ ollama serve
 
 ```bash
 # Same on macOS and Linux
-cd cfi_project/
+cd IDFA_main3/
 source venv/bin/activate
 PYTHONPATH=. uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
@@ -377,7 +377,7 @@ The backend will be available at: **http://localhost:8000**
 
 ```bash
 # Same on macOS and Linux
-cd cfi_project/frontend/
+cd IDFA_main3/frontend/
 npm run dev
 ```
 
@@ -411,7 +411,7 @@ This creates:
 
 | Account | Password | Role |
 |---------|----------|------|
-| `admin` | `Admin@CFI2025` | Admin |
+| `admin` | `Admin@IDF2025` | Admin |
 | `det_markov` | `Markov@2025` | Investigator |
 | `analyst_chen` | `Chen@2025` | Analyst |
 
@@ -461,7 +461,7 @@ All endpoints (except `/api/auth/login` and `/api/auth/register`) require a **Be
 ## Project Structure
 
 ```
-cfi_project/
+IDFA_main3/
 │
 ├── setup.sh                    # Automated setup script (macOS + Linux)
 ├── requirements.txt            # Python package dependencies

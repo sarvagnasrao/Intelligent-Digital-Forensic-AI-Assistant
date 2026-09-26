@@ -26,16 +26,16 @@ async def lifespan(app: FastAPI):
     start_worker()
     print(f"Database initialized")
     print("Ingestion queue worker started")
-    print(f"CFI Backend starting on http://localhost:8000")
+    print(f"IDF AI Assistant Backend starting on http://localhost:8000")
     yield
     # Shutdown
-    print("CFI Backend shutting down")
+    print("IDF AI Assistant Backend shutting down")
 
 
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="Cognitive Forensic Investigator API",
+    description="Intelligent Digital Forensic AI Assistant API",
     lifespan=lifespan,
 )
 

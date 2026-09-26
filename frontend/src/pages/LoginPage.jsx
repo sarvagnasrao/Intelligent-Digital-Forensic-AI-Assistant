@@ -173,14 +173,14 @@
                 fontWeight: 700,
                 letterSpacing: '-0.02em',
               }}>
-                CFI
+                IDF AI
               </span>
               <span style={{
                 fontSize: 13,
                 color: 'var(--color-white-3)',
                 marginLeft: 8,
               }}>
-                Cognitive Forensic Investigator
+                Intelligent Digital Forensic AI Assistant
               </span>
             </div>
           </div>
@@ -502,7 +502,7 @@
                     fontSize: 13,
                     color: 'var(--color-white-4)',
                   }}>
-                    CFI Investigation Platform
+                    Intelligent Digital Forensic AI Assistant
                   </p>
                 </div>
               </div>

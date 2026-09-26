@@ -886,7 +886,7 @@ async def import_case(
             if "case_meta.json" not in names:
                 raise HTTPException(
                     status_code=400,
-                    detail="Not a valid CFI case export — missing case_meta.json",
+                    detail="Not a valid IDF AI case export — missing case_meta.json",
                 )
 
             # ── Case meta ────────────────────────────────────────────────────
@@ -1025,7 +1025,7 @@ def export_case(
     settings    = get_settings()
     tmp         = tempfile.mkdtemp()
     date_str    = datetime.utcnow().strftime("%Y%m%d")
-    zip_name    = f"cfi_case_{case_id[:8]}_{date_str}.zip"
+    zip_name    = f"idfai_case_{case_id[:8]}_{date_str}.zip"
     zip_path    = os.path.join(tmp, zip_name)
 
     # Fetch everything before opening the ZIP
@@ -1198,7 +1198,7 @@ def export_case(
 
         # Human-readable README
         readme = (
-            f"# CFI Case Export\n\n"
+            f"# IDF AI Case Export\n\n"
             f"**Case:** {case.case_name}\n"
             f"**Case #:** {case.case_number or '—'}\n"
             f"**Status:** {case.status}\n"
@@ -1223,7 +1223,7 @@ def export_case(
             f"- Queries: {len(queries_data)}\n"
             f"- Artifacts: {len(artifacts_data)}\n\n"
             f"## Import\n\n"
-            f"Upload this ZIP via **Cases → Import Case** on any CFI instance.\n"
+            f"Upload this ZIP via **Cases → Import Case** on any IDF AI Assistant instance.\n"
         )
         zf.writestr("README.md", readme)
 

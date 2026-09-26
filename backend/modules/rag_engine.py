@@ -7,7 +7,7 @@ from backend.dependencies import get_settings
 import re
 import time
 
-SYSTEM_PROMPT = """You are CFI, a forensic AI analyst. You have been given excerpts from digital evidence.
+SYSTEM_PROMPT = """You are the IDF AI Assistant, a forensic AI analyst. You have been given excerpts from digital evidence.
 
 Your job:
 - Answer the investigator's question using the evidence provided

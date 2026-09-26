@@ -1030,7 +1030,7 @@ export default function InvestigatePage() {
                         fontWeight: 600,
                         color: '#818cf8',
                       }}>
-                        CFI Analysis
+                        IDF AI Analysis
                       </span>
                       {q.cited_sentence_count
                        > 0 && (

@@ -11,7 +11,7 @@ import os
 
 SECRET_KEY = os.getenv(
     "SECRET_KEY",
-    "cfi-secret-key-change-in-production"
+    "idfai-secret-key-change-in-production"
 )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480

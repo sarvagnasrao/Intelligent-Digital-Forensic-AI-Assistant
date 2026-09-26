@@ -19,7 +19,7 @@ import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
 import useWebSocket from './useWebSocket'
 
-// Shared dark toast base style — matches the CFI glassmorphism theme
+// Shared dark toast base style — matches the IDF AI glassmorphism theme
 const BASE_STYLE = {
   background: '#14161f',
   color:      'var(--text-primary)',

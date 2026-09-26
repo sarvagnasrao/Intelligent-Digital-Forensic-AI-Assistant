@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Generate a ~200 MB synthetic digital-evidence text file for testing
-the Cognitive Forensic Investigator ingestion pipeline.
+the Intelligent Digital Forensic AI Assistant ingestion pipeline.
 """
 
 import random, hashlib, uuid, os, sys, time
@@ -26,7 +26,7 @@ SUSPECTS = [
     ("Wei Zhang",         "w.zhang@darknode.io",          "+86-138-0013-8000"),
 ]
 
-CASE_IDS = ["CFI-2025-0042", "CFI-2025-0078", "CFI-2025-0113", "CFI-2025-0156", "CFI-2025-0201"]
+CASE_IDS = ["IDF-2025-0042", "IDF-2025-0078", "IDF-2025-0113", "IDF-2025-0156", "IDF-2025-0201"]
 CASE_NAMES = [
     "Operation Phantom Ledger - Corporate Embezzlement and Money Laundering",
     "Operation Dark Mirror - Insider Threat and IP Exfiltration",
@@ -772,7 +772,7 @@ def main():
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         header = (
             "=" * 80 + "\n"
-            "COGNITIVE FORENSIC INVESTIGATOR - MASTER EVIDENCE COMPILATION\n"
+            "INTELLIGENT DIGITAL FORENSIC AI ASSISTANT - MASTER EVIDENCE COMPILATION\n"
             "Classification: LAW ENFORCEMENT SENSITIVE\n"
             "Generated: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC') + "\n"
             "Cases: " + ", ".join(CASE_IDS) + "\n"

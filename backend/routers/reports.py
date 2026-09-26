@@ -389,7 +389,7 @@ def download_report(
         path=report.file_path,
         media_type="application/pdf",
         filename=(
-            f"CFI_Report_"
+            f"IDF_AI_Report_"
             f"{report.report_type.replace(' ','_')}"
             f"_{report_id[:8]}.pdf"
         )

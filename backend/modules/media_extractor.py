@@ -2,7 +2,7 @@
 media_extractor.py
 ==================
 Handles multimedia file text extraction for
-the Cognitive Forensic Investigator pipeline.
+the Intelligent Digital Forensic AI Assistant pipeline.
 
 Supports:
   - Office documents (.docx, .xlsx, .pptx)

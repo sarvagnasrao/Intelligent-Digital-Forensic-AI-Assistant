@@ -18,7 +18,7 @@ from backend.auth import hash_password
 init_db()
 db = SessionLocal()
 
-print("🌱 Seeding CFI demo data...")
+print("🌱 Seeding IDF AI demo data...")
 
 # ── Users ────────────────────────────────────────────────────────────────────
 print("  Creating users...")
@@ -26,8 +26,8 @@ print("  Creating users...")
 users_data = [
     {
         "username": "admin",
-        "email": "admin@cfi.int",
-        "password": "Admin@CFI2025",
+        "email": "admin@idfai.local",
+        "password": "Admin@IDF2025",
         "full_name": "System Administrator",
         "role": "Admin",
     },
@@ -72,7 +72,7 @@ print("  Creating demo cases...")
 cases_data = [
     {
         "case_name": "Operation Phantom Trace",
-        "case_number": "CFI-2025-001",
+        "case_number": "IDF-2025-001",
         "status": "Active",
         "priority": "Critical",
         "description": "Investigation into Phantom Collective cybercrime network spanning multiple countries.",
@@ -81,7 +81,7 @@ cases_data = [
     },
     {
         "case_name": "Vertex Pharma Leak",
-        "case_number": "CFI-2025-002",
+        "case_number": "IDF-2025-002",
         "status": "Active",
         "priority": "High",
         "description": "Corporate espionage investigation — leaked pharmaceutical research.",
@@ -90,7 +90,7 @@ cases_data = [
     },
     {
         "case_name": "Havenport Missing Person",
-        "case_number": "CFI-2025-003",
+        "case_number": "IDF-2025-003",
         "status": "Open",
         "priority": "High",
         "description": "Missing person investigation — Lily Vance, 17, last seen October 31.",
@@ -294,7 +294,7 @@ print()
 print("✅ Demo data seeded successfully!")
 print()
 print("Demo accounts:")
-print("  admin        / Admin@CFI2025   (Admin)")
+print("  admin        / Admin@IDF2025  (Admin)")
 print("  det_markov   / Markov@2025     (Investigator)")
 print("  analyst_chen / Chen@2025       (Analyst)")
 print()

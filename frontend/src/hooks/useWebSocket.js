@@ -2,7 +2,7 @@
  * useWebSocket.js
  * ──────────────
  * A robust WebSocket hook with automatic reconnection.
- * Connects to the CFI backend on port 8000 (same host as the app).
+ * Connects to the IDF AI backend on port 8000 (same host as the app).
  *
  * Usage:
  *   const { send } = useWebSocket('/ws/global', (data) => { ... })

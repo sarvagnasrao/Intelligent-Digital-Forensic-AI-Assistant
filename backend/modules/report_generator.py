@@ -12,16 +12,16 @@ from reportlab.lib.enums import (
 from datetime import datetime
 import os
 
-# CFI colour palette
-CFI_DARK    = colors.HexColor('#0f1117')
-CFI_CARD    = colors.HexColor('#1e2035')
-CFI_ACCENT  = colors.HexColor('#6366f1')
-CFI_SUCCESS = colors.HexColor('#22c55e')
-CFI_WARNING = colors.HexColor('#f59e0b')
-CFI_DANGER  = colors.HexColor('#ef4444')
-CFI_TEXT    = colors.HexColor('#e2e8f0')
-CFI_MUTED   = colors.HexColor('#64748b')
-CFI_BORDER  = colors.HexColor('#2d3154')
+# IDF AI colour palette
+IDF_DARK    = colors.HexColor('#0f1117')
+IDF_CARD    = colors.HexColor('#1e2035')
+IDF_ACCENT  = colors.HexColor('#6366f1')
+IDF_SUCCESS = colors.HexColor('#22c55e')
+IDF_WARNING = colors.HexColor('#f59e0b')
+IDF_DANGER  = colors.HexColor('#ef4444')
+IDF_TEXT    = colors.HexColor('#e2e8f0')
+IDF_MUTED   = colors.HexColor('#64748b')
+IDF_BORDER  = colors.HexColor('#2d3154')
 WHITE       = colors.white
 BLACK       = colors.black
 
@@ -30,7 +30,7 @@ def _build_styles():
     styles = {}
 
     styles['title'] = ParagraphStyle(
-        'CFITitle',
+        'IDFTitle',
         fontSize=22, 
         fontName='Helvetica-Bold',
         textColor=BLACK,
@@ -38,14 +38,14 @@ def _build_styles():
         alignment=TA_LEFT
     )
     styles['subtitle'] = ParagraphStyle(
-        'CFISubtitle',
+        'IDFSubtitle',
         fontSize=11,
         fontName='Helvetica',
         textColor=colors.HexColor('#374151'),
         spaceAfter=4
     )
     styles['section'] = ParagraphStyle(
-        'CFISection',
+        'IDFSection',
         fontSize=13,
         fontName='Helvetica-Bold',
         textColor=BLACK,
@@ -54,7 +54,7 @@ def _build_styles():
         borderPad=4
     )
     styles['body'] = ParagraphStyle(
-        'CFIBody',
+        'IDFBody',
         fontSize=9,
         fontName='Helvetica',
         textColor=colors.HexColor('#1f2937'),
@@ -62,7 +62,7 @@ def _build_styles():
         leading=14
     )
     styles['mono'] = ParagraphStyle(
-        'CFIMono',
+        'IDFMono',
         fontSize=8,
         fontName='Courier',
         textColor=colors.HexColor('#374151'),
@@ -70,14 +70,14 @@ def _build_styles():
         leading=12
     )
     styles['caption'] = ParagraphStyle(
-        'CFICaption',
+        'IDFCaption',
         fontSize=8,
         fontName='Helvetica',
         textColor=colors.HexColor('#6b7280'),
         spaceAfter=2
     )
     styles['answer'] = ParagraphStyle(
-        'CFIAnswer',
+        'IDFAnswer',
         fontSize=9,
         fontName='Helvetica',
         textColor=colors.HexColor('#1f2937'),
@@ -93,7 +93,7 @@ def _header_table(case_data: dict,
                   generated_by: str) -> Table:
     """
     Creates the report header with 
-    case info and CFI branding.
+    case info and IDF AI branding.
     """
     now = datetime.utcnow().strftime(
         '%Y-%m-%d %H:%M:%S UTC')
@@ -101,10 +101,10 @@ def _header_table(case_data: dict,
     header_data = [
         [
             Paragraph(
-                '<b>COGNITIVE FORENSIC '
-                'INVESTIGATOR</b>',
+                '<b>INTELLIGENT DIGITAL FORENSIC '
+                'AI ASSISTANT</b>',
                 ParagraphStyle(
-                    'H', fontSize=14,
+                    'H', fontSize=10,
                     fontName='Helvetica-Bold',
                     textColor=WHITE)
             ),
@@ -126,7 +126,7 @@ def _header_table(case_data: dict,
     )
     header_table.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,-1),
-         CFI_ACCENT),
+         IDF_ACCENT),
         ('PADDING', (0,0), (-1,-1), 12),
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
     ]))
@@ -516,7 +516,7 @@ def _footer(canvas, doc):
     page_num = canvas.getPageNumber()
     canvas.drawString(
         2*cm, 1.2*cm,
-        'COGNITIVE FORENSIC INVESTIGATOR'
+        'INTELLIGENT DIGITAL FORENSIC AI ASSISTANT'
         ' — CONFIDENTIAL'
     )
     canvas.drawRightString(
@@ -564,9 +564,8 @@ def generate_report(
         leftMargin=2*cm,
         topMargin=2*cm,
         bottomMargin=2.5*cm,
-        title=f'CFI — {report_type}',
-        author='Cognitive Forensic '
-               'Investigator'
+        title=f'IDF AI Assistant — {report_type}',
+        author='Intelligent Digital Forensic AI Assistant'
     )
 
     styles = _build_styles()

@@ -63,6 +63,20 @@ def ensure_collection(client: QdrantClient,
         )
 
 
+class VectorStoreError(RuntimeError):
+    """
+    Raised when chunks could not be embedded or stored.
+
+    This used to be a bare `print(...)` plus `return 0`, which made a broken
+    index indistinguishable from a document that legitimately had no text:
+    the caller saw 0 either way and went on to report "Completed - 0 chunks"
+    with the evidence marked Indexed. That is the same silent-success defect
+    that made a truncated disk image look processed, and it is worse here
+    because the investigator then searches a case that has nothing in it and
+    concludes the evidence was clean.
+    """
+
+
 def store_chunks(chunks: list[str],
                  source_filename: str,
                  evidence_id: str,
@@ -71,7 +85,14 @@ def store_chunks(chunks: list[str],
     """
     Embeds and stores chunks in the case collection.
     Returns number of chunks stored.
+
+    Returns 0 only when there was nothing to store. Any real failure -
+    Ollama unreachable, Qdrant refusing the upsert, an un-parseable
+    embedding response - raises VectorStoreError so the job can be marked
+    Failed instead of silently reporting success.
     """
+    if not chunks:
+        return 0
     try:
         client = get_client(qdrant_path)
         collection = get_collection_name(case_id)
@@ -104,8 +125,13 @@ def store_chunks(chunks: list[str],
         return len(points)
 
     except Exception as e:
-        print(f"QDRANT STORE ERROR: {e}")
-        return 0
+        # Loudly, and with the underlying reason attached. A caller that
+        # swallows this has to work much harder to be wrong in the same way.
+        raise VectorStoreError(
+            f"Could not index {len(chunks)} chunk(s) from "
+            f"'{source_filename}' (evidence {evidence_id}): {type(e).__name__}: "
+            f"{e}"
+        ) from e
 
 
 def search_chunks(query: str,

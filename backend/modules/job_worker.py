@@ -360,17 +360,25 @@ def _process_job(job):
         for warn in mode.get("warnings") or []:
             print(f"[WORKER] Mode '{mode['key']}': {warn}")
 
-        if mode["key"] == "accurate":
-            job.current_step = (
-                "Step 1/5: Starting ingestion "
-                f"(accurate · {mode['whisper_model']} transcription"
-                f"{' on GPU' if mode['whisper_gpu'] else ''}"
-                f"{' · deleted-file recovery' if mode['include_deleted'] else ''})"
-            )
-            db.commit()
-            _mode_note = f" [mode: {mode['key']}]"
-        else:
-            _mode_note = ""
+        # One label format for the profile, used by this frame and by every
+        # frame ingestion.py emits, so the operator sees one convention
+        # instead of "[accurate]" here and "[mode: accurate]" there.
+        _mode_note = f" [{mode['key']}]"
+
+        # The database row can carry more detail than the socket frame — it is
+        # read at leisure, not as a transient bar label. Say what is actually
+        # going to happen: which transcription model, on what device, and
+        # whether deleted-file recovery is on. Only 'accurate' enables the
+        # last one, but all three benefit from the first two.
+        _extra = f"{mode['whisper_model']} transcription"
+        _extra += " on GPU" if mode["whisper_gpu"] else " on CPU"
+        if mode["include_deleted"]:
+            _extra += " + deleted-file recovery"
+        if not mode["ocr"]:
+            _extra += " (OCR off)"
+        job.current_step = (
+            f"Step 1/5: Starting ingestion ({_extra}) [{mode['key']}]")
+        db.commit()
 
         # Broadcast initial start over WebSocket
         _broadcast_progress(

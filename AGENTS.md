@@ -4,9 +4,9 @@
 > **Rule:** read this file *before* changing code. It records verified state, known bugs, and traps that are not
 > derivable from the code itself.
 >
-> Last verified against: `main3` @ `e8d1990` (2026-09-27) — ingestion pipeline work
-> landed in §13, so read that before touching the queue. See §6 and §12 for the
-> forensic-image fixes.
+> Last verified against: `main3` @ `1915171` + the live-stack pass (2026-09-27) —
+> §13 covers the ingestion rework, **§14 covers the live end-to-end run and three
+> further bugs it found (B10/B11/B12)**. See §6 and §12 for the forensic-image fixes.
 
 ---
 
@@ -306,6 +306,13 @@ and should be deleted so the air-gap kit stops shipping dead weight.
 24.7 s "thinking" pause and then stores an error as if it were a model response.
 **Fix:** probe Ollama's health endpoint before starting a generation request.
 
+### ✅ FIXED B10 / B11 / B12 — found by the live end-to-end run
+
+Three further silent-success defects, all the same shape as B1, all fixed and all
+regression-tested. **Read §14 before touching the ingestion path** — the short version is
+that a failed vector-store write used to finish as `Completed — 0 chunks` with the
+evidence marked `Indexed`, and a failed job used to stay `Running` for ever.
+
 ---
 
 ## 7. Traps when porting UI between `main3` and `Main2`
@@ -422,15 +429,21 @@ mocks. Each prints `PASS`/`FAIL` per assertion and exits non-zero on failure.
 See `tests/README.md` for details.
 
 ```bash
-PYTHONPATH=. python tests/verify_ingestion_modes.py   # 32 assertions, ~15 s
+PYTHONPATH=. python tests/verify_ingestion_modes.py   # 39 assertions, ~15 s
 PYTHONPATH=. python tests/verify_ws_progress.py       # 15 assertions, ~10 s
 PYTHONPATH=. python -W error::RuntimeWarning \
                     tests/verify_ws_progress.py       # also catches coroutine leaks
 PYTHONPATH=. python tests/verify_queue_api.py         # 37 assertions, ~5 s
+PYTHONPATH=. python tests/verify_live_stack.py        # 26 assertions, ~90 s
 ```
 
 Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
-All three clean up every row and per-case Qdrant directory they create.
+
+The first three are self-contained; **117 assertions total**. `verify_live_stack.py`
+is the exception — it needs `ollama serve`, uvicorn on `:8000` and Vite on
+`:3000` already running, and it is the only one that crosses a real socket
+(see §14). All four clean up every row and per-case Qdrant directory they
+create, and are safe to re-run.
 
 ### Inspecting a disk image by hand (when 0 artifacts)
 ```python
@@ -662,27 +675,99 @@ actually engages.
 
 **Verification:** `py_compile` on all touched Python · `import backend.main` ·
 `migrate_all.py` twice (idempotent, 18/18 OK) · `vite build` clean (3384
-modules) · **84 behavioural assertions across three scripts, 0 failures**:
+modules) · **117 behavioural assertions across four scripts, 0 failures**
+(see §14 for the live-stack pass and the three bugs it found).
 
-- `tests/verify_ingestion_modes.py` (32) — the same 58 300-char file under all
-  three profiles yields **2 / 3 / 8** chunks, matching the configured
-  `chunk_size` exactly. That is the assertion which proves the profile reaches
-  the pipeline rather than just being stored on the row and shown in the UI.
-  Progress monotonic, ends at 100, mode persisted.
-- `tests/verify_ws_progress.py` (15) — events arrive on the **server's** loop
-  (`socket.loops == {id(server_loop)}`), a registered-but-stopped loop is
-  refused without leaking, and a strict 5-argument callback — the worker's
-  actual shape — is honoured. Run with `-W error::RuntimeWarning`.
-- `tests/verify_queue_api.py` (37) — profiles, budget with slider bounds
-  (`ram_floor_max_mb` was observed tracking `available_ram_mb` at 0.91 as free
-  memory moved between 7.2 GB and 10.1 GB), mode-aware estimates
-  (26 s / 47 s / 121 s for the same file), limit validation, live settings,
-  rescan.
+---
 
-**Still unproven:** an end-to-end ingest of a valid, complete raw/forensic
-image. The disk-image path's progress dispatcher is now correct by construction
-and shares the code path the document tests exercise, but no fixture on disk is
-a complete image (`SCHARDT.001` is truncated — §6 B1).
+## 14. Live-stack verification, and the three bugs it found
 
-**Still to do:** B5 (Ollama probe), the `Main2` GUI question (§7), delete the
-vendored torch wheel (§8 — read the note there first), refresh `README.md`.
+`tests/verify_live_stack.py` exists because §13's suites all drive
+`run_ingestion_with_progress` **in-process**. That proves the pipeline and the
+broadcaster are correct, but not that uvicorn's own event loop delivers frames
+to a real socket — which is exactly the seam B7 lived in. This is the only
+check that crosses it.
+
+It requires `ollama serve` + uvicorn on `:8000` + Vite on `:3000`; it waits 90 s
+for the backend and skips cleanly otherwise. 26 assertions: services up, auth,
+`/queue/modes` and `/queue/system-info` shapes, a real upload, a real queue, and
+then a real `/ws/global` socket from which it requires **≥3 monotonic
+`INGESTION_PROGRESS` frames, ≥3 distinct percentages, arrival at 100, and a
+`Completed` row**. It found three things:
+
+### ✅ FIXED B10. A failed index was reported as a success
+
+**This is the same defect class as B1, in the embedding path — and the most
+consequential bug in the repo.**
+
+`vector_store.store_chunks` did `except Exception: e: print(...)` and
+`return 0`. Zero is also what it returns when a document legitimately has no
+chunks, so the two were indistinguishable. Observed live, in the backend log:
+
+```
+QDRANT STORE ERROR: Expecting value: line 1 column 1 (char 0)
+[INGESTION] Done: 0 chunks, 0 entities (text, mode=accurate)
+```
+
+The job finished **`Completed — 0 chunks`** with the evidence marked
+**`Indexed`**. An investigator then searches a case containing nothing and
+concludes the evidence was clean. The JSON error is Ollama's embeddings
+response failing to parse — Ollama had just been restarted.
+
+- `store_chunks` now returns `0` **only** for empty input and raises
+  `VectorStoreError` (with the chunk count, filename, evidence id and the
+  underlying exception) for any real failure.
+- Guarded by 7 new assertions in `verify_ingestion_modes.py` that force the
+  store to raise and assert the job ends `Failed` with a reason and a terminal
+  timestamp, and the evidence `Failed` — never `Indexed`.
+
+### ✅ FIXED B11. A failed job stayed "Running" for ever
+
+`_run_document_with_progress` caught its own exceptions, marked the evidence
+`Failed`, and **returned normally**. The outer handler in
+`run_ingestion_with_progress` and the one in `job_worker` — both of which mark
+the job terminal and broadcast `INGESTION_FAILED` — therefore never ran. The
+observable result: bar freezes at whatever percent it reached, evidence says
+`Failed`, job says `Running`, nothing explains why.
+
+Both handlers now `raise`, so the worker's single handler finishes the job and
+broadcasts the failure. The outer handler also distinguishes a **user stop**
+from a real failure (`StopIteration` / `"stopped by user"`): Stop now yields
+`Stopped` and evidence `Uploaded`, not a red `Failed` row the operator caused
+deliberately.
+
+### ✅ FIXED B12. Two different labels for the same profile
+
+`job_worker` set `current_step` and its opening broadcast **only for
+`accurate`**, and in a different format from every other frame:
+
+```
+Step 1/5: Starting ingestion [mode: accurate]     ← job_worker
+Step 3/5: Embedding (64/237 chunks) [accurate]    ← ingestion.py
+```
+
+So `fastest` and `normal` showed **no profile at all** on the first frame, and
+`accurate` used a second convention. Now one format, `[{key}]`, for all three
+modes, and the database row carries a richer `current_step` naming the
+transcription model, the device it will run on, whether deleted-file recovery is
+on, and whether OCR is off.
+
+### Test-suite hygiene
+
+`verify_live_stack.py` had to hard-delete its own case: the API's
+`DELETE /api/cases/{id}` is a **soft** delete (`status → Archived`), which is
+correct for chain of custody and wrong for a test. An `atexit` hook now removes
+the case on every exit path, including a failed assertion. Verified residue-free:
+after a full four-script run the database is back to its pre-test state
+(4 cases — 1 real + 3 demo, 1 evidence, 1 job, 16 demo entities).
+
+**Still unproven:** an end-to-end ingest of a **valid, complete** raw/forensic
+image. The disk-image progress dispatcher is correct by construction and shares
+the code path these tests exercise, and B1's truncation reporting is now
+verified end to end over HTTP — but no fixture on disk is a complete image
+(`SCHARDT.001` is truncated, §6 B1).
+
+**Still to do:** B5 (Ollama offline probe), the `Main2` GUI question (§7), the
+stale `vector_store.py` torch import (§2), delete the vendored torch wheel (§8
+— read the note there first), refresh `README.md`.
+

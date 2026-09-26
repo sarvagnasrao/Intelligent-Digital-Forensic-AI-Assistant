@@ -177,8 +177,15 @@ def run_ingestion_with_progress(
         print(f"[INGESTION] FAILED: {e}")
         import traceback
         traceback.print_exc()
+        # A cancelled job is not a failure. The pipelines raise the
+        # StopIteration sentinel for "the operator pressed stop", and
+        # calling that Failed fills the queue view with red rows the
+        # operator created on purpose.
+        stopped = (isinstance(e, StopIteration)
+                   or "stopped by user" in str(e).lower())
         _update_job_progress(
-            job_id, 0, f"Failed: {e}")
+            job_id, 0, ("Stopped by user" if stopped
+                        else f"Failed: {str(e)[:180]}"))
         try:
             evidence = db.query(
                 models.Evidence
@@ -187,11 +194,11 @@ def run_ingestion_with_progress(
                     evidence_id
             ).first()
             if evidence:
-                evidence.status = "Failed"
+                evidence.status = "Uploaded" if stopped else "Failed"
                 evidence.error_message = (
                     str(e))
                 db.commit()
-        except:
+        except Exception:
             pass
 
         # Mark job as failed
@@ -205,13 +212,20 @@ def run_ingestion_with_progress(
                         == job_id
                 ).first()
                 if j:
-                    j.status = "Failed"
+                    j.status = "Stopped" if stopped else "Failed"
                     j.error_message = str(e)
                     j.completed_at = (
                         datetime.utcnow())
                     db2.commit()
+            except Exception:
+                pass
             finally:
                 db2.close()
+        # Re-raise so job_worker can broadcast INGESTION_FAILED and release
+        # the governor. Swallowing here meant the UI only ever learned about
+        # success: the bar stopped moving and the row sat at whatever percent
+        # it had reached, with no terminal state and no error shown.
+        raise
     finally:
         db.close()
 
@@ -532,6 +546,13 @@ def _run_document_with_progress(
                 db.commit()
         except Exception:
             pass
+        # Re-raise rather than returning normally. Swallowing here meant the
+        # job row kept whatever percent it had reached and stayed "Running"
+        # for ever: the evidence said Failed, the job said Running, and no
+        # INGESTION_FAILED frame was ever broadcast. The outer handler in
+        # run_ingestion_with_progress and the one in job_worker both already
+        # know how to finish a job properly, so let them see the error.
+        raise
     finally:
         db.close()
 

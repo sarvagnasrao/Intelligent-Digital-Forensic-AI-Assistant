@@ -236,6 +236,82 @@ def main():
         check(f"{mode_key}: chunk count matches chunk_size {cs}",
               got == expect, f"expected {expect}, got {got}")
 
+    # ── A failed index must never read as a successful one ────────────────
+    # This is the same defect class as the truncated-image bug (B1), in the
+    # embedding path: store_chunks used to print and return 0, which the
+    # pipeline read as "this document had no text", so the job finished
+    # "Completed - 0 chunks" with the evidence marked Indexed. An investigator
+    # then searches a case that holds nothing and concludes the evidence was
+    # clean. Force the store to fail and assert the job says so.
+    print("\n=== an indexing failure is not a success ===")
+    import backend.ingestion as ingestion_mod
+    from backend.modules.vector_store import VectorStoreError
+
+    real_store = ingestion_mod.store_chunks
+    ev_id = str(uuid.uuid4())
+    tmp_dir = tempfile.mkdtemp(prefix="idfai_fail_test_")
+    src = os.path.join(tmp_dir, "report.txt")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(BODY)
+    job_id = str(uuid.uuid4())
+    db.add(models.Evidence(
+        id=ev_id, case_id=case_id,
+        filename=os.path.basename(src),
+        original_filename=os.path.basename(src),
+        file_path=src, file_size_bytes=os.path.getsize(src),
+        file_type="text", sha256_hash="3" * 64,
+        ingested_by="verify", status="Queued"))
+    db.add(models.IngestionJob(
+        id=job_id, evidence_id=ev_id, case_id=case_id,
+        status="Running", progress_percent=0,
+        min_free_ram_mb=256, cpu_throttle_percent=100,
+        ingestion_mode="normal", created_by="verify"))
+    db.commit()
+    db.close()
+
+    def exploding_store(**kwargs):
+        raise VectorStoreError("simulated Qdrant/Ollama outage")
+
+    ingestion_mod.store_chunks = exploding_store
+    raised = None
+    try:
+        run_ingestion_with_progress(
+            evidence_id=ev_id, case_id=case_id, file_path=src,
+            filename=os.path.basename(src), job_id=job_id,
+            governor=ResourceGovernor(min_free_ram_mb=256,
+                                      cpu_throttle_percent=100),
+            mode=resolve_mode_for_device("normal"))
+    except VectorStoreError as e:
+        raised = e
+    finally:
+        ingestion_mod.store_chunks = real_store
+
+    check("the store failure propagates instead of returning 0",
+          isinstance(raised, VectorStoreError), raised)
+
+    db = SessionLocal()
+    job = db.query(models.IngestionJob).filter(
+        models.IngestionJob.id == job_id).first()
+    ev = db.query(models.Evidence).filter(
+        models.Evidence.id == ev_id).first()
+    check("job is Failed, not Completed", job.status == "Failed", job.status)
+    check("job did not stay stuck on Running",
+          job.status != "Running", job.status)
+    check("job records the reason",
+          bool(job.error_message) and "simulated" in (job.error_message or ""),
+          (job.error_message or "")[:90])
+    check("job has a terminal timestamp", job.completed_at is not None,
+          job.completed_at)
+    check("evidence is Failed, not Indexed", ev.status == "Failed", ev.status)
+    check("evidence is not reported as having 0 chunks as a success",
+          (ev.chunk_count or 0) == 0, ev.chunk_count)
+    db.close()
+    try:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
     # ── Report ─────────────────────────────────────────────────────────────
     _cleanup(case_id, settings)
     print(f"\n{'=' * 62}")

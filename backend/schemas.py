@@ -200,10 +200,12 @@ class UserPreferenceUpdate(BaseModel):
     theme: Optional[str] = None
     timezone: Optional[str] = None
     api_keys: Optional[dict] = None
+    show_system_resources: Optional[bool] = None
 
 class UserPreferenceResponse(BaseModel):
     theme: str
     timezone: str
     api_keys: dict
+    show_system_resources: bool = True
 
     model_config = ConfigDict(from_attributes=True)

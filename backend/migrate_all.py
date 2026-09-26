@@ -1,7 +1,7 @@
 """
 backend/migrate_all.py
 
-Master migration script for CFI.
+Master migration script for IDF AI Assistant.
 Runs every migration in the correct order.
 Safe to re-run — already-applied migrations are skipped gracefully.
 
@@ -14,6 +14,17 @@ import os
 import importlib
 import traceback
 
+# This script prints box-drawing and check-mark characters. The default
+# Windows console codepage is cp1252, which cannot encode them, so the
+# banner raised UnicodeEncodeError before a single migration ran. Force
+# UTF-8 on stdout (and reconfigure errors) so it works on Windows.
+for _stream in ("stdout", "stderr"):
+    try:
+        getattr(sys, _stream).reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # Python < 3.7, or a stream with no reconfigure (e.g. captured)
+        pass
+
 # Ensure the project root is on the path regardless of where
 # this script is invoked from.
 sys.path.insert(0, os.path.dirname(
@@ -22,12 +33,11 @@ sys.path.insert(0, os.path.dirname(
 
 print()
 print("╔══════════════════════════════════╗")
-print("║  CFI — Database Migration Tool   ║")
+print("║  IDF AI Assistant — Migration Tool  ║")
 print("╚══════════════════════════════════╝")
 print()
 
 ok = skip = error = 0
-total = 16
 
 # Phrases that indicate the migration was already applied.
 # All comparisons are done on the lower-cased exception message.
@@ -36,6 +46,39 @@ _SKIP_PHRASES = [
     "already exists",
     "table already exists",
 ]
+
+
+# ── Migration registry ────────────────────────────────────────────────────────
+#
+# Each module is imported fresh via importlib so its top-level code runs.
+# The labels and module names are kept in parallel lists to preserve
+# the human-readable names shown in the output.
+#
+# NOTE: this list is declared before step 1 runs so that `total` can be
+# derived from it. A hard-coded count silently drifts out of date every
+# time a migration is added (it read "[17/16]" once already).
+
+MIGRATIONS = [
+    (2,  "migrate_auth",                "backend.migrate_auth"),
+    (3,  "migrate_queue",               "backend.migrate_queue"),
+    (4,  "migrate_queue_fix",           "backend.migrate_queue_fix"),
+    (5,  "migrate_security",            "backend.migrate_security"),
+    (6,  "migrate_entropy",             "backend.migrate_entropy"),
+    (7,  "migrate (anomaly columns)",   "backend.migrate"),
+    (8,  "migrate_geo",                 "backend.migrate_geo"),
+    (9,  "migrate_watchlist",           "backend.migrate_watchlist"),
+    (10, "migrate_filestore",           "backend.migrate_filestore"),
+    (11, "migrate_profiles",            "backend.migrate_profiles"),
+    (12, "migrate_credentials",         "backend.migrate_credentials"),
+    (13, "migrate_case_access",         "backend.migrate_case_access"),
+    (14, "migrate_2fa",                 "backend.migrate_2fa"),
+    (15, "migrate_audit_severity",      "backend.migrate_audit_severity"),
+    (16, "migrate_final (create_all)",  "backend.migrate_final"),
+    (17, "migrate_user_prefs",          "backend.migrate_user_prefs"),
+]
+
+# Step 1 (init_db) plus everything in the registry.
+total = 1 + len(MIGRATIONS)
 
 
 def run_step(num: int, label: str, fn):
@@ -63,30 +106,6 @@ def do_init_db():
     init_db()
 
 run_step(1, "init_db", do_init_db)
-
-# ── Steps 2-16 — individual migration modules ─────────────────────────────────
-#
-# Each module is imported fresh via importlib so its top-level code runs.
-# The labels and module names are kept in parallel lists to preserve
-# the human-readable names shown in the output.
-
-MIGRATIONS = [
-    (2,  "migrate_auth",                "backend.migrate_auth"),
-    (3,  "migrate_queue",               "backend.migrate_queue"),
-    (4,  "migrate_queue_fix",           "backend.migrate_queue_fix"),
-    (5,  "migrate_security",            "backend.migrate_security"),
-    (6,  "migrate_entropy",             "backend.migrate_entropy"),
-    (7,  "migrate (anomaly columns)",   "backend.migrate"),
-    (8,  "migrate_geo",                 "backend.migrate_geo"),
-    (9,  "migrate_watchlist",           "backend.migrate_watchlist"),
-    (10, "migrate_filestore",           "backend.migrate_filestore"),
-    (11, "migrate_profiles",            "backend.migrate_profiles"),
-    (12, "migrate_credentials",         "backend.migrate_credentials"),
-    (13, "migrate_case_access",         "backend.migrate_case_access"),
-    (14, "migrate_2fa",                 "backend.migrate_2fa"),
-    (15, "migrate_audit_severity",      "backend.migrate_audit_severity"),
-    (16, "migrate_final (create_all)",  "backend.migrate_final"),
-]
 
 
 def make_fn(module_name: str):

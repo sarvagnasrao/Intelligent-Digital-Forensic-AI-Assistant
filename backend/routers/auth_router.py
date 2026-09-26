@@ -649,7 +649,7 @@ def setup_2fa(
     totp = pyotp.TOTP(secret)
     uri = totp.provisioning_uri(
         name=current_user.email or current_user.username,
-        issuer_name="CFI Forensic"
+        issuer_name="IDF AI Assistant"
     )
 
     # Generate QR code
@@ -754,7 +754,8 @@ def get_preferences(
     return {
         "theme": pref.theme,
         "timezone": pref.timezone,
-        "api_keys": json.loads(pref.api_keys) if pref.api_keys else {}
+        "api_keys": json.loads(pref.api_keys) if pref.api_keys else {},
+        "show_system_resources": bool(pref.show_system_resources)
     }
 
 @router.put("/preferences", response_model=schemas.UserPreferenceResponse)
@@ -778,6 +779,8 @@ def update_preferences(
         pref.timezone = body.timezone
     if body.api_keys is not None:
         pref.api_keys = json.dumps(body.api_keys)
+    if body.show_system_resources is not None:
+        pref.show_system_resources = body.show_system_resources
 
     db.commit()
     db.refresh(pref)
@@ -785,5 +788,6 @@ def update_preferences(
     return {
         "theme": pref.theme,
         "timezone": pref.timezone,
-        "api_keys": json.loads(pref.api_keys) if pref.api_keys else {}
+        "api_keys": json.loads(pref.api_keys) if pref.api_keys else {},
+        "show_system_resources": bool(pref.show_system_resources)
     }

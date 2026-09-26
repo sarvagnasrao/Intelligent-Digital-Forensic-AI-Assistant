@@ -6,6 +6,7 @@ import { useAuth } from '../context/AuthContext'
 import toast from 'react-hot-toast'
 import PageLayout from '../components/PageLayout'
 import { useTheme } from '../context/ThemeContext'
+import { cachePreferences } from '../hooks/usePreferences'
 
 const inputStyle = {
   width: '100%',
@@ -65,7 +66,11 @@ function AccountTab({ user }) {
 
 function PreferencesTab() {
   const { setTheme } = useTheme()
-  const [prefs, setPrefs] = useState({ theme: 'dark', timezone: 'UTC' })
+  const [prefs, setPrefs] = useState({
+    theme: 'dark',
+    timezone: 'UTC',
+    show_system_resources: true,
+  })
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
@@ -77,7 +82,12 @@ function PreferencesTab() {
     setLoading(true)
     try {
       const res = await getPreferences()
-      setPrefs({ theme: res.data.theme, timezone: res.data.timezone })
+      setPrefs({
+        theme: res.data.theme,
+        timezone: res.data.timezone,
+        // Absent on servers that predate this preference - default to on.
+        show_system_resources: res.data.show_system_resources !== false,
+      })
     } catch {
       toast.error('Failed to load preferences')
     } finally {
@@ -88,7 +98,12 @@ function PreferencesTab() {
   const handleSave = async () => {
     setSaving(true)
     try {
-      await updatePreferences({ theme: prefs.theme, timezone: prefs.timezone })
+      await updatePreferences({
+        theme: prefs.theme,
+        timezone: prefs.timezone,
+        show_system_resources: prefs.show_system_resources,
+      })
+      cachePreferences({ ...prefs })
       setTheme(prefs.theme)
       toast.success('Preferences saved')
     } catch {
@@ -122,7 +137,7 @@ function PreferencesTab() {
             <option value="system">System Default</option>
           </select>
         </div>
-        <div style={{ marginBottom: 24 }}>
+        <div style={{ marginBottom: 16 }}>
           <label style={{ fontSize: 11, color: 'var(--color-white-3)', textTransform: 'uppercase', letterSpacing: '0.08em', display: 'block', marginBottom: 6 }}>
             Timezone
           </label>
@@ -135,6 +150,63 @@ function PreferencesTab() {
             <option value="Local">Local Time</option>
           </select>
         </div>
+
+        {/* Hardware telemetry - optional, some investigators never want it */}
+        <div style={{
+          marginBottom: 24,
+          padding: 14,
+          borderRadius: 10,
+          border: '1px solid rgba(255,255,255,0.07)',
+          background: 'var(--color-white-04)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 14,
+        }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, color: 'var(--text-primary)', fontWeight: 500, marginBottom: 3 }}>
+              System resource monitoring
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--color-white-4)', lineHeight: 1.5 }}>
+              Show live CPU, RAM and queue telemetry on the Evidence page.
+              Turn off to hide hardware settings you do not use.
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={prefs.show_system_resources}
+            aria-label="System resource monitoring"
+            title={prefs.show_system_resources ? 'Monitoring on' : 'Monitoring off'}
+            onClick={() => setPrefs(p => ({ ...p, show_system_resources: !p.show_system_resources }))}
+            style={{
+              flexShrink: 0,
+              width: 42,
+              height: 24,
+              borderRadius: 12,
+              border: 'none',
+              padding: 0,
+              cursor: 'pointer',
+              position: 'relative',
+              background: prefs.show_system_resources
+                ? 'linear-gradient(90deg, #6366f1, #4f46e5)'
+                : 'rgba(255,255,255,0.14)',
+              transition: 'background 0.2s ease',
+            }}
+          >
+            <span style={{
+              position: 'absolute',
+              top: 3,
+              left: prefs.show_system_resources ? 21 : 3,
+              width: 18,
+              height: 18,
+              borderRadius: '50%',
+              background: '#fff',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.35)',
+              transition: 'left 0.2s ease',
+            }} />
+          </button>
+        </div>
+
         <button
           onClick={handleSave}
           disabled={saving}

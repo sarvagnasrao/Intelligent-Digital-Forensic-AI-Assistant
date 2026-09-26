@@ -346,6 +346,10 @@ class UserPreference(Base):
     theme = Column(String(50), default="dark")
     timezone = Column(String(50), default="UTC")
     api_keys = Column(Text, default="{}") # JSON dictionary of service -> key
+    # Show the CPU/RAM telemetry panel on the Evidence page. Some
+    # investigators never look at hardware stats, so it can be switched
+    # off in Settings > Preferences. Defaults to on for existing users.
+    show_system_resources = Column(Boolean, default=True, nullable=False)
 
     user = relationship("User", back_populates="preferences")
 

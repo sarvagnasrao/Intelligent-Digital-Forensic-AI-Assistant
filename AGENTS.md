@@ -4,7 +4,9 @@
 > **Rule:** read this file *before* changing code. It records verified state, known bugs, and traps that are not
 > derivable from the code itself.
 >
-> Last verified against: `main3` @ `0fa8358` + uncommitted fixes (see §6, §12).
+> Last verified against: `main3` @ `e8d1990` (2026-09-27) — ingestion pipeline work
+> landed in §13, so read that before touching the queue. See §6 and §12 for the
+> forensic-image fixes.
 
 ---
 
@@ -17,7 +19,7 @@ the others. They share only a common ancestor.
 |---|---|---|
 | `main` | — | GitHub **default branch**. Oldest. Not the working branch. |
 | `Main2` | `0687a86` | "Government-grade" amber/steel UI. **Has the docs** (`AGENTS.md`, `CLAUDE.md`, `CFI_Setup_Guide.md`). |
-| `main3` | `0fa8358` | **← You are here.** Indigo/violet redesign + light-mode CSS-var refactor. **Docs were lost in the redesign.** |
+| `main3` | `e8d1990` | **← You are here.** Indigo/violet redesign + light-mode CSS-var refactor, + the ingestion pipeline rework (§13). **Docs were lost in the redesign** — this file restores them. |
 | `ui-redesign` | — | Experimental, unreviewed. |
 
 `git merge-base origin/Main2 main3` → `3dbdd49`. Everything after that point is independent work on each branch.
@@ -291,7 +293,7 @@ whole file as binary** (`git diff` said `Binary files differ`). Rewritten as cle
 ### ✅ FIXED B4. `requirements.txt` still pinned PyTorch — the OOM fix was silently reverted
 
 `0be7d9a` removed SentenceTransformers/PyTorch from the code to stop OOM crashes, but the pins
-remained and `vendor/` bundles a ~2 GB `torch-2.3.0` wheel nothing imports. Both pins
+remained and `vendor/` bundles a 152 MB `torch-2.3.0` wheel nothing imports. Both pins
 (`torch==2.3.0`, `sentence-transformers==2.7.0`) are now **removed**, with an inline comment warning
 future agents not to re-add them. **Remaining:** `vendor/python/torch-2.3.0-*.whl` is still on disk
 and should be deleted so the air-gap kit stops shipping dead weight.
@@ -332,34 +334,49 @@ This is a **token-namespace migration, not a file copy** — do it token-first, 
 
 ---
 
-## 8. Uncommitted work (do not lose this)
+## 8. Local-only artefacts & remotes
 
-`main3` has a **dirty working tree** — Windows/air-gap porting that was never committed:
+**The working tree is clean.** The Windows/air-gap porting work that §8 used to
+list as uncommitted (§12) has since landed. `git status` should be empty on a
+clean checkout.
 
-```
- M frontend/package.json      + "packageManager": "yarn@4.18.1"
- M requirements.txt           (the corrupted B3 edit)
- M setup.sh                   installs spaCy from vendor/, npm → yarn
- M start.bat                  npm → yarn
-?? frontend/.yarn/  frontend/.yarnrc.yml  frontend/yarn.lock
-?? setup_windows.bat  start_windows.bat
-?? vendor/                    ~40+ wheels + en_core_web_lg/spacy model tarballs
-?? yarn.lock
-```
+### `vendor/` — air-gap install kit, deliberately NOT in git
 
-`vendor/` is the **air-gap install kit** — it lets `setup.sh` install spaCy and all Python deps with
-no network. It is large and untracked; decide whether it belongs in git or a release artefact.
+`.gitignore:106` excludes `vendor/`, and it must stay that way. It holds
+**~1.1 GB** of pre-downloaded wheels plus the spaCy `en_core_web_lg` tarball, and
+several files exceed GitHub's 100 MB per-file limit — committing it breaks the
+push and bloats history permanently. It is a **local artefact**: distribute it as
+a zip or release asset if an air-gap installer is needed, never as tracked source.
 
-### 🔴 Security action required
-`git remote -v` shows the origin URL **embeds a GitHub personal access token**:
-```
-https://<user>:<PAT>@github.com/Shrishacm/Cognitive-Forensic-Investigator.git
-```
-It is stored in plaintext in `.git/config` and **must be rotated** — it was also printed into this
-repo's terminal history. Rotate the token, then replace the remote with a credential-free URL:
+Regenerate it with:
 ```bash
-git remote set-url origin https://github.com/Shrishacm/Cognitive-Forensic-Investigator.git
+pip download -r requirements.txt -d vendor/python
+python -m spacy download en_core_web_lg   # then move the tarball into vendor/python
 ```
+
+> **Housekeeping (unfinished, B4):** `vendor/python/torch-2.3.0-cp312-cp312-win_amd64.whl`
+> is **152 MB** on disk that nothing imports — `requirements.txt` no longer pins
+> torch and `ingestion_modes.transcription_device()` imports it *opportunistically*,
+> falling back to CPU. Deleting it removes dead weight from the air-gap kit. Note
+> that a CUDA build of torch is what §13 says is needed to enable GPU
+> transcription, so keep or replace it deliberately rather than reflexively.
+
+### ✅ Security: remotes are credential-free
+
+Earlier revisions of this file warned that the origin URL embedded a GitHub
+personal access token. That is fixed — both remotes are now plain HTTPS URLs
+with no inline credentials, and no `PAT`/`ghp_`-style string remains anywhere in
+`.git/config`:
+
+```
+idfa    https://github.com/sarvagnasrao/Intelligent-Digital-Forensic-AI-Assistant.git
+origin  https://github.com/Shrishacm/Cognitive-Forensic-Investigator.git
+```
+
+`main3` tracks `idfa/main`; push with `git push idfa main3:main`. **Keep it that
+way** — do not re-embed a token to make a push work. If a push starts demanding
+credentials, that is a credential-helper or auth problem to fix locally, not a
+reason to put a secret in the remote URL.
 
 ---
 
@@ -434,8 +451,8 @@ Compare `os.path.getsize(p)` against `part.start + part.len` sectors × 512 — 
 
 ## 11. Suggested next actions, in priority order
 
-1. **Rotate the leaked GitHub PAT** (§8) — security first.
-2. **Commit the air-gap/Windows porting work** (§8) so it stops being one `rm -rf` from gone.
+1. ~~Rotate the leaked GitHub PAT~~ ✅ done — both remotes are credential-free (§8).
+2. ~~Commit the air-gap/Windows porting work~~ ✅ done — working tree is clean (§8).
 3. ~~Fix B1~~ ✅ done — see §12.
 4. ~~Fix B2~~ ✅ done — see §12.
 5. ~~Fix B3 + B4~~ ✅ done (except deleting the vendored torch wheel) — see §12.
@@ -449,7 +466,7 @@ Compare `os.path.getsize(p)` against `part.start + part.len` sectors × 512 — 
 
 ## 12. Changelog of agent work
 
-### Uncommitted — raw/forensic image fixes (this session)
+### Raw/forensic image fixes (committed)
 
 Files changed: `backend/modules/forensic_ingestion.py`, `backend/ingestion.py`,
 `backend/modules/audit_helper.py`, `requirements.txt`, `AGENTS.md`.
@@ -460,7 +477,9 @@ Files changed: `backend/modules/forensic_ingestion.py`, `backend/ingestion.py`,
 - B3 fixed: `requirements.txt` rewritten as clean UTF-8.
 - B4 fixed: `torch` / `sentence-transformers` pins removed.
 - B5 still open.
-- `vendor/python/torch-2.3.0-*.whl` still needs deleting (~2 GB dead weight).
+- `vendor/python/torch-2.3.0-*.whl` still needs deleting (152 MB dead weight — but see the
+  caution in §8: a CUDA build of torch is what §13 needs for GPU transcription, so replace
+  rather than reflexively delete).
 
 **Verification performed:** backend imports OK · `py_compile` OK · against the real
 `SCHARDT.001`: correct truncation report + `RuntimeError` carrying the true TSK error (no longer a
@@ -468,15 +487,16 @@ silent 0) · synthetic EWF header detected as `ewf` · `requirements.txt` parses
 
 **Not yet verified:** a full end-to-end ingest of a *valid, complete* raw image (would need a real
 forensic image or a correctly constructed test fixture). The mount path was confirmed to mount a
-valid FAT16 volume successfully; the risk is low because the walk/extract code is unchanged.
+valid FAT16 volume successfully; the risk is low because the walk/extract code is unchanged. Still
+unproven after §13 as well.
 
-**Still uncommitted from before this session:** the air-gap/Windows porting work in §8.
+**Committed:** the air-gap/Windows porting work and these fixes. Working tree is clean (§8).
 
 ### Still to do
 
-1. **Rotate the leaked GitHub PAT** (§8) — security first.
-2. **Commit** the air-gap/Windows work + these fixes.
-3. **Delete `vendor/python/torch-2.3.0-*.whl`** (finishes B4).
+1. ~~Rotate the leaked GitHub PAT~~ ✅ done — both remotes are credential-free (§8).
+2. ~~Commit the air-gap/Windows porting work~~ ✅ done — working tree is clean (§8).
+3. **Delete `vendor/python/torch-2.3.0-*.whl`** (finishes B4, 152 MB of dead weight — but read the note in §8 first, a CUDA build is what GPU transcription needs).
 4. **Fix B5** — probe Ollama health before starting a generation request.
 5. **Decide the GUI question** (§7) — restore `Main2` layout onto `main3` via token migration.
 6. **Refresh `README.md`** against the real feature set; restore `CLAUDE.md` /
@@ -664,5 +684,5 @@ image. The disk-image path's progress dispatcher is now correct by construction
 and shares the code path the document tests exercise, but no fixture on disk is
 a complete image (`SCHARDT.001` is truncated — §6 B1).
 
-**Still to do:** B5 (Ollama probe), the `Main2` GUI question (§7), rotate the
-PATs (§8), delete the vendored torch wheel (§12), refresh `README.md`.
+**Still to do:** B5 (Ollama probe), the `Main2` GUI question (§7), delete the
+vendored torch wheel (§8 — read the note there first), refresh `README.md`.

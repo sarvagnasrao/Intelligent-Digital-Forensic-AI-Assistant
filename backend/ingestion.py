@@ -79,30 +79,62 @@ def run_ingestion_with_progress(
         governor: ResourceGovernor = None,
         include_deleted: bool = False,
         progress_callback=None,
-        stop_check=None):
+        stop_check=None,
+        mode: dict = None):
     """
     Full ingestion pipeline with
     progress tracking and resource
     governance.
+
     progress_callback(case_id, job_id, evidence_id, percent, step)
     is called at each stage so the frontend gets live WS updates.
     stop_check() returns True when user has requested a stop.
+    mode is the resolved ingestion profile (see ingestion_modes); when
+    omitted it is resolved here so every caller gets the same behaviour.
     """
     if governor is None:
         governor = ResourceGovernor()
 
+    if mode is None:
+        from backend.modules.ingestion_modes import resolve_mode_for_device
+        mode = resolve_mode_for_device(None)
+
+    # A profile that asks for deleted-file recovery wins over the legacy
+    # boolean, so the mode is the single source of truth once it exists.
+    include_deleted = bool(include_deleted or mode.get("include_deleted"))
+
     # Store stop_check on governor so check_and_throttle can use it
     governor._stop_check = stop_check
 
-    def _progress(percent: int, step: str):
-        _update_job_progress(job_id, percent, step)
-        if progress_callback and job_id and case_id:
-            try:
-                progress_callback(case_id, job_id, evidence_id, percent, step)
-            except Exception:
-                pass
+    def _dispatch(cid, jid, eid, percent, step):
+        """
+        The 5-argument progress contract. This - not a 2-argument helper -
+        is what gets handed to the sub-pipelines, because the caller's
+        callback (the worker's _broadcast_progress) is 5-argument.
 
-    _progress(5, "Step 1/5: Reading file")
+        The previous code passed a 2-argument `_progress(percent, step)`
+        as the sub-pipeline callback, and those sub-pipelines in turn called
+        it with 5 arguments. Every intermediate step therefore raised
+        TypeError inside a bare `except Exception: pass`, so the database
+        row kept moving while the WebSocket emitted exactly one event per
+        job. That is what made live progress appear broken. The failure is
+        logged now rather than swallowed.
+        """
+        _update_job_progress(jid, percent, step)
+        if progress_callback and jid and cid:
+            try:
+                progress_callback(cid, jid, eid, percent, step)
+            except Exception as e:
+                print(
+                    f"[INGESTION] progress_callback failed "
+                    f"({type(e).__name__}: {e}) — the job continues, "
+                    f"but live progress updates are lost."
+                )
+
+    def _progress(percent: int, step: str):
+        _dispatch(case_id, job_id, evidence_id, percent, step)
+
+    _progress(5, f"Step 1/5: Reading file [{mode.get('key', 'normal')}]")
 
     db = SessionLocal()
     qdrant_path = (
@@ -130,14 +162,16 @@ def run_ingestion_with_progress(
                 job_id, governor,
                 include_deleted,
                 qdrant_path, db,
-                progress_callback=_progress)
+                progress_callback=_dispatch,
+                mode=mode)
         else:
             _run_document_with_progress(
                 evidence, case_id,
                 file_path, filename,
                 job_id, governor,
                 qdrant_path, db,
-                progress_callback=_progress)
+                progress_callback=_dispatch,
+                mode=mode)
 
     except Exception as e:
         print(f"[INGESTION] FAILED: {e}")
@@ -192,17 +226,50 @@ def run_ingestion_with_progress(
 _FAST_TEXT_EXTENSIONS = {'.pdf', '.txt'}
 
 
+def _finish_job_no_text(job_id: str, filename: str, extraction_type: str):
+    """
+    Closes out a job whose file yielded no text (silent audio, an image with
+    nothing legible, an empty PDF).
+
+    Without this the job row was left at whatever percent the last progress
+    tick set, so the queue showed a permanently "Running" job at 10% after
+    the evidence had already been marked Indexed.
+    """
+    if not job_id:
+        return
+    db2 = SessionLocal()
+    try:
+        j = db2.query(models.IngestionJob).filter(
+            models.IngestionJob.id == job_id).first()
+        if j:
+            j.status = "Completed"
+            j.progress_percent = 100
+            j.completed_at = datetime.utcnow()
+            j.current_step = (
+                f"Complete — no text extracted ({extraction_type})")
+            db2.commit()
+    except Exception as e:
+        print(f"[INGESTION] Could not finalise empty job: {e}")
+    finally:
+        db2.close()
+
+
 
 def _run_document_with_progress(
         evidence, case_id, file_path,
         filename, job_id, governor,
         qdrant_path, db,
-        progress_callback=None):
+        progress_callback=None,
+        mode: dict = None):
 
     """
     Ingestion pipeline for all non-disk-image
     files: PDF, TXT, Office docs, email, audio,
     video, and images.
+
+    mode selects the accuracy/time trade-off: chunk size and overlap,
+    embedding batch size, whether OCR runs, and (via the extractors) which
+    Whisper model is used and whether it goes to the GPU.
     """
     import tempfile
     import shutil
@@ -212,13 +279,23 @@ def _run_document_with_progress(
     qdrant_path = (
         f"{settings.cases_dir}/{case_id}/qdrant")
 
+    if mode is None:
+        from backend.modules.ingestion_modes import resolve_mode_for_device
+        mode = resolve_mode_for_device(None)
+
+    chunk_size = int(mode.get("chunk_size") or 20000)
+    chunk_overlap = int(mode.get("chunk_overlap") or 0)
+    embed_batch = max(16, int(mode.get("embed_batch") or 128))
+    run_ocr = bool(mode.get("ocr", True))
+    mode_key = mode.get("key", "normal")
+
     def _progress(percent: int, step: str):
-        _update_job_progress(job_id, percent, step)
-        if progress_callback and job_id and case_id:
-            try:
-                progress_callback(case_id, job_id, evidence_id, percent, step)
-            except Exception:
-                pass
+        # progress_callback is the 5-argument dispatcher from
+        # run_ingestion_with_progress, not a 2-argument helper.
+        if progress_callback:
+            progress_callback(case_id, job_id, evidence_id, percent, step)
+        else:
+            _update_job_progress(job_id, percent, step)
 
     try:
         
@@ -226,11 +303,13 @@ def _run_document_with_progress(
             filename.lower())[1]
         print(
             f"[INGESTION] {ext.upper()} "
-            f"file: {filename}")
+            f"file: {filename} "
+            f"(mode={mode_key}, chunk={chunk_size}, "
+            f"batch={embed_batch}, ocr={run_ocr})")
 
         if ext in _FAST_TEXT_EXTENSIONS:
             # PDF and plain text — fast path
-            _progress(10, 'Step 1/5: Extracting text')
+            _progress(10, f'Step 1/5: Extracting text [{mode_key}]')
             governor.check_and_throttle()
             text = extract_text(file_path)
             extraction_type = (
@@ -239,6 +318,8 @@ def _run_document_with_progress(
         else:
             # Multimedia: read as bytes and
             # route through extract_text_from_bytes
+            _progress(10, f'Step 1/5: Extracting text [{mode_key}]')
+            governor.check_and_throttle()
             from backend.modules.forensic_ingestion \
                 import extract_text_from_bytes
             with open(file_path, 'rb') as f:
@@ -249,7 +330,10 @@ def _run_document_with_progress(
                 text, extraction_type = \
                     extract_text_from_bytes(
                         data, filename,
-                        temp_dir)
+                        temp_dir,
+                        run_ocr=run_ocr,
+                        whisper_model=mode.get("whisper_model"),
+                        whisper_gpu=bool(mode.get("whisper_gpu")))
             finally:
                 try:
                     shutil.rmtree(
@@ -271,18 +355,31 @@ def _run_document_with_progress(
             evidence.chunk_count = 0
             evidence.entity_count = 0
             db.commit()
+            if job_id:
+                _finish_job_no_text(job_id, filename, extraction_type)
             return
 
-        _progress(25, 'Step 2/5: Chunking text')
+        _progress(25, f'Step 2/5: Chunking text [{mode_key}]')
         governor.check_and_throttle()
-        chunks = chunk_text(text)
-        
-        _progress(40, f"Step 3/5: Embedding {len(chunks)} chunks")
-        # Use a larger batch size for faster PyTorch throughput on CPU
-        BATCH = 250
+        chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+        if not chunks:
+            evidence.status = "Indexed"
+            evidence.chunk_count = 0
+            evidence.entity_count = 0
+            db.commit()
+            if job_id:
+                _finish_job_no_text(job_id, filename, extraction_type)
+            return
+
+        _progress(40, f"Step 3/5: Embedding {len(chunks)} chunks [{mode_key}]")
         chunk_count = 0
-        for i in range(0, len(chunks), BATCH):
-            batch = chunks[i:i+BATCH]
+        total = len(chunks)
+        for i in range(0, total, embed_batch):
+            # Stop promptly rather than starting another embedding batch
+            # the operator has already cancelled.
+            if governor._stop_check and governor._stop_check():
+                raise StopIteration("Ingestion stopped by user")
+            batch = chunks[i:i+embed_batch]
             chunk_count += store_chunks(
                 chunks=batch,
                 source_filename=filename,
@@ -290,12 +387,20 @@ def _run_document_with_progress(
                 case_id=case_id,
                 qdrant_path=qdrant_path
             )
-            progress = 40 + int((i / len(chunks)) * 30)
-            _progress(progress, f"Step 3/5: Embedding ({i+len(batch)}/{len(chunks)} chunks)")
+            done = min(i + len(batch), total)
+            # Report the share actually finished, over the 40-70 band that
+            # step 3 owns. The previous expression used i/len(chunks) after
+            # the batch had already been stored, so it always lagged one
+            # batch behind and never reached 70 before the jump to 75.
+            progress = 40 + int((done / total) * 30)
+            _progress(
+                progress,
+                f"Step 3/5: Embedding ({done}/{total} chunks) "
+                f"[{mode_key}]")
             governor.check_and_throttle()
 
 
-        _progress(75, 'Step 4/5: Building entity graph')
+        _progress(75, f'Step 4/5: Building entity graph [{mode_key}]')
         governor.check_and_throttle()
         entity_counts, extracted_entities = build_graph(
             chunks=chunks,
@@ -306,7 +411,7 @@ def _run_document_with_progress(
             governor=governor
         )
 
-        _progress(90, 'Step 5/5: Saving entities')
+        _progress(90, f'Step 5/5: Saving entities [{mode_key}]')
         governor.check_and_throttle()
         _save_entities_to_db(
             db, extracted_entities, case_id,
@@ -383,12 +488,13 @@ def _run_document_with_progress(
                 "filename": filename,
                 "type": extraction_type,
                 "chunk_count": chunk_count,
-                "entity_count": total_entities
+                "entity_count": total_entities,
+                "ingestion_mode": mode_key
             }
         )
         db.commit()
         
-        _progress(100, "Complete")
+        _progress(100, f"Complete [{mode_key}]")
         if job_id:
             db2 = SessionLocal()
             try:
@@ -397,12 +503,17 @@ def _run_document_with_progress(
                     j.status = "Completed"
                     j.progress_percent = 100
                     j.completed_at = datetime.utcnow()
-                    j.current_step = f"Complete — {chunk_count} chunks, {total_entities} entities"
+                    j.current_step = (
+                        f"Complete — {chunk_count} chunks, "
+                        f"{total_entities} entities ({mode_key})")
                     db2.commit()
             finally:
                 db2.close()
 
-        print(f"[INGESTION] Done: {chunk_count} chunks, {total_entities} entities ({extraction_type})")
+        print(
+            f"[INGESTION] Done: {chunk_count} chunks, "
+            f"{total_entities} entities "
+            f"({extraction_type}, mode={mode_key})")
 
     except Exception as e:
         print(f"[INGESTION] FAILED: {e}")
@@ -432,7 +543,8 @@ def _run_document_with_progress(
 
 def _run_forensic_with_progress(evidence, case_id, file_path,
                            filename, job_id, governor,
-                           include_deleted, qdrant_path, db, progress_callback=None):
+                           include_deleted, qdrant_path, db, progress_callback=None,
+                           mode: dict = None):
 
     """
     Full forensic pipeline for disk images.
@@ -445,11 +557,34 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
       5. Store artifacts in ForensicArtifact table
       6. Feed all extracted text into Qdrant + graph
       7. Update Evidence record
+
+    mode supplies include_deleted and the chunking used for the extracted
+    text, so "accurate" recovers deleted entries and "fastest" does not.
     """
+    if mode is None:
+        from backend.modules.ingestion_modes import resolve_mode_for_device
+        mode = resolve_mode_for_device(None)
+    mode_key = mode.get("key", "normal")
+    include_deleted = bool(include_deleted or mode.get("include_deleted"))
+    evidence_id = evidence.id
+
+    def _progress(percent: int, step: str):
+        # The 5-argument dispatcher, same contract as the document path. This
+        # pipeline used to call _update_job_progress directly at every stage,
+        # which advanced the database row but emitted no WebSocket event at
+        # all - so a disk image (the slowest ingest in the product) showed a
+        # frozen bar and then jumped from 0 to 100.
+        if progress_callback:
+            progress_callback(case_id, job_id, evidence_id, percent, step)
+        else:
+            _update_job_progress(job_id, percent, step)
+
     temp_dir = None
     try:
 
-        print(f"[FORENSIC] Starting: {filename}")
+        print(
+            f"[FORENSIC] Starting: {filename} "
+            f"(mode={mode_key}, include_deleted={include_deleted})")
 
         # Step 1: Verify image hash
         print(f"[FORENSIC] Verifying image SHA-256...")
@@ -472,7 +607,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
         # Step 2: Create temp directory for intermediate files
         temp_dir = tempfile.mkdtemp(prefix="cfi_forensic_")
 
-        _update_job_progress(job_id, 5, "Step 2: Mounting image")
+        _progress(5, "Step 2: Mounting image")
         print(f"[FORENSIC] Mounting image...")
 
         # Pre-flight the raw layout so a partial copy is
@@ -512,7 +647,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             os.makedirs(extracted_base_dir, exist_ok=True)
             print(f"[FORENSIC] Saving extracted files to: {extracted_base_dir}")
 
-            _update_job_progress(job_id, 20, "Step 3: Walking filesystem")
+            _progress(20, "Step 3: Walking filesystem")
             print(f"[FORENSIC] Walking filesystem...")
 
             # Step 3 & 4: Walk and extract
@@ -578,7 +713,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                         # Simulate a rough progress for extraction between 20-60%
                         # It is hard to know total file count upfront, but we update progress.
                         prog = min(60, 20 + int(artifact_count/100))
-                        _update_job_progress(job_id, prog, f"Step 3: Extracting files ({artifact_count} so far)")
+                        _progress(prog, f"Step 3: Extracting files ({artifact_count} so far)")
                         governor.check_and_throttle()
                         print(f"[FORENSIC] {artifact_count} artifacts processed")
 
@@ -590,7 +725,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             print(f"[FORENSIC] {artifact_count} artifacts extracted")
 
             # Run anomaly detection on all artifacts
-            _update_job_progress(job_id, 60, "Step 4: Anomaly detection")
+            _progress(60, "Step 4: Anomaly detection")
             governor.check_and_throttle()
             print(f"[FORENSIC] Running anomaly detection...")
             from backend.modules.anomaly_detector import (
@@ -636,7 +771,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                   f"{anomaly_count} anomalies found")
 
             # Step 6: Feed all text into Qdrant
-            _update_job_progress(job_id, 70, "Step 5: Building vector index")
+            _progress(70, "Step 5: Building vector index")
             governor.check_and_throttle()
             print(f"[FORENSIC] Building vector index...")
             # Limit to 500 files for memory safety on M1 8GB
@@ -652,11 +787,11 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             )
 
             # Build entity graph
-            _update_job_progress(job_id, 85, "Step 6: Building entity graph")
+            # Was: 85, then immediately 75, then 90. The bar went backwards
+            # mid-job, which reads as a stalled or restarted ingest.
+            _progress(85, "Step 4/5: Building entity graph")
             governor.check_and_throttle()
             print(f"[FORENSIC] Building entity graph...")
-            _update_job_progress(job_id, 75, 'Step 4/5: Building entity graph')
-            governor.check_and_throttle()
             entity_counts, extracted_entities = build_graph(
                 chunks=chunks,
                 source_filename=filename,
@@ -667,7 +802,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             )
 
             # Save entities to DB
-            _update_job_progress(job_id, 90, 'Step 5/5: Saving entities')
+            _progress(90, 'Step 5/5: Saving entities')
             governor.check_and_throttle()
             _save_entities_to_db(
                 db, extracted_entities, case_id, evidence.id, filename)
@@ -802,7 +937,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             db.commit()
 
             
-            _update_job_progress(job_id, 100, "Complete")
+            _progress(100, "Complete")
             if job_id:
                 db2 = SessionLocal()
                 try:

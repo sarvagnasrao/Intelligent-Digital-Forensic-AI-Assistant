@@ -11,7 +11,7 @@ import {
   ChevronDown, ChevronUp,
   Zap, Activity, ChevronRight, Square,
   Zap as ZapIcon, Sliders, Save, MemoryStick, HardDrive,
-  UploadCloud, Settings, Plus, User
+  UploadCloud, Settings, Plus, User, Gauge, Circle
 } from "lucide-react"
 import {
   getEvidence, uploadEvidence,
@@ -30,6 +30,7 @@ import toast from "react-hot-toast"
 import { formatDistanceToNow } from "date-fns"
 import { fromUtc } from '../utils/time'
 import useWebSocket from "../hooks/useWebSocket"
+import useSystemInfo from "../hooks/useSystemInfo"
 
 // ── Supported format groups ────────────────────────────────
 const FILE_GROUPS = [
@@ -300,21 +301,121 @@ function InstructionsPanel() {
   )
 }
 
+// ── Ingestion mode picker ────────────────────────────────────
+// Rendered from the server's profile list, so a label or a description can
+// never drift from the code that actually implements the mode.
+function ModePicker({ modes, value, onChange, disabled }) {
+  if (!modes.length) {
+    return (
+      <p className="text-[10px] text-ink-2">Loading profiles…</p>
+    )
+  }
+  return (
+    <div className="space-y-1.5" role="radiogroup" aria-label="Ingestion profile">
+      {modes.map((m) => {
+        const active = m.key === value
+        const eff = m.effective || {}
+        const warn = (eff.warnings || []).length > 0
+        return (
+          <button
+            key={m.key}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            disabled={disabled}
+            onClick={() => onChange(m.key)}
+            className={`w-full text-left px-3 py-2 rounded-lg border transition-colors disabled:opacity-50
+              ${active
+                ? 'border-accent/60 bg-accent/10'
+                : 'border-line bg-surface-1 hover:border-ink-2/40'}`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-semibold text-ink-0 flex items-center gap-1.5">
+                {active
+                  ? <CheckCircle size={12} className="text-accent" />
+                  : <Circle size={12} className="text-ink-2 opacity-50" />}
+                {m.label}
+                <span className="text-[10px] font-normal text-ink-2">{m.tagline}</span>
+              </span>
+              <span className="text-[10px] text-ink-2 shrink-0 tabular-nums">
+                {m.speed} · {m.accuracy}
+              </span>
+            </div>
+            {active && (
+              <p className="text-[10px] text-ink-2 leading-snug mt-1 ml-5">{m.description}</p>
+            )}
+            {active && (
+              <div className="flex flex-wrap gap-1 mt-1.5 ml-5">
+                {eff.whisper_model && (
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-surface-3 text-ink-2">
+                    whisper: {eff.whisper_model}{eff.whisper_gpu ? ' (GPU)' : ''}
+                  </span>
+                )}
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-surface-3 text-ink-2">
+                  chunk: {eff.chunk_size}
+                </span>
+                {m.includes_deleted_files && (
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-success/15 text-success">
+                    deleted-file recovery
+                  </span>
+                )}
+                {!m.runs_ocr && (
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-warning/15 text-warning">
+                    no OCR
+                  </span>
+                )}
+              </div>
+            )}
+            {active && warn && (
+              <p className="text-[10px] text-warning leading-snug mt-1.5 ml-5">
+                {eff.warnings.join(' ')}
+              </p>
+            )}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── Queue Settings Modal ────────────────────────────────────
 function QueueModal({ ev, onClose, onQueue }) {
-  const [cpu, setCpu]     = useState(95)
-  const [ram, setRam]     = useState(0.5)
+  const { budget, modes, defaultMode, loading } = useSystemInfo()
+
+  // The slider bounds and the defaults both come from the live device
+  // budget. Before it arrives we render nothing numeric rather than
+  // guessing - a hardcoded 8 GB maximum was the bug this replaced.
+  const [mode, setMode]   = useState(null)
+  const [cpu, setCpu]     = useState(null)
+  const [ram, setRam]     = useState(null)
   const [saving, setSaving] = useState(false)
+
+  // Seed the controls once, from the device budget.
+  useEffect(() => {
+    if (!budget) return
+    if (cpu === null) setCpu(budget.cpu_throttle_percent)
+    if (ram === null) setRam(
+      Math.round((budget.ram_floor_default_mb / 1024) * 2) / 2
+    )
+  }, [budget, cpu, ram])
+
+  const effectiveMode = mode || defaultMode
+  const ramMaxGb = budget
+    ? Math.max(1, Math.round(budget.ram_floor_max_mb / 1024))
+    : 0
 
   const handleQueue = async () => {
     setSaving(true)
-    await onQueue(cpu, ram)
-    setSaving(false)
+    try {
+      await onQueue(cpu, ram, effectiveMode)
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-surface-2 border border-line rounded-2xl w-full max-w-sm shadow-2xl">
+      <div className="bg-surface-2 border border-line rounded-2xl w-full max-w-sm shadow-2xl max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between px-5 py-4 border-b border-line">
           <div className="flex items-center gap-2">
             <Sliders size={16} className="text-accent" />
@@ -325,7 +426,7 @@ function QueueModal({ ev, onClose, onQueue }) {
           </button>
         </div>
 
-        <div className="p-5 space-y-5">
+        <div className="p-5 space-y-5 overflow-y-auto">
           <div className="flex items-center gap-2 bg-surface-1 rounded-lg px-3 py-2">
             <p className="text-xs text-ink-0 truncate" title={ev.original_filename}>
               Queueing: <span className="font-semibold">{ev.original_filename}</span>
@@ -333,14 +434,42 @@ function QueueModal({ ev, onClose, onQueue }) {
           </div>
 
           <div>
+            <p className="text-xs font-semibold text-ink-0 flex items-center gap-1.5 mb-1.5">
+              <Gauge size={12} className="text-accent" /> Ingestion Profile
+            </p>
+            <ModePicker
+              modes={modes}
+              value={effectiveMode}
+              onChange={setMode}
+              disabled={loading}
+            />
+          </div>
+
+          <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs font-semibold text-ink-0 flex items-center gap-1.5">
-                <Cpu size={12} className="text-accent" /> CPU Throttle
+                <Cpu size={12} className="text-accent" /> CPU Ceiling
               </label>
-              <span className={`text-sm font-bold tabular-nums ${cpu >= 80 ? 'text-warning' : cpu >= 50 ? 'text-accent' : 'text-success'}`}>{cpu}%</span>
+              <span className={`text-sm font-bold tabular-nums ${cpu >= 80 ? 'text-warning' : cpu >= 50 ? 'text-accent' : 'text-success'}`}>
+                {cpu === null ? '—' : `${cpu}%`}
+              </span>
             </div>
-            <input type="range" min="10" max="100" step="5" value={cpu} onChange={e => setCpu(Number(e.target.value))} className="w-full accent-violet-500" />
-            <div className="flex justify-between text-[10px] text-ink-2 mt-0.5"><span>10%</span><span>50%</span><span>100%</span></div>
+            <input
+              type="range" min="10" max="100" step="5"
+              value={cpu ?? 90}
+              onChange={e => setCpu(Number(e.target.value))}
+              disabled={cpu === null}
+              className="w-full accent-violet-500 disabled:opacity-40"
+            />
+            <div className="flex justify-between text-[10px] text-ink-2 mt-0.5">
+              <span>10%</span><span>50%</span><span>100%</span>
+            </div>
+            {budget && (
+              <p className="text-[10px] text-ink-2 mt-1">
+                Ingestion sleeps between batches once the machine passes this
+                load. Suggested for this device: {budget.cpu_throttle_percent}%.
+              </p>
+            )}
           </div>
 
           <div>
@@ -348,16 +477,40 @@ function QueueModal({ ev, onClose, onQueue }) {
               <label className="text-xs font-semibold text-ink-0 flex items-center gap-1.5">
                 <MemoryStick size={12} className="text-accent" /> Min Free RAM
               </label>
-              <span className={`text-sm font-bold tabular-nums ${ram < 1 ? 'text-danger' : ram < 2 ? 'text-warning' : 'text-success'}`}>{ram} GB</span>
+              <span className={`text-sm font-bold tabular-nums ${ram === null ? '' : ram < 1 ? 'text-danger' : ram < 2 ? 'text-warning' : 'text-success'}`}>
+                {ram === null ? '—' : `${ram} GB`}
+              </span>
             </div>
-            <input type="range" min="0" max="8" step="0.5" value={ram} onChange={e => setRam(Number(e.target.value))} className="w-full accent-violet-500" />
-            <div className="flex justify-between text-[10px] text-ink-2 mt-0.5"><span>0 GB</span><span>2 GB</span><span>8 GB</span></div>
+            <input
+              type="range" min="0" max={ramMaxGb || 1} step="0.5"
+              value={ram ?? 0}
+              onChange={e => setRam(Number(e.target.value))}
+              disabled={ram === null}
+              className="w-full accent-violet-500 disabled:opacity-40"
+            />
+            <div className="flex justify-between text-[10px] text-ink-2 mt-0.5">
+              <span>0 GB (override)</span>
+              <span>max {ramMaxGb || '—'} GB</span>
+            </div>
+            {budget && (
+              <p className="text-[10px] text-ink-2 mt-1">
+                {budget.description}. {budget.gpu_acceleration}. The job waits
+                here if free memory drops below this, so it never starves the
+                rest of the machine.
+              </p>
+            )}
+            {ram !== null && ram < 1 && (
+              <p className="text-[10px] text-danger mt-1 flex items-center gap-1">
+                <AlertCircle size={10} />
+                0 GB min RAM — ingestion will never pause. Use carefully.
+              </p>
+            )}
           </div>
         </div>
 
-        <div className="flex gap-2 px-5 pb-5">
+        <div className="flex gap-2 px-5 pb-5 pt-1">
           <button onClick={onClose} className="flex-1 py-2 rounded-lg border border-line text-xs text-ink-2 hover:text-ink-0 transition-colors">Cancel</button>
-          <button onClick={handleQueue} disabled={saving} className="flex-1 py-2 rounded-lg bg-accent hover:bg-accent/90 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50">
+          <button onClick={handleQueue} disabled={saving || cpu === null || ram === null} className="flex-1 py-2 rounded-lg bg-accent hover:bg-accent/90 text-white text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50">
             {saving ? <Loader size={12} className="animate-spin" /> : <Plus size={12} />} Queue Job
           </button>
         </div>
@@ -368,18 +521,26 @@ function QueueModal({ ev, onClose, onQueue }) {
 
 // ── Edit Settings Modal ────────────────────────────────────
 function EditSettingsModal({ job, onClose, onSaved }) {
+  const { budget, modes, defaultMode } = useSystemInfo()
   const [cpu, setCpu]     = useState(job.cpu_throttle_percent ?? 70)
   const [ram, setRam]     = useState(Math.round((job.min_free_ram_mb ?? 2048) / 1024 * 10) / 10)
+  const [mode, setMode]   = useState(job.ingestion_mode || defaultMode)
   const [saving, setSaving] = useState(false)
 
   const handleSave = async () => {
     setSaving(true)
     try {
-      await updateJobSettings(job.id, {
+      const res = await updateJobSettings(job.id, {
         cpu_throttle_percent: cpu,
         min_free_ram_mb:      Math.round(ram * 1024),
+        ingestion_mode:       mode,
       })
-      toast.success(`Settings updated — CPU ${cpu}%, RAM floor ${ram} GB`)
+      const live = res.data?.applied_live
+      toast.success(
+        live
+          ? `Settings applied to the running job — CPU ${cpu}%, RAM floor ${ram} GB, ${mode}`
+          : `Settings saved — CPU ${cpu}%, RAM floor ${ram} GB, ${mode}`
+      )
       onSaved()
       onClose()
     } catch (e) {
@@ -391,9 +552,22 @@ function EditSettingsModal({ job, onClose, onSaved }) {
     }
   }
 
+  // Slider ceiling follows the device, as it does in the queue form.
+  const ramMaxGb = budget
+    ? Math.max(1, Math.round(budget.ram_floor_max_mb / 1024))
+    : 8
+
+  // A job queued on a bigger machine (or before the budget was known) can
+  // carry a floor above what this one can free. Pull it down so the slider
+  // and the saved value agree instead of silently submitting an out-of-range
+  // number the server would clamp anyway.
+  useEffect(() => {
+    if (budget && ram > ramMaxGb) setRam(ramMaxGb)
+  }, [budget, ramMaxGb, ram])
+
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-surface-2 border border-line rounded-2xl w-full max-w-sm shadow-2xl">
+      <div className="bg-surface-2 border border-line rounded-2xl w-full max-w-sm shadow-2xl max-h-[90vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-line">
           <div className="flex items-center gap-2">
@@ -405,22 +579,42 @@ function EditSettingsModal({ job, onClose, onSaved }) {
           </button>
         </div>
 
-        <div className="p-5 space-y-5">
+        <div className="p-5 space-y-5 overflow-y-auto">
           {/* Status badge */}
           <div className="flex items-center gap-2 bg-surface-1 rounded-lg px-3 py-2">
             <span className={`w-2 h-2 rounded-full shrink-0 ${job.status === 'Running' ? 'bg-accent animate-pulse' : 'bg-warning'}`} />
             <p className="text-xs text-ink-2">
               <span className="font-medium text-ink-0">{job.status}</span>
-              {job.status === 'Running' && ' — changes apply on next batch check'}
-              {job.status === 'Queued'  && ' — changes apply when job starts'}
+              {job.status === 'Running'
+                ? ' — changes are pushed into the running job immediately'
+                : ' — changes apply when the job starts'}
             </p>
+          </div>
+
+          {/* Profile */}
+          <div>
+            <p className="text-xs font-semibold text-ink-0 flex items-center gap-1.5 mb-1.5">
+              <Gauge size={12} className="text-accent" /> Ingestion Profile
+            </p>
+            <ModePicker
+              modes={modes}
+              value={mode}
+              onChange={setMode}
+              disabled={job.status === 'Running'}
+            />
+            {job.status === 'Running' && (
+              <p className="text-[10px] text-ink-2 mt-1">
+                The profile is read when the job starts, so it cannot be
+                changed mid-run. Stop and re-queue to switch.
+              </p>
+            )}
           </div>
 
           {/* CPU slider */}
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="text-xs font-semibold text-ink-0 flex items-center gap-1.5">
-                <Cpu size={12} className="text-accent" /> CPU Throttle
+                <Cpu size={12} className="text-accent" /> CPU Ceiling
               </label>
               <span className={`text-sm font-bold tabular-nums
                 ${cpu >= 80 ? 'text-warning' : cpu >= 50 ? 'text-accent' : 'text-success'}`}>
@@ -452,16 +646,21 @@ function EditSettingsModal({ job, onClose, onSaved }) {
               </span>
             </div>
             <input
-              type="range" min="0" max="8" step="0.5"
-              value={ram}
+              type="range" min="0" max={ramMaxGb} step="0.5"
+              value={Math.min(ram, ramMaxGb)}
               onChange={e => setRam(Number(e.target.value))}
               className="w-full accent-violet-500"
             />
             <div className="flex justify-between text-[10px] text-ink-2 mt-0.5">
               <span>0 GB (override)</span>
-              <span>2 GB (safe)</span>
-              <span>8 GB (cautious)</span>
+              <span>max {ramMaxGb} GB</span>
             </div>
+            {budget && (
+              <p className="text-[10px] text-ink-2 mt-1">
+                {budget.description}. Capped at {ramMaxGb} GB — the most this
+                machine can currently hold free.
+              </p>
+            )}
             {ram < 1 && (
               <p className="text-[10px] text-danger mt-1 flex items-center gap-1">
                 <AlertCircle size={10} />
@@ -572,28 +771,42 @@ export default function EvidencePage() {
 
   const handleEstimate = async (ev) => {
     try {
-      const cpu = queueConfig[ev.id]?.cpu_throttle_percent || 70
-      const res = await estimateTime([ev.id], cpu)
-      setEstimates(prev => ({
-        ...prev,
-        [ev.id]: res.data.estimates[ev.id] || { human_readable: 'Unknown' }
-      }))
+      const cfg = queueConfig[ev.id] || {}
+      // Omitted limits are filled from the live device budget server-side,
+      // so the estimate reflects the machine rather than a stale default.
+      const res = await estimateTime(
+        [ev.id],
+        cfg.cpu_throttle_percent ?? null,
+        cfg.ingestion_mode ?? null
+      )
+      const files = res.data.files || res.data.estimates || []
+      const est = Array.isArray(files)
+        ? (files[0] || { human_readable: 'Unknown' })
+        : (res.data.estimates[ev.id] || { human_readable: 'Unknown' })
+      setEstimates(prev => ({ ...prev, [ev.id]: est }))
     } catch (e) {
       toast.error('Failed to estimate time')
     }
   }
 
-  const handleAddToQueue = async (ev, cpu, ram) => {
+  const handleAddToQueue = async (ev, cpu, ram, ingestionMode) => {
     setAddingToQueue(prev => ({ ...prev, [ev.id]: true }))
     try {
-      await addToQueue({
+      const res = await addToQueue({
         evidence_id: ev.id,
         case_id: caseId,
         cpu_throttle_percent: cpu,
         min_free_ram_mb: Math.round(ram * 1024),
+        ingestion_mode: ingestionMode,
         priority: 1
       })
-      toast.success('Added to queue')
+      const modeLabel = res.data?.ingestion_mode || ingestionMode
+      const warn = res.data?.mode_warnings || []
+      toast.success(
+        warn.length
+          ? `Queued as "${modeLabel}" — ${warn.join(' ')}`
+          : `Queued as "${modeLabel}"`
+      )
       loadEvidence()
       loadQueue()
       loadHistory()
@@ -932,9 +1145,26 @@ export default function EvidencePage() {
                       <ProgressBar percent={job.progress_percent} status="Running" />
                     </div>
                     <div className="flex justify-between items-center text-xs text-ink-2">
-                      <span>{job.cpu_throttle_percent}% CPU</span>
-                      <span>{(job.min_free_ram_mb / 1024).toFixed(1)}GB RAM</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="px-1.5 py-0.5 rounded bg-accent/15 text-accent font-semibold">
+                          {job.ingestion_mode || 'normal'}
+                        </span>
+                        <span>{job.cpu_throttle_percent}% CPU</span>
+                      </span>
+                      <span>{(job.min_free_ram_mb / 1024).toFixed(1)}GB RAM floor</span>
                     </div>
+                    {/* Why a job is not moving, when the governor is holding
+                        it back. Without this a throttled job just looks
+                        broken, because the percent is legitimately frozen. */}
+                    {job.governor?.reason && (
+                      <p className="text-[10px] text-warning mt-1.5 flex items-start gap-1">
+                        <AlertCircle size={10} className="shrink-0 mt-px" />
+                        <span>
+                          Throttled: {job.governor.reason}
+                          {job.governor.ram_pauses > 0 && ` · ${job.governor.ram_pauses} RAM wait(s)`}
+                        </span>
+                      </p>
+                    )}
                   </div>
                 ))
               )}
@@ -1033,7 +1263,7 @@ export default function EvidencePage() {
         <QueueModal
           ev={queuingEv}
           onClose={() => setQueuingEv(null)}
-          onQueue={(cpu, ram) => handleAddToQueue(queuingEv, cpu, ram)}
+          onQueue={(cpu, ram, ingestionMode) => handleAddToQueue(queuingEv, cpu, ram, ingestionMode)}
         />
       )}
     </PageLayout>

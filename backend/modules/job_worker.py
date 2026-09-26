@@ -10,11 +10,87 @@ _worker_thread = None
 _worker_running = False
 _worker_lock = threading.Lock()
 
+# The server's event loop, captured at startup by set_main_loop(). Worker
+# threads schedule their WebSocket sends onto it.
+_main_loop = None
+
 # Per-job control: job_id -> threading.Event (set = stop requested)
 _job_stop_events: dict = {}
 # Per-job override: job_id -> bool (True = bypass resource limits)
 _job_overrides: dict = {}
 _jobs_lock = threading.Lock()
+
+# Live governors of currently-running jobs: job_id -> ResourceGovernor.
+# Registered by _process_job so PATCH /queue/{id}/settings can change the
+# limits of a job that is already running. Without this the endpoint
+# rewrote the database row and the running governor carried on using the
+# values it was constructed with, so "takes effect on next batch" never
+# happened for a job that was already past its first batch.
+_live_governors: dict = {}
+
+
+def set_main_loop(loop):
+    """
+    Called from the FastAPI lifespan with the server's event loop.
+
+    Progress events are produced on a worker thread but the WebSocket
+    objects belong to the server loop, so sends have to be scheduled back
+    onto it.
+    """
+    global _main_loop
+    _main_loop = loop
+    print("[WORKER] Main event loop registered for progress updates")
+
+
+def _register_governor(job_id: str, governor: ResourceGovernor):
+    with _jobs_lock:
+        _live_governors[job_id] = governor
+
+
+def _unregister_governor(job_id: str):
+    with _jobs_lock:
+        _live_governors.pop(job_id, None)
+
+
+def update_job_limits(job_id: str, min_free_ram_mb=None,
+                      cpu_throttle_percent=None) -> bool:
+    """
+    Applies new limits to a running job. Returns True if the job was
+    running and the change was applied live, False if it was not running
+    (in which case the caller has already persisted the values and the
+    worker will pick them up when the job starts).
+    """
+    with _jobs_lock:
+        governor = _live_governors.get(job_id)
+    if governor is None:
+        return False
+    governor.update_limits(
+        min_free_ram_mb=min_free_ram_mb,
+        cpu_throttle_percent=cpu_throttle_percent,
+    )
+    print(
+        f"[WORKER] Live limits for {job_id[:8]}: "
+        f"CPU<={governor.cpu_throttle_percent}% "
+        f"RAM floor {governor.min_free_ram_mb}MB"
+    )
+    return True
+
+
+def governor_snapshot(job_id: str) -> dict:
+    """Current throttling state of a running job, for the UI."""
+    with _jobs_lock:
+        governor = _live_governors.get(job_id)
+    if governor is None:
+        return {"running": False}
+    return {
+        "running": True,
+        "min_free_ram_mb": governor.min_free_ram_mb,
+        "cpu_throttle_percent": governor.cpu_throttle_percent,
+        "force_override": governor.force_override,
+        "ram_pauses": governor.total_pauses,
+        "throttle_seconds": round(governor.total_throttle_seconds, 1),
+        "reason": governor.last_reason,
+    }
 
 
 def force_start_job(job_id: str):
@@ -60,6 +136,7 @@ def _cleanup_job(job_id: str):
     with _jobs_lock:
         _job_stop_events.pop(job_id, None)
         _job_overrides.pop(job_id, None)
+    _unregister_governor(job_id)
 
 def start_worker():
     """
@@ -117,32 +194,67 @@ def stop_worker():
     _worker_running = False
 
 
+def _notify(case_id: str, event_type: str, payload: dict) -> bool:
+    """
+    Schedules a WebSocket broadcast on the server's event loop and returns
+    without waiting for it.
+
+    This used to create a brand new event loop inside the worker thread and
+    run _notify_case on it. That cannot work: the WebSocket objects were
+    accepted on the server's loop, and awaiting send_json from a different
+    loop either raised or silently never reached the client. The result was
+    progress that updated in the database but never on screen, and a stream
+    of "broadcast_progress error" lines in the backend log.
+
+    Now the coroutine is handed to the server loop with
+    run_coroutine_threadsafe, which is the supported way to call into a
+    loop you do not own.
+    """
+    try:
+        from backend.main import _notify_case
+    except Exception as e:
+        print(f"[WS] cannot import _notify_case: {e}")
+        return False
+
+    loop = _main_loop
+    # is_running() matters as much as is_closed(): a loop that is registered
+    # but not spinning accepts the callback and then never executes it, which
+    # leaks the coroutine ("was never awaited") and drops the event silently.
+    if loop is None or loop.is_closed() or not loop.is_running():
+        return False
+
+    coro = _notify_case(case_id, event_type, payload)
+    try:
+        asyncio.run_coroutine_threadsafe(coro, loop)
+        return True
+    except Exception as e:
+        # Never leave an un-awaited coroutine behind on the failure path.
+        try:
+            coro.close()
+        except Exception:
+            pass
+        print(f"[WS] schedule {event_type} failed: {e}")
+        return False
+
+
 def _broadcast_progress(case_id: str, job_id: str, evidence_id: str,
                          percent: int, step: str, status: str = "Running"):
     """
     Emits INGESTION_PROGRESS over WebSocket so the frontend
     can update the queue page in real time without polling.
     """
-    try:
-        import asyncio
-        from backend.main import _notify_case
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(
-            _notify_case(
-                case_id,
-                "INGESTION_PROGRESS",
-                {
-                    "job_id":         job_id,
-                    "evidence_id":    evidence_id,
-                    "percent":        percent,
-                    "step":           step,
-                    "status":         status,
-                },
-            )
-        )
-        loop.close()
-    except Exception as e:
-        print(f"[WS] broadcast_progress error: {e}")
+    _notify(case_id, "INGESTION_PROGRESS", {
+        "job_id":         job_id,
+        "evidence_id":    evidence_id,
+        "percent":        percent,
+        "step":           step,
+        "status":         status,
+    })
+
+
+def _broadcast_event(case_id: str, event_type: str, payload: dict):
+    """Generic fire-and-forget broadcast used for complete/failed events."""
+    _notify(case_id, event_type, payload)
 
 
 def _worker_loop():
@@ -236,11 +348,34 @@ def _process_job(job):
         filename_s    = evidence.filename
         min_ram       = job.min_free_ram_mb
         cpu_pct       = job.cpu_throttle_percent
+        # Absent on rows written before the column existed -> falls back to
+        # "normal" inside resolve_mode_for_device.
+        mode_key      = getattr(job, "ingestion_mode", None)
+
+        # Resolve the mode against this machine before announcing the job, so
+        # the step text can state what will actually happen.
+        from backend.modules.ingestion_modes import (
+            resolve_mode_for_device, get_mode)
+        mode = resolve_mode_for_device(mode_key)
+        for warn in mode.get("warnings") or []:
+            print(f"[WORKER] Mode '{mode['key']}': {warn}")
+
+        if mode["key"] == "accurate":
+            job.current_step = (
+                "Step 1/5: Starting ingestion "
+                f"(accurate · {mode['whisper_model']} transcription"
+                f"{' on GPU' if mode['whisper_gpu'] else ''}"
+                f"{' · deleted-file recovery' if mode['include_deleted'] else ''})"
+            )
+            db.commit()
+            _mode_note = f" [mode: {mode['key']}]"
+        else:
+            _mode_note = ""
 
         # Broadcast initial start over WebSocket
         _broadcast_progress(
             case_id_str, job_id_str, evidence_id_s,
-            0, "Step 1/5: Starting ingestion", "Running"
+            0, f"Step 1/5: Starting ingestion{_mode_note}", "Running"
         )
 
         db.close()
@@ -260,44 +395,43 @@ def _process_job(job):
                 cpu_throttle_percent=cpu_pct
             )
 
+        # Expose the live governor so PATCH /queue/{id}/settings can retune
+        # this job while it runs, instead of only writing the row.
+        _register_governor(job_id_str, governor)
+
         # Run ingestion with job tracking + progress broadcast
         from backend.ingestion import run_ingestion_with_progress
 
         def _stop_check():
             return is_stop_requested(job_id_str)
 
-        run_ingestion_with_progress(
-            evidence_id=evidence_id_s,
-            case_id=case_id_str,
-            file_path=file_path_s,
-            filename=filename_s,
-            job_id=job_id_str,
-            governor=governor,
-            progress_callback=_broadcast_progress,
-            stop_check=_stop_check
-        )
+        try:
+            run_ingestion_with_progress(
+                evidence_id=evidence_id_s,
+                case_id=case_id_str,
+                file_path=file_path_s,
+                filename=filename_s,
+                job_id=job_id_str,
+                governor=governor,
+                progress_callback=_broadcast_progress,
+                stop_check=_stop_check,
+                mode=mode
+            )
+        finally:
+            _unregister_governor(job_id_str)
 
         # ── Emit INGESTION_COMPLETE via WebSocket ───────────────────────────────
-        try:
-            from backend.main import _notify_case
-            _loop = asyncio.new_event_loop()
-            _loop.run_until_complete(
-                _notify_case(
-                    case_id_str,
-                    "INGESTION_COMPLETE",
-                    {
-                        "evidence_id": evidence_id_s,
-                        "filename":    filename_s,
-                        "message":     f"{filename_s} has been ingested",
-                        "job_id":      job_id_str,
-                    },
-                )
-            )
-            _loop.close()
-        except Exception as _ws_err:
-            print(f"[WS] Emit INGESTION_COMPLETE error: {_ws_err}")
-        finally:
-            _cleanup_job(job_id_str)
+        _broadcast_event(
+            case_id_str,
+            "INGESTION_COMPLETE",
+            {
+                "evidence_id": evidence_id_s,
+                "filename":    filename_s,
+                "message":     f"{filename_s} has been ingested",
+                "job_id":      job_id_str,
+            },
+        )
+        _cleanup_job(job_id_str)
 
     except Exception as e:
         print(f"[WORKER] Job failed: {e}")
@@ -331,23 +465,15 @@ def _process_job(job):
 
         # ── Emit INGESTION_FAILED via WebSocket ───────────────────────────────
         if _cid:
-            try:
-                from backend.main import _notify_case
-                _loop = asyncio.new_event_loop()
-                _loop.run_until_complete(
-                    _notify_case(
-                        _cid,
-                        "INGESTION_FAILED",
-                        {
-                            "evidence_id": _eid,
-                            "message":     f"Ingestion stopped" if is_stop_requested(_jid) else f"Ingestion failed: {str(e)[:120]}",
-                            "job_id":      _jid,
-                        },
-                    )
-                )
-                _loop.close()
-            except Exception as _ws_err:
-                print(f"[WS] Emit INGESTION_FAILED error: {_ws_err}")
+            _broadcast_event(
+                _cid,
+                "INGESTION_FAILED",
+                {
+                    "evidence_id": _eid,
+                    "message":     f"Ingestion stopped" if is_stop_requested(_jid) else f"Ingestion failed: {str(e)[:120]}",
+                    "job_id":      _jid,
+                },
+            )
         if _jid:
             _cleanup_job(_jid)
     finally:

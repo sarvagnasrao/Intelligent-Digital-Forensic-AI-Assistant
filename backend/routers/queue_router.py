@@ -12,7 +12,10 @@ from backend.modules.time_estimator import (
 from backend.modules.resource_governor import (
     get_system_info, suggest_resource_budget)
 from backend.modules.hardware_probe import rescan_hardware
-from pydantic import BaseModel
+from backend.modules.ingestion_modes import (
+    describe_modes, get_mode, resolve_mode_for_device,
+    suggest_budget, MODE_TIME_FACTOR, DEFAULT_MODE)
+from pydantic import BaseModel, Field
 from typing import Optional
 import uuid
 from datetime import datetime
@@ -22,11 +25,23 @@ router = APIRouter(
     tags=["Ingestion Queue"]
 )
 
+# Fields describe_modes() already surfaces on the parent object. Repeating
+# them inside "effective" would just give the UI two places to read from.
+_MODE_UI_FIELDS = frozenset({
+    "key", "label", "tagline", "description", "speed", "accuracy",
+    "time_factor",
+})
+
 class QueueJobRequest(BaseModel):
     evidence_id: str
     case_id: str
-    min_free_ram_mb: int = 2048
-    cpu_throttle_percent: int = 70
+    # Both limits are optional now. When omitted they are filled from the
+    # live device budget instead of a hardcoded 2 GB / 70%, which is what
+    # made the queue form offer a 0-8 GB range on a 16 GB machine.
+    min_free_ram_mb: Optional[int] = None
+    cpu_throttle_percent: Optional[int] = None
+    # 'fastest' | 'normal' | 'accurate'. None resolves to the default.
+    ingestion_mode: Optional[str] = None
 
 class BulkQueueRequest(BaseModel):
     jobs: list[QueueJobRequest]
@@ -36,8 +51,8 @@ def get_system_info_endpoint(
     current_user = Depends(get_current_user)
 ):
     """
-    Returns the live hardware + device inventory of this machine
-    and the suggested resource budget.
+    Returns the live hardware + device inventory of this machine, the
+    ingestion profiles on offer, and a resource budget derived from both.
 
     The inventory is re-scanned whenever the set of attached devices
     changes (see hardware_probe.DEFAULT_TTL_SECONDS), so hot-plugged
@@ -45,14 +60,18 @@ def get_system_info_endpoint(
     Use POST /queue/system-info/rescan to force an immediate re-walk.
     """
     info = get_system_info()
-    budget = suggest_resource_budget(info["total_ram_mb"])
+    budget = suggest_budget(info)
     return {
         "system": info,
         # Same payload under a clearer name. The System Resource monitor
         # (Evidence page and Queue page) reads this so both surfaces show
         # an identical hardware description.
         "hardware": info,
-        "suggested_budget": budget
+        "suggested_budget": budget,
+        # The three profiles. Sent from the server so the UI never has to
+        # hardcode a label or a description that can drift from the code.
+        "modes": describe_modes(),
+        "default_mode": "normal",
     }
 
 @router.post("/system-info/rescan")
@@ -71,8 +90,36 @@ def rescan_system_info_endpoint(
     return {
         "system": info,
         "hardware": info,
-        "suggested_budget": suggest_resource_budget(info["total_ram_mb"]),
+        "suggested_budget": suggest_budget(info),
+        "modes": describe_modes(),
+        "default_mode": "normal",
         "rescanned": True
+    }
+
+@router.get("/modes")
+def list_modes_endpoint(
+    current_user = Depends(get_current_user)
+):
+    """
+    The three ingestion profiles, each already resolved against this
+    machine so the UI can show which transcription model and how much
+    concurrency will actually be used.
+    """
+    info = get_system_info()
+    resolved = []
+    for m in describe_modes():
+        eff = resolve_mode_for_device(m["key"], info)
+        # Send the whole resolved profile rather than a hand-picked subset.
+        # A subset is a maintenance trap: the first time someone adds a knob
+        # to ingestion_modes.MODES, the UI silently keeps showing the old
+        # set and the two disagree about what the job will actually do.
+        m["effective"] = {
+            k: v for k, v in eff.items() if k not in _MODE_UI_FIELDS}
+        resolved.append(m)
+    return {
+        "modes": resolved,
+        "default_mode": DEFAULT_MODE,
+        "budget": suggest_budget(info),
     }
 
 @router.post("/estimate")
@@ -84,10 +131,19 @@ def estimate_time(
     """
     Estimates ingestion time for one or
     more evidence files.
-    Body: {evidence_ids: [...], cpu_throttle_percent: 70}
+    Body: {evidence_ids: [...], cpu_throttle_percent: 70,
+           ingestion_mode: 'fastest'|'normal'|'accurate'}
+
+    The estimate is mode-aware, so asking for 'accurate' quotes the slower,
+    more complete pass rather than the balanced baseline.
     """
     evidence_ids = body.get("evidence_ids", [])
-    throttle = body.get("cpu_throttle_percent", 70)
+    # Fall back to the device budget rather than a hardcoded 70%, so the
+    # throttle shown here matches what the job will actually run under.
+    throttle = body.get("cpu_throttle_percent")
+    if throttle is None:
+        throttle = suggest_budget()["cpu_throttle_percent"]
+    mode_key = body.get("ingestion_mode")
 
     files = []
     for eid in evidence_ids:
@@ -107,7 +163,7 @@ def estimate_time(
             status_code=404,
             detail="No evidence found")
 
-    return estimate_queue_total(files, throttle)
+    return estimate_queue_total(files, throttle, mode_key)
 
 @router.post("/add")
 def add_to_queue(
@@ -139,6 +195,31 @@ def add_to_queue(
         db.commit()
 
 
+    # Resolve the profile, and the device budget for anything the operator
+    # did not override. Values left None are filled from the live machine
+    # rather than from the old hardcoded 2 GB / 70% defaults.
+    mode = resolve_mode_for_device(body.ingestion_mode)
+    budget = suggest_budget()
+
+    cpu_pct = body.cpu_throttle_percent
+    if cpu_pct is None:
+        cpu_pct = budget["cpu_throttle_percent"]
+    if not 10 <= int(cpu_pct) <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail="cpu_throttle_percent must be 10-100")
+
+    ram_mb = body.min_free_ram_mb
+    if ram_mb is None:
+        ram_mb = budget["ram_floor_default_mb"]
+    if int(ram_mb) < 0:
+        raise HTTPException(
+            status_code=400,
+            detail="min_free_ram_mb must be >= 0")
+    # A floor above the RAM this machine can ever free would park the job
+    # in a wait loop indefinitely, so cap it at what is actually available.
+    ram_mb = int(min(int(ram_mb), budget["ram_floor_max_mb"]))
+
     # Get queue position
     max_pos = db.query(
         models.IngestionJob
@@ -155,7 +236,8 @@ def add_to_queue(
         est = estimate_ingestion_time(
             ev.filename,
             ev.file_size_bytes,
-            body.cpu_throttle_percent
+            cpu_pct,
+            mode_key=mode["key"]
         )
         estimate = est["total_seconds"]
 
@@ -165,8 +247,9 @@ def add_to_queue(
         case_id=body.case_id,
         status="Queued",
         queue_position=max_pos,
-        min_free_ram_mb=body.min_free_ram_mb,
-        cpu_throttle_percent=body.cpu_throttle_percent,
+        min_free_ram_mb=ram_mb,
+        cpu_throttle_percent=int(cpu_pct),
+        ingestion_mode=mode["key"],
         estimated_seconds=estimate,
         created_by=current_user.username
     )
@@ -181,8 +264,13 @@ def add_to_queue(
     return {
         "job_id": job.id,
         "queue_position": max_pos + 1,
+        "ingestion_mode": mode["key"],
+        "cpu_throttle_percent": int(cpu_pct),
+        "min_free_ram_mb": ram_mb,
         "estimated_seconds": estimate,
-        "estimated_human": _fmt(estimate) if estimate else "Unknown"
+        "estimated_human": _fmt(estimate) if estimate else "Unknown",
+        "mode_warnings": mode.get("warnings") or [],
+        "budget": budget,
     }
 
 @router.post("/add-bulk")
@@ -291,6 +379,10 @@ def list_all_jobs(
         ev = db.query(models.Evidence).filter(
             models.Evidence.id == j.evidence_id
         ).first()
+        # Live throttling state, so the queue can explain a stalled job
+        # instead of just showing a percentage that is not moving.
+        from backend.modules.job_worker import governor_snapshot
+        gov = governor_snapshot(j.id)
         return {
             "id": j.id,
             "evidence_id": j.evidence_id,
@@ -300,6 +392,7 @@ def list_all_jobs(
             "progress_percent": j.progress_percent,
             "progress": j.progress_percent,   # alias for frontend compat
             "current_step": j.current_step,
+            "ingestion_mode": j.ingestion_mode or "normal",
             "estimated_seconds": j.estimated_seconds,
             "elapsed_seconds": j.elapsed_seconds,
             "started_at": str(j.started_at) if j.started_at else None,
@@ -308,6 +401,7 @@ def list_all_jobs(
             "created_by": j.created_by,
             "cpu_throttle_percent": j.cpu_throttle_percent,
             "min_free_ram_mb": j.min_free_ram_mb,
+            "governor": gov,
             # Evidence display fields
             "filename": ev.filename if ev else None,
             "original_filename": ev.filename if ev else None,
@@ -498,12 +592,13 @@ def update_job_settings(
         )
 
     changed = []
+    live_applied = False
     if "cpu_throttle_percent" in body:
         v = int(body["cpu_throttle_percent"])
         if not 10 <= v <= 100:
             raise HTTPException(
                 status_code=400,
-                detail="cpu_throttle_percent must be 10–100"
+                detail="cpu_throttle_percent must be 10-100"
             )
         job.cpu_throttle_percent = v
         changed.append(f"CPU→{v}%")
@@ -515,15 +610,42 @@ def update_job_settings(
                 status_code=400,
                 detail="min_free_ram_mb must be ≥ 0"
             )
+        # Never accept a floor the machine could not satisfy.
+        budget = suggest_budget()
+        v = int(min(v, budget["ram_floor_max_mb"]))
         job.min_free_ram_mb = v
         changed.append(f"RAM floor→{v}MB")
 
+    if "ingestion_mode" in body:
+        mode = resolve_mode_for_device(body["ingestion_mode"])
+        job.ingestion_mode = mode["key"]
+        changed.append(f"mode→{mode['key']}")
+
     db.commit()
+
+    # A queued job has no governor yet, so the row above is enough - the
+    # worker reads it at start. A running job does, so push the new limits
+    # into the live governor too; otherwise the edit only ever showed up in
+    # the database while the job carried on with the old numbers.
+    if job.status == "Running":
+        from backend.modules.job_worker import update_job_limits
+        live_applied = update_job_limits(
+            job.id,
+            min_free_ram_mb=job.min_free_ram_mb,
+            cpu_throttle_percent=job.cpu_throttle_percent,
+        )
+
     return {
         "ok": True,
         "job_id": job_id,
         "changed": changed,
         "cpu_throttle_percent": job.cpu_throttle_percent,
         "min_free_ram_mb": job.min_free_ram_mb,
-        "note": "Changes take effect on next batch boundary for running jobs",
+        "ingestion_mode": job.ingestion_mode or "normal",
+        "applied_live": live_applied,
+        "note": (
+            "Applied to the running job immediately."
+            if live_applied else
+            "Saved. Takes effect when the job starts."
+        ),
     }

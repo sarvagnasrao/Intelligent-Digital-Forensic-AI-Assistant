@@ -209,11 +209,19 @@ export const getSystemInfo = () =>
 export const rescanSystemInfo = () =>
   api.post('/queue/system-info/rescan')
 
-export const estimateTime = (evidenceIds, throttle) =>
+// throttle and mode are both optional: the server fills them from the live
+// device budget when omitted, so the UI never has to guess this machine's
+// limits.
+export const estimateTime = (evidenceIds, throttle, ingestionMode) =>
   api.post('/queue/estimate', {
     evidence_ids: evidenceIds,
-    cpu_throttle_percent: throttle
+    cpu_throttle_percent: throttle,
+    ingestion_mode: ingestionMode
   })
+
+// The three ingestion profiles, each already resolved against this machine.
+export const getIngestionModes = () =>
+  api.get('/queue/modes')
 
 export const addToQueue = (data) =>
   api.post('/queue/add', data)

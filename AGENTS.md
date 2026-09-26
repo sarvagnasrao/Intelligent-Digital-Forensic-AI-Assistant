@@ -398,6 +398,23 @@ python -c "import pyewf, pytsk3; print(pyewf.get_version(), pytsk3.get_version()
 PYTHONPATH=. python backend/migrate_all.py && PYTHONPATH=. python backend/migrate_all.py
 ```
 
+### Behavioural checks (`tests/`)
+
+These run the real pipeline, the real event loop and the real HTTP API — not
+mocks. Each prints `PASS`/`FAIL` per assertion and exits non-zero on failure.
+See `tests/README.md` for details.
+
+```bash
+PYTHONPATH=. python tests/verify_ingestion_modes.py   # 32 assertions, ~15 s
+PYTHONPATH=. python tests/verify_ws_progress.py       # 15 assertions, ~10 s
+PYTHONPATH=. python -W error::RuntimeWarning \
+                    tests/verify_ws_progress.py       # also catches coroutine leaks
+PYTHONPATH=. python tests/verify_queue_api.py         # 37 assertions, ~5 s
+```
+
+Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
+All three clean up every row and per-case Qdrant directory they create.
+
 ### Inspecting a disk image by hand (when 0 artifacts)
 ```python
 import pytsk3, os
@@ -422,10 +439,11 @@ Compare `os.path.getsize(p)` against `part.start + part.len` sectors × 512 — 
 3. ~~Fix B1~~ ✅ done — see §12.
 4. ~~Fix B2~~ ✅ done — see §12.
 5. ~~Fix B3 + B4~~ ✅ done (except deleting the vendored torch wheel) — see §12.
-6. **Fix B5** — probe Ollama before starting the request.
-7. **Decide the GUI question** (§7) — restore `Main2` layout onto `main3` via token migration.
-8. **Refresh `README.md`** against the real feature set, and restore `CLAUDE.md` / `CFI_Setup_Guide.md` from `Main2`.
-9. **Keep this file updated** as work lands.
+6. ~~Fix B7/B8/B9~~ ✅ done — live progress, device-synced limits, real throttling (§13).
+7. **Fix B5** — probe Ollama before starting the request.
+8. **Decide the GUI question** (§7) — restore `Main2` layout onto `main3` via token migration.
+9. **Refresh `README.md`** against the real feature set, and restore `CLAUDE.md` / `CFI_Setup_Guide.md` from `Main2`.
+10. **Keep this file updated** as work lands.
 
 ---
 
@@ -464,3 +482,187 @@ valid FAT16 volume successfully; the risk is low because the walk/extract code i
 6. **Refresh `README.md`** against the real feature set; restore `CLAUDE.md` /
    `CFI_Setup_Guide.md` from `Main2`.
 7. **Keep this file updated** as work lands.
+
+---
+
+## 13. Ingestion pipeline: progress, resource budget, and three profiles
+
+New files: `backend/modules/ingestion_modes.py`, `backend/migrate_ingestion_mode.py`,
+`frontend/src/hooks/useSystemInfo.js`, `tests/`.
+
+### ✅ FIXED B7. Live ingestion progress never reached the browser
+
+**Symptom:** the job row sat at 5 % (or jumped 0 → 100) and the bar froze.
+
+**Two independent root causes, both silent by construction.**
+
+1. **Cross-loop WebSocket sends.** `job_worker` ran the ingestion on a
+   background thread but built a *brand new* event loop inside that thread
+   for each broadcast, then awaited `_notify_case` on it. The `WebSocket`
+   objects had been accepted on the *server's* loop, so the sends could not
+   land. Now the server loop is captured at startup
+   (`job_worker.set_main_loop()` in `main.py`'s lifespan) and broadcasts are
+   scheduled with `asyncio.run_coroutine_threadsafe`. The three throwaway
+   `run_until_complete` blocks are gone.
+2. **A callback arity mismatch behind a bare `except: pass`.** This is the one
+   that actually cost every intermediate tick. `run_ingestion_with_progress`
+   defined `_progress(percent, step)` and handed *that* to the sub-pipelines
+   as their `progress_callback`. The sub-pipelines correctly called the
+   documented 5-argument contract
+   `progress_callback(case_id, job_id, evidence_id, percent, step)`, so every
+   call raised `TypeError: _progress() takes 2 positional arguments but 5
+   were given` — inside `except Exception: pass`. The database row still
+   advanced (that path is separate), so the job *looked* alive server-side
+   while the socket emitted exactly one event. Fixed by introducing an
+   explicit 5-argument `_dispatch(cid, jid, eid, percent, step)` and passing
+   *that* to the sub-pipelines. The bare `pass` is now a printed error.
+
+**Also fixed while in there:**
+- The forensic path called `_update_job_progress` directly at every stage, so
+  a disk image — the slowest ingest in the product — emitted **no** WebSocket
+  events at all. It now uses the same dispatcher.
+- Non-monotonic progress: the forensic path went `85 → 75 → 90`, so the bar
+  moved backwards mid-job.
+- Step 3 recomputed as `40 + int((done/total)*30)` over the band the step
+  actually owns, replacing `i/len(chunks)` computed *after* the batch was
+  stored (always one batch behind, never reached 70 before jumping to 75).
+- Added `_finish_job_no_text()` — a file yielding no text left the job stuck
+  at "Running" 10 % forever.
+
+**Trap — do not reintroduce:** a loop that is *registered but not spinning*
+accepts `run_coroutine_threadsafe` and then never runs the coroutine, so the
+event vanishes with no error and the coroutine leaks ("was never awaited").
+`_notify` checks `loop.is_running()` as well as `is_closed()`, and closes the
+coroutine on a scheduling failure.
+
+### ✅ FIXED B8. The RAM limit was a hardcoded 8 GB, unrelated to the machine
+
+The "8 GB" the operator saw was `max="8"` on an HTML range input in
+`EvidencePage.jsx`, with hardcoded labels `0 GB (override) / 2 GB (safe) /
+8 GB (cautious)`. Behind it, `suggest_resource_budget()` branched on a fixed
+8/16/32 GB ladder. Nothing in that path consulted the hardware.
+
+`ingestion_modes.suggest_budget()` now derives everything from the live probe
+(available RAM, physical/logical cores, laptop + battery, discrete GPU) and
+returns the **slider bounds** alongside the defaults: `ram_floor_min_mb`,
+`ram_floor_default_mb`, `ram_floor_max_mb`, `cpu_min_percent`,
+`cpu_max_percent`, `total_ram_mb`, `available_ram_mb`, `gpu_acceleration`,
+`description`, `health`, `max_parallel_files`.
+
+On the dev box (15.9 GB RAM, 4C/8T, GTX 1050 Ti) that is a 1792 MB default
+floor and a 7168 MB ceiling, replacing the fixed 8192 MB.
+
+The old `suggest_resource_budget()` survives as a thin shim over
+`suggest_budget()` for signature compatibility; its `total_ram_mb` argument is
+ignored because the probe is authoritative.
+
+### ✅ FIXED B9. Resource throttling was disabled for every job
+
+`check_and_throttle` contained an unconditional `self.force_override = True`,
+which short-circuited both the RAM and the CPU check — so the queue page's
+limits were decorative. The governor now:
+
+- honours `force_override` only when the constructor sets it;
+- ramps `get_sleep_seconds(cpu_percent)` from *measured* load against the
+  ceiling (at a 70 % ceiling: 0 s at ≤70 % load, 0.75 s at 100 %) instead of a
+  flat 1 s per batch;
+- waits for RAM in 2 s slices honouring stop, bounded by
+  `ram_wait_seconds = 120` so a busy machine cannot produce a queue that
+  never drains;
+- records `last_reason`, `total_throttle_seconds`, `total_pauses`, and
+  supports `update_limits()` for live changes.
+
+`job_worker` keeps a `_live_governors` registry, so `PATCH /queue/{id}/settings`
+on a *running* job takes effect immediately and reports `applied_live: true`.
+
+### ✅ NEW — three ingestion profiles
+
+`backend/modules/ingestion_modes.py` is the single source of truth; the worker,
+the estimator and the UI all read it, so they cannot disagree.
+
+| | `fastest` | `normal` | `accurate` |
+|---|---|---|---|
+| chunk size / overlap | 30000 / 0 | 20000 / 0 | 8000 / 400 |
+| embed batch | 256 | 128 | 64 |
+| OCR | off | on | on |
+| Whisper | `tiny` | `base` | `small` |
+| deleted-file recovery | off | off | **on** |
+| `MODE_TIME_FACTOR` | 0.55 | 1.0 | 2.6 |
+
+- `GET /api/queue/modes` returns all three already resolved against this
+  machine, each under `effective`. It sends the **whole** resolved profile,
+  not a hand-picked subset — a subset is a trap, because the first new knob
+  added to `MODES` would silently never reach the UI.
+- `resolve_mode_for_device()` only ever downgrades the *Whisper size* and
+  clamps `max_parallel`; it never silently drops OCR, chunking or
+  deleted-file recovery. Every downgrade is returned in `warnings` and
+  surfaced in the UI and in the `add_to_queue` response as `mode_warnings`.
+- Chunk-size changes affect retrieval granularity, not dimensionality, so
+  existing Qdrant collections stay valid (`VECTOR_SIZE = 384`).
+- `include_deleted` is the main cost driver on disk images and only `accurate`
+  sets it.
+- `ingestion_mode` is a nullable `String(20)` on `ingestion_jobs`, added by
+  `migrate_ingestion_mode.py` (registry entry 18). Nullable because SQLite
+  cannot `ALTER TABLE ADD COLUMN` with a non-constant default; the existing
+  row is backfilled to `'normal'` and `resolve_mode_for_device(None)` already
+  treats NULL as `'normal'`.
+- `estimate_ingestion_time(..., mode_key=)` now scales by `MODE_TIME_FACTOR`.
+  It did not before, so all three profiles quoted the identical time.
+
+**GPU honesty:** a GPU in the hardware inventory is not the same thing as
+torch being able to drive it. `transcription_device()` (in `ingestion_modes`,
+probed once, cached) asks `torch.cuda.is_available()`;
+`media_extractor._resolve_whisper_device` delegates to it. If a discrete GPU
+is present but torch is a CPU-only build, the profile reports
+`whisper_gpu: false` and warns, instead of showing a `(GPU)` badge that turns
+out to be false the first time an audio file is queued. `fp16` is tied to the
+resolved device rather than hardcoded `False`.
+
+**On this machine:** torch is `2.3.0+cpu`, so `_resolve_whisper_device`
+returns `'cpu'` and `normal`/`accurate` emit the "torch reports no usable CUDA
+device" warning. A CUDA torch build is required before GPU transcription
+actually engages.
+
+### Frontend
+
+- `hooks/useSystemInfo.js` — one shared, module-cached description of the
+  machine, consumed by the Evidence-page queue form, the Edit-settings modal
+  and `ResourceMonitor`'s rescan. The RAM slider renders **disabled with a
+  placeholder** until the budget lands rather than guessing a maximum and
+  snapping the value when the real one arrives.
+- `EvidencePage.jsx` — `ModePicker` (rendered from the server's profile list,
+  so a label cannot drift from the code that implements it), the device-synced
+  RAM ceiling, and `governor.reason` on the job row so a throttled job does not
+  look hung. A 0 GB floor gets an explicit warning.
+- `QueuePage.jsx` — WebSocket-driven live progress (the 3 s poll is kept as the
+  safety net for chunk/entity counts and the completed rows), the profile
+  badge, and the throttle reason.
+- `ResourceMonitor.jsx` — its Rescan button now also invalidates the shared
+  budget cache, which is exactly the moment the answer changes.
+
+**Verification:** `py_compile` on all touched Python · `import backend.main` ·
+`migrate_all.py` twice (idempotent, 18/18 OK) · `vite build` clean (3384
+modules) · **84 behavioural assertions across three scripts, 0 failures**:
+
+- `tests/verify_ingestion_modes.py` (32) — the same 58 300-char file under all
+  three profiles yields **2 / 3 / 8** chunks, matching the configured
+  `chunk_size` exactly. That is the assertion which proves the profile reaches
+  the pipeline rather than just being stored on the row and shown in the UI.
+  Progress monotonic, ends at 100, mode persisted.
+- `tests/verify_ws_progress.py` (15) — events arrive on the **server's** loop
+  (`socket.loops == {id(server_loop)}`), a registered-but-stopped loop is
+  refused without leaking, and a strict 5-argument callback — the worker's
+  actual shape — is honoured. Run with `-W error::RuntimeWarning`.
+- `tests/verify_queue_api.py` (37) — profiles, budget with slider bounds
+  (`ram_floor_max_mb` was observed tracking `available_ram_mb` at 0.91 as free
+  memory moved between 7.2 GB and 10.1 GB), mode-aware estimates
+  (26 s / 47 s / 121 s for the same file), limit validation, live settings,
+  rescan.
+
+**Still unproven:** an end-to-end ingest of a valid, complete raw/forensic
+image. The disk-image path's progress dispatcher is now correct by construction
+and shares the code path the document tests exercise, but no fixture on disk is
+a complete image (`SCHARDT.001` is truncated — §6 B1).
+
+**Still to do:** B5 (Ollama probe), the `Main2` GUI question (§7), rotate the
+PATs (§8), delete the vendored torch wheel (§12), refresh `README.md`.

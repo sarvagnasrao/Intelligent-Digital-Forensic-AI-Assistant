@@ -474,6 +474,13 @@ class IngestionJob(Base):
     # 100 = full speed
     # 50 = sleep 1s between batches
     # 25 = sleep 3s between batches
+    # Which accuracy/time profile to ingest under:
+    # 'fastest' | 'normal' | 'accurate'.
+    # See backend/modules/ingestion_modes.py. Rows written before this
+    # column existed are NULL and resolve to 'normal' at runtime, so the
+    # migration backfills rather than forcing a NOT NULL constraint.
+    ingestion_mode = Column(
+        String(20), nullable=True)
 
     # Timestamps
     queued_at = Column(

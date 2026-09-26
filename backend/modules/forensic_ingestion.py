@@ -174,12 +174,20 @@ def is_supported_file(filename: str,
 def extract_text_from_bytes(
         data: bytes,
         filename: str,
-        temp_dir: str) -> tuple:
+        temp_dir: str,
+        run_ocr: bool = True,
+        whisper_model: str = None,
+        whisper_gpu: bool = True) -> tuple:
     """
     Extracts text from file bytes.
     Returns (extracted_text, extraction_type)
     Writes to temp file for libraries
     that need a file path.
+
+    run_ocr / whisper_model / whisper_gpu come from the ingestion mode.
+    They are keyword-only-with-defaults so every existing caller keeps
+    working unchanged, but the 'fastest' profile now genuinely skips OCR
+    instead of paying for it and throwing the text away.
     """
     ext = os.path.splitext(filename.lower())[1]
 
@@ -262,12 +270,20 @@ def extract_text_from_bytes(
     # Image files — try OCR first,
     # then fall through to EXIF below
     if ext in IMAGE_EXTENSIONS:
-        from backend.modules.media_extractor \
-            import extract_image_ocr
-        ocr_text = extract_image_ocr(data)
-        if ocr_text and len(
-                ocr_text.strip()) > 20:
-            return ocr_text[:20000], 'ocr', {}
+        if not run_ocr:
+            # 'fastest' profile: skip Tesseract entirely. EXIF/GPS below
+            # still runs, so the image is not lost - it just has no text.
+            print(
+                "[EXTRACT] OCR disabled by ingestion mode - "
+                "extracting EXIF only."
+            )
+        else:
+            from backend.modules.media_extractor \
+                import extract_image_ocr
+            ocr_text = extract_image_ocr(data)
+            if ocr_text and len(
+                    ocr_text.strip()) > 20:
+                return ocr_text[:20000], 'ocr', {}
         # Fall through to EXIF + GPS extraction
         if EXIFREAD_AVAILABLE:
             try:
@@ -341,7 +357,10 @@ def extract_text_from_bytes(
         from backend.modules.media_extractor \
             import extract_media
         result = extract_media(
-            data, filename, temp_dir)
+            data, filename, temp_dir,
+            run_ocr=run_ocr,
+            whisper_model=whisper_model,
+            whisper_gpu=whisper_gpu)
         # extract_media returns (text, type)
         return result[0], result[1], {}
 

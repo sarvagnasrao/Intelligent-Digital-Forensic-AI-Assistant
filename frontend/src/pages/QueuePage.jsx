@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Layers, RefreshCw, CheckCircle, XCircle,
   Clock, Trash2, HardDrive, Cpu,
@@ -9,6 +9,7 @@ import ResourceMonitor from '../components/ResourceMonitor'
 import toast from 'react-hot-toast'
 import { formatDistanceToNow, intervalToDuration } from 'date-fns'
 import { fromUtc } from '../utils/time'
+import useWebSocket from '../hooks/useWebSocket'
 
 // ─── Status config ────────────────────────────────────────────────────────────
 const STATUS_CONFIG = {
@@ -123,13 +124,47 @@ function JobRow({ job, onRetry, onDelete }) {
             {name}
           </span>
         </div>
-        <div style={{ display: 'flex', gap: 10, paddingLeft: 18 }}>
+        <div style={{ display: 'flex', gap: 10, paddingLeft: 18, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 10, fontFamily: 'monospace', color: 'rgba(255,255,255,0.18)' }}>
             {job.case_id?.slice(0, 8)}…
           </span>
+          {/* The profile the job is running under, so the queue always
+              states which accuracy/time trade-off produced the result. */}
+          {job.ingestion_mode && (
+            <span
+              title={`Ingestion profile: ${job.ingestion_mode}`}
+              style={{
+                fontSize: 10,
+                fontWeight: 500,
+                color: 'rgba(129,140,248,0.9)',
+                background: 'rgba(99,102,241,0.1)',
+                border: '1px solid rgba(99,102,241,0.25)',
+                borderRadius: 4,
+                padding: '0 5px',
+              }}
+            >
+              {job.ingestion_mode}
+            </span>
+          )}
           {job.current_step && job.status === 'Running' && (
             <span style={{ fontSize: 10, color: 'rgba(99,102,241,0.7)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>
               {job.current_step}
+            </span>
+          )}
+          {/* A throttled job's percent is legitimately frozen. Say why,
+              otherwise it is indistinguishable from a hung one. */}
+          {job.status === 'Running' && job.governor?.reason && (
+            <span
+              title={
+                `${job.governor.reason}` +
+                (job.governor.ram_pauses > 0
+                  ? ` · ${job.governor.ram_pauses} RAM wait(s)`
+                  : '') +
+                ` · ${job.governor.throttle_seconds || 0}s throttled`
+              }
+              style={{ fontSize: 10, color: 'rgba(245,158,11,0.85)' }}
+            >
+              throttled: {job.governor.reason}
             </span>
           )}
           {job.error_message && job.status === 'Failed' && (
@@ -315,6 +350,27 @@ export default function QueuePage() {
     pollRef.current = setInterval(load, 3000)
     return () => clearInterval(pollRef.current)
   }, [])
+
+  // Live progress over the WebSocket, so the bar moves as each batch lands
+  // instead of jumping every 3 s. The poll above stays as a safety net: it
+  // still owns everything the socket does not carry (chunk/entity counts,
+  // the governor's throttle reason, the completed/failed rows).
+  useWebSocket('/ws/global', useCallback((msg) => {
+    if (msg.type === 'INGESTION_PROGRESS' && msg.job_id) {
+      setJobs(prev => prev.map(j => (
+        j.id === msg.job_id
+          ? {
+              ...j,
+              progress_percent: msg.percent ?? j.progress_percent,
+              progress:        msg.percent ?? j.progress,
+              current_step:    msg.step    ?? j.current_step,
+            }
+          : j
+      )))
+    } else if (msg.type === 'INGESTION_COMPLETE' || msg.type === 'INGESTION_FAILED') {
+      load()
+    }
+  }, []))
 
   const handleRetry = async (evidenceId, caseId) => {
     try {

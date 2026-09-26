@@ -4,6 +4,7 @@ import {
   RefreshCw, Monitor, Network, Battery, Server, ShieldAlert,
 } from 'lucide-react'
 import { getSystemInfo, rescanSystemInfo } from '../api/client'
+import { refreshSystemInfo } from '../hooks/useSystemInfo'
 import usePreferences from '../hooks/usePreferences'
 
 /**
@@ -129,6 +130,11 @@ export default function ResourceMonitor({
     setScanning(true)
     try {
       apply(await rescanSystemInfo())
+      // Invalidate the shared device budget too. The queue form sizes its
+      // RAM-floor slider from that budget, and a rescan is exactly the
+      // moment the answer changes - e.g. after plugging in a bigger machine
+      // or a GPU. Fire-and-forget: a failure here must not blank the panel.
+      refreshSystemInfo().catch(() => {})
     } catch {
       setError(true)
     } finally {

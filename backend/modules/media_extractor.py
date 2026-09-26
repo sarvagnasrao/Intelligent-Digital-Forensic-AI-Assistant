@@ -115,20 +115,75 @@ IMAGE_EXTENSIONS = {
 MAX_AUDIO_DURATION_SECONDS = 1800
 
 
-# ── Whisper model (lazy load) ─────────────
+# ── Whisper model (lazy load, per size) ─────────────
 
-def _get_whisper_model():
+# Cache one model per size, so a queue mixing 'fastest' and 'accurate' jobs
+# does not thrash between two model loads.
+_WHISPER_MODELS: dict = {}
+_WHISPER_DEVICE: str = None
+
+
+def _resolve_whisper_device(want_gpu: bool = True) -> str:
     """
-    Loads the Whisper 'tiny' model on first
-    use. Tiny uses ~39 MB RAM — safe for M1
-    8 GB machines. Model is cached globally.
+    Returns 'cuda' when a usable CUDA device is present, else 'cpu'.
+
+    Resolved once and cached. A CPU-only build of torch is common on
+    Windows laptops even when the GPU is capable, and asking for 'cuda'
+    there raises instead of falling back - which is why this probes rather
+    than assuming.
+
+    The probe itself lives in ingestion_modes.transcription_device() so the
+    profile the UI previews and the device used here are the same fact read
+    from one implementation. This used to be a second, independent probe,
+    which meant the queue form could promise GPU transcription that this
+    function then silently refused to use.
+    """
+    global _WHISPER_DEVICE
+    if not want_gpu:
+        return 'cpu'
+    if _WHISPER_DEVICE is None:
+        from backend.modules.ingestion_modes import transcription_device
+        _WHISPER_DEVICE = transcription_device() or 'cpu'
+    if _WHISPER_DEVICE == 'cuda':
+        try:
+            import torch
+            print(
+                f"[MEDIA] Whisper will use GPU: "
+                f"{torch.cuda.get_device_name(0)}")
+        except Exception:
+            pass
+    else:
+        print(
+            "[MEDIA] No CUDA device available to torch - "
+            "transcription will run on the CPU."
+        )
+    return _WHISPER_DEVICE
+
+
+def _get_whisper_model(model_name: str = None, use_gpu: bool = True):
+    """
+    Loads the requested Whisper model on first use and caches it per size.
+
+    The size used to be hardcoded to 'tiny', which meant the "accurate"
+    profile could never actually transcribe accurately, and the model was
+    always loaded on the CPU even on a box with a discrete GPU. Both are
+    now driven by the ingestion mode.
     """
     global _WHISPER_MODEL
-    if _WHISPER_MODEL is None:
-        print("[MEDIA] Loading Whisper tiny model…")
-        _WHISPER_MODEL = whisper.load_model("tiny")
-        print("[MEDIA] Whisper model loaded")
-    return _WHISPER_MODEL
+    size = model_name or os.environ.get("WHISPER_MODEL", "tiny")
+    device = _resolve_whisper_device(use_gpu)
+
+    cached = _WHISPER_MODELS.get((size, device))
+    if cached is not None:
+        return cached
+
+    print(f"[MEDIA] Loading Whisper '{size}' on {device}…")
+    model = whisper.load_model(size, device=device)
+    _WHISPER_MODELS[(size, device)] = model
+    # Back-compat: some callers still read the single-model global.
+    _WHISPER_MODEL = model
+    print(f"[MEDIA] Whisper '{size}' ready on {device}")
+    return model
 
 
 # ── Office document extractors ────────────
@@ -362,10 +417,13 @@ def extract_image_ocr(data: bytes) -> str:
 
 def extract_audio_transcript(data: bytes,
                               filename: str,
-                              temp_dir: str) -> str:
+                              temp_dir: str,
+                              model_name: str = None,
+                              use_gpu: bool = True) -> str:
     """
     Transcribes an audio file using Whisper.
-    - Lazy-loads the tiny model on first call
+    - Lazy-loads the requested model on first call
+    - Runs on the GPU when torch reports a usable CUDA device
     - Skips files longer than MAX_AUDIO_DURATION_SECONDS
     - Returns a placeholder if Whisper is not installed
     - Temp files are cleaned up in a finally block
@@ -417,10 +475,13 @@ def extract_audio_transcript(data: bytes,
             pass  # ffprobe not available, continue
 
         print(f"[MEDIA] Transcribing: {filename}…")
-        model = _get_whisper_model()
+        model = _get_whisper_model(model_name, use_gpu)
+        # fp16 is only safe on CUDA. Half precision on CPU is either
+        # unsupported or silently wrong, so it is tied to the device.
+        device = _resolve_whisper_device(use_gpu)
         result = model.transcribe(
             tmp_path,
-            fp16=False,         # Required for M1 CPU
+            fp16=(device == 'cuda'),
             language=None       # Auto-detect language
         )
         transcript = result.get("text", "").strip()
@@ -448,7 +509,9 @@ def extract_audio_transcript(data: bytes,
 
 def extract_video(data: bytes,
                   filename: str,
-                  temp_dir: str) -> tuple:
+                  temp_dir: str,
+                  whisper_model: str = None,
+                  whisper_gpu: bool = True) -> tuple:
     """
     Extracts forensic metadata and audio
     transcript from a video file.
@@ -460,6 +523,8 @@ def extract_video(data: bytes,
       3. Extract audio track with ffmpeg → WAV
       4. Transcribe with Whisper
       5. Clean up all temp files
+
+    whisper_model / whisper_gpu come from the ingestion mode.
 
     Returns (text: str, metadata: dict)
     """
@@ -592,7 +657,9 @@ def extract_video(data: bytes,
                             extract_audio_transcript(
                                 audio_data,
                                 "extracted_audio.wav",
-                                temp_dir
+                                temp_dir,
+                                model_name=whisper_model,
+                                use_gpu=whisper_gpu
                             )
                         if transcript:
                             parts.append(
@@ -761,11 +828,18 @@ def extract_browser_history(
 
 def extract_media(data: bytes,
                   filename: str,
-                  temp_dir: str) -> tuple:
+                  temp_dir: str,
+                  run_ocr: bool = True,
+                  whisper_model: str = None,
+                  whisper_gpu: bool = True) -> tuple:
     """
     Main entry point for multimedia extraction.
     Routes to the appropriate extractor based
     on file extension.
+
+    run_ocr / whisper_model / whisper_gpu are supplied by the ingestion
+    mode, so the 'fastest' profile skips OCR and the 'accurate' profile
+    transcribes with a larger model, on the GPU when one is available.
 
     Returns:
         (extracted_text: str, media_type: str)
@@ -799,18 +873,24 @@ def extract_media(data: bytes,
     if ext in AUDIO_EXTENSIONS:
         return (
             extract_audio_transcript(
-                data, filename, temp_dir),
+                data, filename, temp_dir,
+                model_name=whisper_model,
+                use_gpu=whisper_gpu),
             'audio'
         )
 
     # Video files
     if ext in VIDEO_EXTENSIONS:
         text, _meta = extract_video(
-            data, filename, temp_dir)
+            data, filename, temp_dir,
+            whisper_model=whisper_model,
+            whisper_gpu=whisper_gpu)
         return text, 'video'
 
     # Images — OCR first, then EXIF fallback
     if ext in IMAGE_EXTENSIONS:
+        if not run_ocr:
+            return "", 'exif'   # caller handles EXIF
         ocr_text = extract_image_ocr(data)
         if ocr_text and len(
                 ocr_text.strip()) > 20:

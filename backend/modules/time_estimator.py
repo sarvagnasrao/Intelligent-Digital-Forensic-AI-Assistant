@@ -65,13 +65,26 @@ EMBEDDING_OVERHEAD_PER_MB = 2.0
 def estimate_ingestion_time(
         filename: str,
         file_size_bytes: int,
-        cpu_throttle_percent: int = 100
+        cpu_throttle_percent: int = 100,
+        mode_key: str = None
 ) -> dict:
     """
     Estimates ingestion time for a file.
     Returns dict with seconds estimate
     and human-readable breakdown.
+
+    mode_key selects an ingestion profile ('fastest' | 'normal' |
+    'accurate'). It scales the estimate so the number the operator sees
+    reflects the mode they actually picked, rather than always quoting the
+    balanced case.
     """
+    from backend.modules.ingestion_modes import (
+        get_mode, MODE_TIME_FACTOR, DEFAULT_MODE)
+
+    mode = get_mode(mode_key or DEFAULT_MODE)
+    mode_key = mode["key"]
+    mode_factor = MODE_TIME_FACTOR.get(mode_key, 1.0)
+
     ext = os.path.splitext(filename.lower())[1]
     size_mb = file_size_bytes / (1024 * 1024)
     size_gb = size_mb / 1024
@@ -114,6 +127,14 @@ def estimate_ingestion_time(
         embedding_seconds +
         graph_seconds)
 
+    # Scale for the chosen profile. The per-MB table above is calibrated
+    # against the 'normal' profile, so 'fastest' genuinely does less work
+    # (no OCR, larger chunks, tiny transcription model) and 'accurate' does
+    # more (deleted-file recovery, GPU transcription, small overlapping
+    # chunks). Without this the estimate was identical for all three and an
+    # operator picking 'accurate' had no idea what they were signing up for.
+    total_seconds *= mode_factor
+
     # Apply throttle factor
     throttle_factor = (
         100 / max(cpu_throttle_percent, 10))
@@ -126,26 +147,38 @@ def estimate_ingestion_time(
         "file": filename,
         "size_mb": round(size_mb, 1),
         "category": category,
-        "extraction_seconds": round(extraction_seconds * throttle_factor),
-        "embedding_seconds": round(embedding_seconds * throttle_factor),
-        "graph_seconds": round(graph_seconds * throttle_factor),
+        "ingestion_mode": mode_key,
+        "mode_factor": mode_factor,
+        "chunk_size": mode["chunk_size"],
+        "extraction_seconds": round(
+            extraction_seconds * throttle_factor * mode_factor),
+        "embedding_seconds": round(
+            embedding_seconds * throttle_factor * mode_factor),
+        "graph_seconds": round(
+            graph_seconds * throttle_factor * mode_factor),
         "total_seconds": round(total_seconds),
         "human_readable": _format_duration(round(total_seconds)),
         "throttle_applied": throttle_factor > 1.0,
         "note": (
-            "Estimate based on M1 Mac benchmarks. Actual time may "
-            "vary by 50% depending on file content density."
+            "Estimate is relative, not absolute: it scales the extracted "
+            "text volume, the transcription model and the chunk count for "
+            f"the '{mode_key}' profile. A machine already under load will "
+            "also stretch it."
         )
     }
 
 def estimate_queue_total(
         files: list[dict],
-        cpu_throttle_percent: int = 100
+        cpu_throttle_percent: int = 100,
+        mode_key: str = None
 ) -> dict:
     """
     Estimates total time for a list of
     files queued for ingestion.
     files: list of {filename, file_size_bytes}
+    mode_key: a single profile applied to the whole batch, or None for the
+    default. Per-file modes are summed correctly when every entry carries
+    its own 'ingestion_mode' key.
     """
     estimates = []
     total_seconds = 0
@@ -154,7 +187,8 @@ def estimate_queue_total(
         est = estimate_ingestion_time(
             f["filename"],
             f["file_size_bytes"],
-            cpu_throttle_percent
+            cpu_throttle_percent,
+            mode_key=f.get("ingestion_mode") or mode_key
         )
         estimates.append(est)
         total_seconds += est["total_seconds"]

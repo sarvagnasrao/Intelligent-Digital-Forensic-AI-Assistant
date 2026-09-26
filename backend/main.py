@@ -22,13 +22,20 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     # Startup
     init_db()
-    from backend.modules.job_worker import start_worker
+    from backend.modules.job_worker import start_worker, set_main_loop
+    # The ingestion worker runs in a background thread but must send
+    # progress over WebSockets owned by *this* event loop. Hand it the loop
+    # so it can schedule sends with run_coroutine_threadsafe instead of
+    # spinning up a throwaway loop of its own.
+    set_main_loop(asyncio.get_running_loop())
     start_worker()
     print(f"Database initialized")
     print("Ingestion queue worker started")
     print(f"IDF AI Assistant Backend starting on http://localhost:8000")
     yield
     # Shutdown
+    from backend.modules.job_worker import stop_worker
+    stop_worker()
     print("IDF AI Assistant Backend shutting down")
 
 

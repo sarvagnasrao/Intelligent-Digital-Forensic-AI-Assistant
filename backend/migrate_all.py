@@ -75,6 +75,7 @@ MIGRATIONS = [
     (15, "migrate_audit_severity",      "backend.migrate_audit_severity"),
     (16, "migrate_final (create_all)",  "backend.migrate_final"),
     (17, "migrate_user_prefs",          "backend.migrate_user_prefs"),
+    (18, "migrate_ingestion_mode",      "backend.migrate_ingestion_mode"),
 ]
 
 # Step 1 (init_db) plus everything in the registry.

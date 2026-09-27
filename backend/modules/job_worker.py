@@ -5,6 +5,7 @@ from datetime import datetime
 from backend.database import SessionLocal
 from backend import models
 from backend.modules.resource_governor import ResourceGovernor
+from backend.modules.eta import EtaTracker
 
 _worker_thread = None
 _worker_running = False
@@ -237,11 +238,95 @@ def _notify(case_id: str, event_type: str, payload: dict) -> bool:
         return False
 
 
+def _throttle_seconds(job_id: str) -> float:
+    """
+    Total seconds this job has spent paused by the governor, via the
+    public snapshot rather than by reaching into the live governor.
+
+    A failed lookup is 0.0, not an exception: the ETA is a measurement, and
+    losing one measurement is a smaller problem than losing the frame that
+    carries it.
+    """
+    try:
+        snap = governor_snapshot(job_id)
+        return float(snap.get("throttle_seconds") or 0.0)
+    except Exception as e:
+        print(f"[WORKER] governor snapshot failed for {job_id[:8]}: {e}")
+        return 0.0
+
+
+def _write_timing(session, job_id: str, elapsed, eta) -> bool:
+    """Persist elapsed/eta onto the job row. Returns True if it committed."""
+    try:
+        session.execute(
+            models.IngestionJob.__table__.update()
+            .where(models.IngestionJob.id == job_id)
+            .values(elapsed_seconds=elapsed, eta_seconds=eta)
+        )
+        session.commit()
+        return True
+    except Exception as e:
+        try:
+            session.rollback()
+        except Exception as rb:
+            print(f"[WORKER] timing rollback failed for {job_id[:8]}: {rb}")
+        print(f"[WORKER] timing write failed for {job_id[:8]}: {e}")
+        return False
+
+
+def _tick_eta(job_id: str, percent, tracker, session,
+              throttle_seconds: float = 0.0) -> dict:
+    """
+    Advances the job's ETA and writes it to the row. Runs on every
+    progress frame, so it is written to be incapable of breaking the
+    pipeline it is measuring: every failure is logged and reported as
+    "unknown", never raised. A progress path that raises is a much worse
+    bug than a missing countdown - it is the B11 shape, where an
+    exception out of the progress path left the job Running for ever.
+    """
+    unknown = {"elapsed_seconds": None, "eta_seconds": None}
+    if tracker is None or session is None:
+        return unknown
+    try:
+        state = tracker.update(percent, throttle_seconds=throttle_seconds)
+    except Exception as e:
+        print(f"[WORKER] ETA update failed for {job_id[:8]}: {e}")
+        return unknown
+    _write_timing(session, job_id,
+                  state.get("elapsed_seconds"), state.get("eta_seconds"))
+    return state
+
+
+def _safe_elapsed(tracker):
+    """tracker's elapsed wall clock in whole seconds, or None. Never raises."""
+    try:
+        if tracker is None:
+            return None
+        return int(round(tracker.elapsed()))
+    except Exception as e:
+        print(f"[WORKER] elapsed read failed: {e}")
+        return None
+
+
 def _broadcast_progress(case_id: str, job_id: str, evidence_id: str,
-                         percent: int, step: str, status: str = "Running"):
+                         percent: int, step: str, status: str = "Running",
+                         elapsed_seconds: int = None, eta_seconds: int = None):
     """
     Emits INGESTION_PROGRESS over WebSocket so the frontend
     can update the queue page in real time without polling.
+
+    The first five parameters are the contract ingestion.py calls, and they
+    are positional by design: this function is handed to
+    run_ingestion_with_progress as progress_callback, and a mismatch in
+    that arity is swallowed behind a bare except inside the pipeline and
+    silently kills every intermediate update (§13 B7). Do not reorder or
+    "tidy" them.
+
+    elapsed_seconds and eta_seconds are additional keyword arguments so
+    the queue page gets the countdown off the socket instead of waiting
+    for its next poll. They are always present, and eta_seconds is
+    explicitly allowed to be null: null is "not measurable", and the UI
+    must render it as such rather than coercing it to zero.
     """
     _notify(case_id, "INGESTION_PROGRESS", {
         "job_id":         job_id,
@@ -249,6 +334,8 @@ def _broadcast_progress(case_id: str, job_id: str, evidence_id: str,
         "percent":        percent,
         "step":           step,
         "status":         status,
+        "elapsed_seconds": elapsed_seconds,
+        "eta_seconds":    eta_seconds,
     })
 
 
@@ -311,6 +398,10 @@ def _get_next_job():
 def _process_job(job):
     """Processes a single ingestion job."""
     db = SessionLocal()
+    # Bound before the try so the terminal handlers and the finally can
+    # refer to them whether or not the job ever got as far as creating them.
+    eta_tracker = None
+    eta_db = None
     try:
         # Mark as running
         job = db.query(
@@ -325,6 +416,36 @@ def _process_job(job):
         job.started_at = datetime.utcnow()
         job.current_step = "Step 1/5: Starting ingestion"
         db.commit()
+
+        # ── Live timing ────────────────────────────────────────────────
+        # elapsed_seconds was a column nothing ever wrote, so every running
+        # job reported 0 - a fabricated zero on a job that had been running
+        # for ten minutes, indistinguishable from one that just started.
+        # The tracker is seeded from the queue-time estimate so the very
+        # first frame can already show a countdown, before any work has
+        # been measured to correct it with.
+        eta_tracker = EtaTracker(prior_seconds=job.estimated_seconds)
+        # One session for the whole job, not one per frame: this is
+        # written on every progress tick, and a session per tick would
+        # open and close a SQLite connection hundreds of times on a large
+        # ingest. It is committed per frame, so it holds no lock between
+        # frames and cannot block the API thread.
+        eta_db = SessionLocal()
+
+        def _progress_frame(cid, jid, eid, percent, step):
+            """
+            The 5-argument progress contract ingestion.py calls for every
+            frame (case_id, job_id, evidence_id, percent, step). Bound as
+            a closure over this job's tracker; the arity is load-bearing,
+            see _broadcast_progress.
+            """
+            state = _tick_eta(
+                jid, percent, eta_tracker, eta_db,
+                throttle_seconds=_throttle_seconds(jid))
+            _broadcast_progress(
+                cid, jid, eid, percent, step,
+                elapsed_seconds=state.get("elapsed_seconds"),
+                eta_seconds=state.get("eta_seconds"))
 
         evidence = db.query(
             models.Evidence
@@ -380,11 +501,13 @@ def _process_job(job):
             f"Step 1/5: Starting ingestion ({_extra}) [{mode['key']}]")
         db.commit()
 
-        # Broadcast initial start over WebSocket
-        _broadcast_progress(
+        # Broadcast initial start over WebSocket. Routed through the same
+        # frame function as every later update so the very first socket
+        # event already carries elapsed/eta, rather than arriving a step
+        # behind the rest of the stream.
+        _progress_frame(
             case_id_str, job_id_str, evidence_id_s,
-            0, f"Step 1/5: Starting ingestion{_mode_note}", "Running"
-        )
+            0, f"Step 1/5: Starting ingestion{_mode_note}")
 
         db.close()
 
@@ -421,12 +544,20 @@ def _process_job(job):
                 filename=filename_s,
                 job_id=job_id_str,
                 governor=governor,
-                progress_callback=_broadcast_progress,
+                progress_callback=_progress_frame,
                 stop_check=_stop_check,
                 mode=mode
             )
         finally:
             _unregister_governor(job_id_str)
+
+        # Final timing. The job completed, so "nothing remaining" is a real
+        # zero here - the one place it is entitled to be written - and
+        # elapsed_seconds is the answer to "how long did this actually
+        # take", which used to be a permanent 0.
+        _elapsed_final = _safe_elapsed(eta_tracker)
+        if _elapsed_final is not None:
+            _write_timing(eta_db, job_id_str, _elapsed_final, 0)
 
         # ── Emit INGESTION_COMPLETE via WebSocket ───────────────────────────────
         _broadcast_event(
@@ -459,6 +590,15 @@ def _process_job(job):
                     j.status = "Stopped" if is_stop_requested(_jid) else "Failed"
                     j.error_message = str(e)
                     j.current_step = "Stopped by user" if is_stop_requested(_jid) else "Failed — see error"
+                    # How long it ran before failing or being stopped is
+                    # the one number a terminal row leaves behind, and it
+                    # read 0 before. No ETA is written: nothing further is
+                    # going to run, but the job is not "about to finish",
+                    # and a countdown on a red row would be a lie.
+                    _elapsed_fail = _safe_elapsed(eta_tracker)
+                    if _elapsed_fail is not None:
+                        j.elapsed_seconds = _elapsed_fail
+                    j.eta_seconds = None
                     db2.commit()
             if _eid:
                 ev = db2.query(models.Evidence).filter(
@@ -485,6 +625,11 @@ def _process_job(job):
         if _jid:
             _cleanup_job(_jid)
     finally:
+        try:
+            if eta_db is not None:
+                eta_db.close()
+        except Exception as e:
+            print(f"[WORKER] timing session close failed: {e}")
         try:
             db.close()
         except:

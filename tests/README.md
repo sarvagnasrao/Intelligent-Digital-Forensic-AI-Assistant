@@ -17,6 +17,8 @@ PYTHONPATH=. venv/bin/python tests/verify_forensic_failure.py
 PYTHONPATH=. venv/bin/python tests/verify_vector_store.py
 PYTHONPATH=. venv/bin/python tests/verify_cpu_sampler.py
 PYTHONPATH=. venv/bin/python tests/verify_gpu_telemetry.py
+PYTHONPATH=. venv/bin/python tests/verify_eta.py
+PYTHONPATH=. venv/bin/python tests/verify_service_health.py
 PYTHONPATH=. venv/bin/python tests/verify_live_stack.py   # needs the stack running
 
 # Windows
@@ -28,10 +30,12 @@ $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_forensic_failure.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_vector_store.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_cpu_sampler.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_gpu_telemetry.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_eta.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_service_health.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_live_stack.py
 ```
 
-The first eight are self-contained — **334 assertions**. `verify_live_stack.py`
+The first eight are self-contained — **585 assertions**. `verify_live_stack.py`
 is the ninth and needs `ollama serve`, uvicorn on `:8000` and the Vite dev
 server on `:3000` already running; it waits 90 s for the backend and skips
 cleanly if it never comes up.
@@ -56,6 +60,8 @@ cleanly if it never comes up.
 | `verify_live_stack.py` | End-to-end over a real socket: uploads a file, queues it as `accurate`, and asserts monotonic `INGESTION_PROGRESS` frames actually arrive on `/ws/global` and land on a `Completed` row. | ~90 s |
 | `verify_cpu_sampler.py` | The CPU figure is a real measurement, not a primed constant. Burns all logical cores in **subprocesses** and requires the reported load to climb and then fall, and pins the forced re-scan's worst case below the 300 ms the old blocking sampler cost on every cache miss. | ~10 s |
 | `verify_gpu_telemetry.py` | The NVML ABI, end to end. Each entry point gets its own struct and the version handshake; the 32-bit misread is *refused*; a field-order misread is *refused*; both `used` conventions are accepted and normalised; the VRAM ratio divides by a denominator covering the same adapters as its numerator; sysfs byte values are converted; a failed NVML session recovers; and no unmeasurable metric ever becomes `0`. | ~20 s |
+| `verify_eta.py` | The live countdown. `elapsed_seconds` was a column nothing ever wrote, so every running job reported `0` — indistinguishable from one that had just started. Drives `EtaTracker` with an injected fake clock and requires: the estimate is `None` (never `0`) when there is neither a prior nor a measurement; `0` only at 100 %; a clean run counts down monotonically; the blend beats naive `elapsed / percent * 100` on an uneven-band job; governor pauses lengthen the quote without exploding it; a drop from 100 % is a restart and reports `None`, not a false `0`; and hostile input (`None`, `"abc"`, `NaN`, `-5`, `500`, a backwards pause counter) never raises. | <1 s |
+| `verify_service_health.py` | The measured health behind `GET /api/status` — the endpoint that used to report fiction, with `database` as `os.path.exists()` presented as connectivity and `ollama` as "running" whenever `/api/tags` answered 200 (which it does with an *empty* model list, so a machine that had never pulled a model reported a healthy AI). It runs all six probes against throwaway databases and temporary case trees, and asserts the module's own rule in every direction that matters: a metric that cannot be measured is `None` plus a reason and never a fabricated `0`, `False` or `"ok"`; `state` separates *measured and broken* from *could not measure*; a probe that raises degrades to `unavailable` for that service alone and leaves the other five measured; and the legacy keys `database`, `ollama`, `models` and `cases_dir` — still read by `Sidebar.jsx` — can never be fabricated healthy. It also pins the two fixtures that most easily stop discriminating: the `_MISSING` sentinel (a worker that has never started must not read as "not introspectable") and the bounded directory walk (exceeding the cap yields *no* total, not a partial one). Self-contained and safe to re-run: every assertion points `backend.database.engine` at a throwaway file and the run asserts afterwards that `data/forensic.db` was never opened. It cannot exercise the real worker loop, since that only starts in the FastAPI lifespan — so the no-heartbeat gap (a wedged worker still reads `ok`) stays unproven here. | ~25 s |
 
 ## Why these exist
 

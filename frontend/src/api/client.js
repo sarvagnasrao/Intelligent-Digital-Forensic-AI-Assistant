@@ -27,9 +27,60 @@ api.interceptors.response.use(
   }
 )
 
+// ── Honest error messages ─────────────────────────────────────────────
+// An axios error carries the real reason in one of three different places,
+// and `err.response?.data?.detail` only ever reads one of them.
+//
+// The case that matters most is the one that reads worst. With the backend
+// down, Vite's dev proxy still answers - it replies 500 with a *completely
+// empty body* - so `detail` is undefined and a naive `|| 'fallback'` reports
+// an unreachable server as bad credentials. That is the same defect class as
+// the silent-success bugs in the ingestion path: the app states something
+// confidently true-shaped that is simply not what happened.
+//
+// So the `fallback` is only allowed to speak when the server actually
+// answered. "No server" always gets its own message.
+export const apiErrorMessage = (err, fallback) => {
+  const res = err?.response
+  const detail = res?.data?.detail
+
+  // The server gave a structured reason. Most specific thing we have.
+  if (typeof detail === 'string' && detail) return detail
+
+  // A proxy or gateway answering with plain text rather than JSON.
+  if (typeof res?.data === 'string' && res.data.trim()) {
+    return res.data.trim().slice(0, 200)
+  }
+
+  if (res?.status === 429) {
+    return 'Too many attempts — wait a minute, then try again.'
+  }
+
+  // Reached a server, but it could not answer.
+  if (res) {
+    return `The server returned an error (HTTP ${res.status}).`
+  }
+
+  // Never reached a server at all.
+  if (err?.code === 'ECONNABORTED' || /timeout/i.test(err?.message || '')) {
+    return 'The backend did not respond in time.'
+  }
+  return 'Cannot reach the backend on port 8000 — is it running?'
+}
+
 // Auth endpoints
+// Bare `axios`, not the `api` instance, and that is load-bearing: `api`'s
+// response interceptor redirects to /login on any 401, so routing a login
+// attempt through it would turn a wrong password into a reload loop.
+//
+// The timeout is explicit because axios defaults to none — a proxy that
+// accepts the socket and then never answers would spin the button for ever.
 export const login = (username, password, totp_code = null) => {
-  return axios.post('/api/auth/login-2fa', { username, password, totp_code })
+  return axios.post(
+    '/api/auth/login-2fa',
+    { username, password, totp_code },
+    { timeout: 15000 }
+  )
 }
 
 export const register = (data) =>

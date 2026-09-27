@@ -463,6 +463,14 @@ class IngestionJob(Base):
     elapsed_seconds = Column(
         Integer, default=0)
 
+    # Live "time remaining", rewritten by the worker on every progress
+    # frame. Nullable on purpose: a job with no defensible estimate stores
+    # NULL and the UI renders that as an em dash. A 0 default would be a
+    # fabricated "no time remaining" for a job that has not run at all -
+    # the same fake-zero defect as elapsed_seconds was (see AGENTS.md §16).
+    eta_seconds = Column(
+        Integer, nullable=True)
+
     # Resource budget
     min_free_ram_mb = Column(
         Integer, default=2048)

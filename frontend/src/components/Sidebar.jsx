@@ -171,8 +171,15 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
 
   const isActive = (p) => location.pathname === p
 
+  // Three states, not two. `status` is null until the first /api/status lands, and
+  // that call takes ~2 s (it asks Ollama for its model list). Treating "not known
+  // yet" as failure rendered a red "Ollama offline" dot for the whole time the
+  // request was in flight - and a slow or hung /api/tags made that look permanent.
+  // So an absent reading is neutral, never a failure colour.
   const dbOk = status?.database === 'connected'
+  const dbKnown = !!status
   const ollamaOk = status?.ollama === 'running'
+  const ollamaKnown = !!status
 
   return (
     <aside style={{
@@ -506,18 +513,18 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
           display: 'flex', alignItems: 'center', gap: 14,
           flexShrink: 0,
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }} title={dbOk ? 'Database connected' : 'Database error'}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }} title={dbOk ? 'Database connected' : dbKnown ? 'Database error' : 'Database status not measured yet'}>
             <span style={{
               width: 5, height: 5, borderRadius: '50%', flexShrink: 0,
-              background: dbOk ? '#10b981' : '#ef4444',
+              background: dbOk ? '#10b981' : dbKnown ? '#ef4444' : '#94a3b8',
             }} />
             <Database size={11} style={{ color: 'var(--ink-2)', flexShrink: 0 }} />
             <span style={{ fontSize: 9, color: 'var(--ink-2)', letterSpacing: '0.04em' }}>DB</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }} title={ollamaOk ? 'Ollama running' : 'Ollama offline'}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }} title={ollamaOk ? 'Ollama ready to answer' : ollamaKnown ? 'Ollama not answering' : 'AI status not measured yet'}>
             <span style={{
               width: 5, height: 5, borderRadius: '50%', flexShrink: 0,
-              background: ollamaOk ? '#10b981' : '#ef4444',
+              background: ollamaOk ? '#10b981' : ollamaKnown ? '#ef4444' : '#94a3b8',
             }} />
             <Cpu size={11} style={{ color: 'var(--ink-2)', flexShrink: 0 }} />
             <span style={{ fontSize: 9, color: 'var(--ink-2)', letterSpacing: '0.04em' }}>AI</span>
@@ -530,13 +537,13 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
           display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5,
           borderTop: '1px solid var(--line-DEFAULT)',
         }}>
-          <span title={`Database: ${dbOk ? 'Connected' : 'Error'}`} style={{
+          <span title={`Database: ${dbOk ? 'Connected' : dbKnown ? 'Error' : 'Checking'}`} style={{
             width: 5, height: 5, borderRadius: '50%',
-            background: dbOk ? '#10b981' : '#ef4444',
+            background: dbOk ? '#10b981' : dbKnown ? '#ef4444' : '#94a3b8',
           }} />
-          <span title={`AI: ${ollamaOk ? 'Running' : 'Offline'}`} style={{
+          <span title={`AI: ${ollamaOk ? 'Ready' : ollamaKnown ? 'Not answering' : 'Checking'}`} style={{
             width: 5, height: 5, borderRadius: '50%',
-            background: ollamaOk ? '#10b981' : '#ef4444',
+            background: ollamaOk ? '#10b981' : ollamaKnown ? '#ef4444' : '#94a3b8',
           }} />
         </div>
       )}

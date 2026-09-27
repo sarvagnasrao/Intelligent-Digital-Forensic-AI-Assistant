@@ -12,7 +12,7 @@ import PageLayout from '../components/PageLayout'
 import ResourceMonitor from '../components/ResourceMonitor'
 import useSystemInfo from '../hooks/useSystemInfo'
 import toast from 'react-hot-toast'
-import { formatDistanceToNow, intervalToDuration } from 'date-fns'
+import { formatDistanceToNow } from 'date-fns'
 import { fromUtc } from '../utils/time'
 import useWebSocket from '../hooks/useWebSocket'
 
@@ -73,12 +73,37 @@ const STATUS_CONFIG = {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function elapsed(seconds) {
-  if (!seconds || seconds < 1) return '—'
-  const d = intervalToDuration({ start: 0, end: seconds * 1000 })
-  if (d.hours > 0) return `${d.hours}h ${d.minutes}m`
-  if (d.minutes > 0) return `${d.minutes}m ${d.seconds}s`
-  return `${d.seconds}s`
+
+/**
+ * seconds -> `45s` / `4m 20s` / `1h 05m`.
+ *
+ * A component that is exactly zero is dropped rather than padded out, so two
+ * minutes reads `2m` and not the `2m 00s` that a strict zero-pad produces.
+ *
+ * Returns **null** for a value that is not a usable measurement, and never for a
+ * real zero. That distinction is the entire point of the function: the server
+ * sends `eta_seconds: null` when it cannot project a finish and
+ * `eta_seconds: 0` when there is nothing left to do, and collapsing those two
+ * in either direction is how a job that has just started ends up proudly
+ * reporting `0s left`. The previous version of this helper did exactly that —
+ * it returned the em dash for `null`, `0` and `1` alike — which is why the null
+ * case is now decided here, once, instead of at each call site.
+ */
+function fmtDuration(seconds) {
+  // `seconds == null` must be tested before any coercion: `Number(null)` is 0,
+  // so a null that reached the arithmetic would format as a confident `0s`.
+  if (seconds == null || seconds === '') return null
+  const total = Math.round(Number(seconds))
+  if (!Number.isFinite(total) || total < 0) return null
+  if (total < 60) return `${total}s`
+  if (total < 3600) {
+    const m = Math.floor(total / 60)
+    const s = total % 60
+    return s === 0 ? `${m}m` : `${m}m ${String(s).padStart(2, '0')}s`
+  }
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  return m === 0 ? `${h}h` : `${h}h ${String(m).padStart(2, '0')}m`
 }
 
 function timeAgo(dateStr) {
@@ -330,6 +355,19 @@ function JobRow({ job, onRetry, onDelete, onSaveSettings, onForceStart, onStop, 
   const name = job.original_filename || job.filename || 'Unknown file'
   const progress = job.progress_percent ?? job.progress
 
+  // ── Timing ─────────────────────────────────────────────────────────────────
+  // Derived straight from the row on every render, with no local state and no
+  // local timer, so the 3 s poll re-seeds them for free and the value can never
+  // drift away from what the server last said. A browser-side countdown would
+  // look livelier and would be wrong the instant the projection is revised -
+  // after a throttle, a faster chunk, or a corrected elapsed time - and a
+  // self-decrementing estimate is a wrong number with extra motion.
+  const eta = fmtDuration(job.eta_seconds)
+  const runtime = fmtDuration(job.elapsed_seconds)
+  // An estimate of zero for a job that has not started is not a fast file, it
+  // is a missing figure, so it is treated as unknown rather than announced.
+  const estimate = job.estimated_seconds > 0 ? fmtDuration(job.estimated_seconds) : null
+
   return (
     <div
       className="queue-row"
@@ -382,6 +420,24 @@ function JobRow({ job, onRetry, onDelete, onSaveSettings, onForceStart, onStop, 
           {job.current_step && job.status === 'Running' && (
             <span style={{ fontSize: 10, color: 'rgba(99,102,241,0.7)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }}>
               {job.current_step}
+            </span>
+          )}
+          {/* Approximate time remaining, and only while the job is actually
+              running. `eta_seconds` is null whenever the server cannot project
+              a finish yet - an unknown, emphatically not a zero - so it reads
+              "estimating…" rather than `0s left`. A legitimate 0 (the job is
+              at 100%) still renders as `~0s left`, because it is true. */}
+          {job.status === 'Running' && (
+            <span
+              title={eta == null
+                ? 'Not enough measured progress yet to project a finish time'
+                : 'Approximate time remaining, projected from measured throughput'}
+              style={{
+                fontSize: 10,
+                color: eta == null ? 'rgba(255,255,255,0.3)' : 'rgba(165,180,252,0.9)',
+              }}
+            >
+              {eta == null ? 'estimating…' : `~${eta} left`}
             </span>
           )}
           {/* A throttled job's percent is legitimately frozen. Say why,
@@ -467,18 +523,18 @@ function JobRow({ job, onRetry, onDelete, onSaveSettings, onForceStart, onStop, 
         {job.entity_count != null ? job.entity_count : '—'}
       </span>
 
-      {/* Time */}
+      {/* Time. Only a running job has an elapsed time worth reporting, a queued
+          job has not started so the only honest figure is the profile- and
+          throttle-aware estimate, and a terminal row reports when it finished
+          rather than a countdown that no longer means anything. */}
       <div style={{ textAlign: 'right' }}>
         <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.28)' }}>
-          {job.status === 'Running' || job.status === 'Queued'
-            ? elapsed(job.elapsed_seconds)
-            : timeAgo(job.completed_at)}
+          {job.status === 'Running'
+            ? (runtime == null ? '—' : `${runtime} elapsed`)
+            : job.status === 'Queued'
+              ? (estimate == null ? '—' : `~${estimate} estimated`)
+              : timeAgo(job.completed_at)}
         </div>
-        {job.status === 'Queued' && job.estimated_seconds && (
-          <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.18)', marginTop: 2 }}>
-            est. {elapsed(job.estimated_seconds)}
-          </div>
-        )}
       </div>
 
       {/* Actions */}
@@ -710,6 +766,17 @@ export default function QueuePage() {
   // instead of jumping every 3 s. The poll above stays as a safety net: it
   // still owns everything the socket does not carry (chunk/entity counts,
   // the governor's throttle reason, the completed/failed rows).
+  //
+  // Precedence is per key. Progress and step use `??`: an absent field is an
+  // unchanged field, and a frame legitimately has nothing new to say about
+  // them. The timing fields use *present-key*-wins instead, because for them
+  // `null` is a value and not an absence — a frame carrying `eta_seconds: null`
+  // is the server withdrawing a projection it will not stand behind, and `??`
+  // would keep displaying the polled number the server has already disowned.
+  // A frame that omits the key entirely (an older backend) leaves the polled
+  // value in place. And because the poll replaces the whole row every 3 s, the
+  // server's own row stays authoritative between frames; the socket only
+  // refines it in between.
   useWebSocket('/ws/global', useCallback((msg) => {
     if (msg.type === 'INGESTION_PROGRESS' && msg.job_id) {
       setJobs(prev => prev.map(j => (
@@ -719,6 +786,8 @@ export default function QueuePage() {
               progress_percent: msg.percent ?? j.progress_percent,
               progress:        msg.percent ?? j.progress,
               current_step:    msg.step    ?? j.current_step,
+              eta_seconds:     ('eta_seconds' in msg)     ? msg.eta_seconds     : j.eta_seconds,
+              elapsed_seconds: ('elapsed_seconds' in msg) ? msg.elapsed_seconds : j.elapsed_seconds,
             }
           : j
       )))

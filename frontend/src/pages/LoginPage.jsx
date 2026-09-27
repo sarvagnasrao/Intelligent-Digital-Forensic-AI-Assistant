@@ -7,6 +7,7 @@
            Search, AlertTriangle,
            Key, Globe } from 'lucide-react'
   import { useAuth } from '../context/AuthContext'
+  import { apiErrorMessage } from '../api/client'
   import toast from 'react-hot-toast'
 
   const FEATURES = [
@@ -74,9 +75,12 @@
         await signIn(form.username, form.password)
         navigate('/')
       } catch (e) {
-        toast.error(
-          e.response?.data?.detail || 'Authentication failed'
-        )
+        // Not `e.response?.data?.detail || '...'`: with the
+        // backend down the proxy answers 500 with an empty
+        // body, so that fallback reported an unreachable
+        // server as bad credentials.
+        toast.error(apiErrorMessage(
+          e, 'Authentication failed'))
       } finally {
         setLoading(false)
       }

@@ -2,6 +2,10 @@
 
 > **An AI-powered digital forensics platform for investigative analysis of evidence — built entirely offline, on your machine.**
 
+> ### 👉 New here? Start at **[SETUP.md](SETUP.md)**.
+> One page: prerequisites, install, the `ollama pull` step people skip, the ports, and
+> what each failure actually means. The sections below are the long version.
+
 ---
 
 ## Table of Contents
@@ -386,9 +390,13 @@ Per-case Qdrant stores and evidence folders are created automatically under `dat
 
 ```bash
 cd frontend
-npm install        # or: yarn install
+npm install
 cd ..
 ```
+
+> Use **npm**, not yarn. `frontend/package-lock.json` is the lockfile of record. The
+> global `yarn` 1.x on Windows cannot resolve `vite` and dies with
+> `vite is not recognized`.
 
 ### Step 5 — Ollama model
 
@@ -396,6 +404,12 @@ cd ..
 ollama serve          # terminal 1
 ollama pull llama3.2:3b   # terminal 2
 ```
+
+> **Do not skip the `pull`.** Ollama starts happily with **zero** models installed, and
+> `/api/tags` still returns `200` with an empty list — so a running daemon is not the
+> same as a model being available to answer with. Check the **System Health** page: the
+> Ollama card reports `model_ready`, which is the fact that matters. Without a model the
+> assistant cannot answer, and no amount of rephrasing a question will change that.
 
 ---
 
@@ -430,7 +444,7 @@ Backend: **http://localhost:8000**
 
 ```bash
 cd frontend
-npm run dev          # or: yarn dev  (needs Yarn 4 - see Troubleshooting)
+npm run dev
 ```
 
 Frontend: **http://localhost:3000**
@@ -717,29 +731,30 @@ Start `ollama serve` first, then retry. Generation is unavailable until the serv
 
 ---
 
-### `yarn dev` fails with `'vite' is not recognized`
+### `'vite' is not recognized`
 
-The frontend scripts are normally run through Yarn 4 (`frontend/.yarnrc.yml` sets
-`yarnPath` and `packageManager`). The **global Yarn 1.x shim on Windows ignores both**, so
-`yarn dev` cannot find the `vite` binary:
+This is a **yarn** problem — the project uses **npm**, and `frontend/package-lock.json` is
+the lockfile of record. The global `yarn` 1.x shim on Windows does not resolve the local
+`vite` binary:
 
 ```
 'vite' is not recognized as an internal or external command
 command not found: vite
 ```
 
-This is a Yarn version problem, not a missing dependency — `frontend/node_modules/.bin/vite.cmd`
-exists. Fixes, in order of preference:
+It is not a missing dependency — `frontend/node_modules/.bin/vite.cmd` exists. Just use npm:
 
 ```cmd
-:: Option 1 - enable the bundled Yarn 4 via corepack (matches the committed yarn.lock)
-corepack enable
-yarn --version        REM should print 4.x
-cd frontend && yarn dev
-
-:: Option 2 - use npm instead
-cd frontend && npm install && npm run dev
+cd frontend
+npm install
+npm run dev
 ```
+
+The Yarn 4 configuration that used to sit in the repo (`frontend/.yarnrc.yml`, a
+committed 3.7 MB `yarn-4.18.1.cjs`, and two `yarn.lock` files — one of them a 90-byte
+empty stub) has been removed, so there is no longer a second package manager to
+accidentally half-use. A root `yarn.lock` that pinned nothing is exactly the kind of file
+that makes a fresh install non-reproducible.
 
 `start_windows.bat` and `start.sh` do **not** depend on either package manager: they invoke
 `frontend/node_modules/.bin/vite` directly, so the launcher works regardless of which one you

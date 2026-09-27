@@ -76,6 +76,7 @@ MIGRATIONS = [
     (16, "migrate_final (create_all)",  "backend.migrate_final"),
     (17, "migrate_user_prefs",          "backend.migrate_user_prefs"),
     (18, "migrate_ingestion_mode",      "backend.migrate_ingestion_mode"),
+    (19, "migrate_eta",                 "backend.migrate_eta"),
 ]
 
 # Step 1 (init_db) plus everything in the registry.

@@ -205,38 +205,29 @@ def health_check():
 @app.get("/api/status")
 def system_status():
     """
-    Returns status of all connected services.
-    Used by frontend to show system health.
+    Returns the MEASURED status of every backend service.
+
+    This used to answer with three values, two of them fictional:
+    "database" was os.path.exists() on a hardcoded path reported as
+    "connected" (existence is not connectivity - a corrupt, locked or
+    read-only database file exists perfectly happily), and "ollama" was
+    "running" whenever /api/tags answered 200, which it also does with an
+    EMPTY model list, so a machine with zero models installed reported a
+    healthy AI (AGENTS.md §6 B5, §15).
+
+    The probes live in backend/modules/service_health.py. They follow one
+    invariant (AGENTS.md §16): a metric that cannot be measured is None
+    plus a reason, never a fabricated 0, False or "ok", and a probe that
+    fails degrades to state "unavailable" for that one service rather
+    than taking the whole response down with it.
+
+    The legacy top-level keys (database / ollama / models / cases_dir)
+    are preserved for the existing consumers. They are lossy, and they
+    collapse towards not-fabricating: "ollama" is "running" only when a
+    model is actually ready to answer.
     """
-    import os
-
-    # Check database
-    db_exists = os.path.exists("./data/forensic.db")
-
-    # Check Ollama
-    try:
-        import requests
-
-        r = requests.get(
-            "http://localhost:11434/api/tags",
-            timeout=3,
-        )
-        ollama_status = r.status_code == 200
-        models_available = (
-            [m["name"] for m in r.json().get("models", [])]
-            if ollama_status
-            else []
-        )
-    except Exception:
-        ollama_status = False
-        models_available = []
-
-    return {
-        "database": "connected" if db_exists else "not found",
-        "ollama": "running" if ollama_status else "offline",
-        "models": models_available,
-        "cases_dir": os.path.exists(settings.cases_dir),
-    }
+    from backend.modules.service_health import collect_status
+    return collect_status(settings.cases_dir)
 
 
 

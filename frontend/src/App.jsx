@@ -49,17 +49,28 @@ function AppLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
 
   useEffect(() => {
+    // A throw here used to fabricate `{ database: 'error', ollama: 'offline' }`,
+    // which turned a backend that was merely slow to answer into a permanently
+    // reported-dead AI. Now an unreachable status endpoint only says so.
+    let cancelled = false
     const fetchStatus = async () => {
       try {
         const res = await getStatus()
-        setSystemStatus(res.data)
+        if (!cancelled) setSystemStatus(res.data)
       } catch {
-        setSystemStatus({ database: 'error', ollama: 'offline' })
+        // Leave the previous payload alone if there was one; if there was not,
+        // systemStatus stays null and the Sidebar renders a neutral "checking"
+        // state rather than a fabricated failure.
+        if (!cancelled) setSystemStatus(null)
       }
     }
     fetchStatus()
+    // Fast at first - the backend is often still starting when the page opens -
+    // then settle to the slow cadence once a real reading exists.
+    const fast = setInterval(fetchStatus, 4000)
+    const slow = setInterval(() => { if (systemStatus) clearInterval(fast) }, 4000)
     const interval = setInterval(fetchStatus, 30000)
-    return () => clearInterval(interval)
+    return () => { cancelled = true; clearInterval(fast); clearInterval(slow); clearInterval(interval) }
   }, [])
 
   const sidebarWidth = sidebarOpen ? SIDEBAR_EXPANDED : SIDEBAR_COLLAPSED

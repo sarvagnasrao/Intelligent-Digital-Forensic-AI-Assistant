@@ -4,10 +4,12 @@
 > **Rule:** read this file *before* changing code. It records verified state, known bugs, and traps that are not
 > derivable from the code itself.
 >
-> Last verified against: `main3` @ `1915171` + the live-stack pass (2026-09-27) —
+> Last verified against: `main3` @ the §18 commit (2026-09-27) —
 > §13 covers the ingestion rework, §14 the live end-to-end run and the three
-> further bugs it found (B10/B11/B12), and **§15 the stop button, per-case
-> Qdrant isolation and the optional-dependency trap (B13/B14/B15)**.
+> further bugs it found (B10/B11/B12), **§15 the stop button, per-case
+> Qdrant isolation and the optional-dependency trap (B13/B14/B15)**,
+> §16/§17 the telemetry and per-job controls, and **§18 the honesty pass
+> (B20–B23): the silent AI, real system health, live ETA and durable prompts**.
 > See §6 and §12 for the forensic-image fixes.
 
 ---
@@ -1410,6 +1412,255 @@ what is free, and never below 1 GB.
 
 **Full gate, servers stopped: 334 assertions across eight scripts, 0 failures**
 (39 + 15 + 51 + 17 + 15 + 17 + 9 + 171). `npm run build` clean.
+
+---
+
+## 18. The honesty pass — B20–B23
+
+Four user-reported symptoms. Each had a different proximate cause, and all four are the
+same defect class as B1, B10, B11 and B16–B19: **a confident, true-shaped message that
+is not what happened.** In three of the four, the app blamed the investigator for
+something the investigator did not control.
+
+### ✅ FIXED B20. "Authentication failed" for a server that was not running
+
+Not an authentication failure at all. With the backend down, Vite's dev proxy still
+answers — **HTTP 500 with a zero-length body** (measured: 126 ms). `LoginPage.jsx` read
+`e.response?.data?.detail || 'Authentication failed'`, and on an empty body `detail` is
+`undefined`, so the fallback won. An unreachable server was reported as a wrong password.
+
+`apiErrorMessage(err, fallback)` in `client.js` now separates the cases, and the
+load-bearing rule is that **`fallback` may only speak when a server actually answered**.
+No response at all gets its own message. The login call also gained an explicit 15 s
+timeout: bare `axios` defaults to *none*, so a proxy that accepts the socket without
+answering spins the button for ever.
+
+> **Trap — do not "tidy" this by routing `login` through the `api` instance.** `api`'s
+> response interceptor redirects to `/login` on any 401, so a wrong password during a
+> login attempt becomes a reload loop. The bare `axios` is load-bearing.
+
+22 other call sites use the same `?.detail ||` shape. They are less exposed rather than
+differently wrong; `apiErrorMessage` is exported for them.
+
+### ✅ FIXED B21. The AI answered nothing, and blamed the investigator's question
+
+Ollama was running with **zero models installed**. `generate_response` called
+`/api/generate`, received `HTTP 404 {"error":"model 'llama3.2:3b' not found"}`, and read
+only `.get("response","")` — discarding the error and returning `""`. `process_response`
+then saw a short string and returned:
+
+> The AI did not generate a response. Please try rephrasing your question.
+
+No rewording of a question installs a model. That is not merely useless advice, it is
+advice **guaranteed to fail**, and it pointed the investigator at their own typing
+instead of at the fix.
+
+- `generate_response` checks the status code and surfaces Ollama's `error` field, naming
+  the exact `ollama pull` command.
+- `run_rag_query` gates on `ollama_diagnostic()["model_ready"]`, not on the daemon merely
+  answering. **"Ollama is up" and "a model exists to answer with" are different facts** —
+  `/api/tags` returns 200 with an *empty* list on a machine that never pulled a model.
+- The empty-response fallback no longer blames the question, and separates "the search
+  matched 2 sources but the model returned nothing" (a model fault) from "nothing in this
+  case matched" (a search fault).
+- `SYSTEM_PROMPT` rewritten from a report generator into a senior forensic analyst working
+  the case alongside the investigator: name files, timestamps and entities, connect
+  artefacts, and when the evidence is thin say what is missing and what to pull next.
+- One diagnostic per query, reused in the result, instead of probing twice and risking the
+  two answers disagreeing.
+
+This closes **B5** (§6), which had been open since the first live-stack pass.
+
+### ✅ FIXED B22. System health reported fabricated successes
+
+`SystemHealthPage.jsx` held two cards that were **string literals, not measurements**:
+`Backend API / "Running" / status="ok"` and `Vector Store / "Qdrant" / status="ok"`. The
+second also cited `data/qdrant_store`, **a directory that does not exist** — per-case
+Qdrant is `data/cases/<case_id>/qdrant/` (§2, §9).
+
+`/api/status` was worse: `database` was `os.path.exists("./data/forensic.db")` — **file
+existence presented as connectivity**, so a corrupt or locked database reported
+"connected".
+
+New `backend/modules/service_health.py` runs six isolated probes, each returning `state`
+(`ok` / `error` / `unavailable` — measured-and-broken vs could-not-measure) plus a reason:
+
+| service | now actually measures |
+|---|---|
+| `database` | a real query against the `cases` table, with `latency_ms` |
+| `ollama` | daemon, configured model, `model_ready`, `installed_models` |
+| `vector_store` | real case-collection count, total size, writability |
+| `worker` | the worker thread's real liveness |
+| `cases_dir` | existence **and** a real writability check |
+| `embeddings` | `importlib.util.find_spec` for the lazy optional deps — does not import torch |
+
+One probe raising leaves the other five measured. No probe opens a `QdrantClient` —
+embedded mode takes an exclusive lock per directory and would fight the running app
+(§15, B14).
+
+The page renders an unmeasured state as a **grey dot and an em dash**, never a colour. A
+measured `0` is still shown as `0`, because *zero models installed* is the single most
+important fact on that page. §16's rule cuts both ways: a fabricated `0` is a lie, and so
+is turning a real `0` into an em dash.
+
+> **Cost:** `/api/status` takes ~2.1 s, nearly all of it `ollama_diagnostic()`'s
+> `/api/tags`. That is inside the frontend's 15 s poll and is now reported as
+> `latency_ms` rather than being invisible.
+> **Known gap:** the worker probe **cannot detect a wedged worker**. `job_worker` exposes
+> only a thread and a boolean, with no heartbeat, so a loop stuck inside `_process_job`
+> still reads `ok`. Fixing it needs a heartbeat in `job_worker.py`.
+
+### ✅ FIXED B23. Prompts vanished when the investigator changed tab
+
+Two different losses, and only the obvious one is a `useState` problem.
+
+1. **An unsent draft** lived in component state. Changing route unmounts the page, so it
+   went with it.
+2. **A submitted question that was still generating** vanished for a subtler reason:
+   `backend/routers/queries.py` writes its `QueryLog` **after** `run_rag_query` returns.
+   A question in flight therefore **does not exist in the database yet**, so the refetch on
+   return could not find a row that had not been created.
+
+Fixed with a per-case `localStorage` draft, plus a `cfi_pending_questions` list of
+in-flight questions that is reconciled against every fetch — a pending entry stops being
+pending the moment the server has it — and re-rendered as a waiting bubble. A 3 s poll
+runs **only while something is in flight**, and it is *quiet*, because a background poll
+that blanks the transcript reads as the page breaking.
+
+Pending entries expire after 10 minutes; past that the request is presumed lost, so a dead
+backend cannot cause an infinite poll.
+
+**Also added:** terminal-style **↑/↓ prompt recall** in the textarea, sourced from the
+questions already asked *in that case* rather than from a second private store, so the
+recall list and the visible transcript cannot disagree. Arrowing past the newest entry
+restores whatever was being typed. The arrows are taken **only at the edges of the text**,
+because in a textarea `ArrowUp` is also the ordinary way to move between lines and
+hijacking it unconditionally would break Shift+Enter multi-line editing.
+
+### ✅ FIXED B24. The queue had no ETA, and its elapsed time was a fabricated `0`
+
+Two separate lies in the same row, and the second one was hiding the first.
+
+`models.IngestionJob.elapsed_seconds` was **read by `queue_router._row()` and written
+nowhere in the codebase.** Every running job reported `0`. There was no ETA field at
+all — the only time figure on a running job was the queue-time `estimated_seconds`,
+which is a fixed prior computed before the job starts and never revised. So the
+question "how long has this been running, and how much longer?" was answered by a
+number that was wrong and a number that did not exist.
+
+`elapsed_seconds` being a permanent `0` is the same defect as B16's
+`applied_live: false`: **a fabricated value in a field shaped exactly like a real one.**
+A job running for ten minutes and a job that just started are indistinguishable on
+screen.
+
+New `backend/modules/eta.py` — `EtaTracker`, deliberately pure (no database, no network,
+no backend imports) so it is unit-testable, with the clock injectable for exactly that
+reason. Three design points, each of which is a trap someone will try to simplify away:
+
+**1. Never `elapsed / percent * 100`.** `progress_percent` is five weighted bands
+(hash, extraction, chunking, embedding, entity graph) whose cost per point is wildly
+uneven. A 635 MB disk image spends most of its wall clock in step 1; a 2 MB text file
+spends most of its in step 3. Linear extrapolation therefore extrapolates the wrong
+quantity, and is wrong by the largest margin exactly where the operator most needs an
+answer. So the prior is **blended** with observed throughput, not replaced by it:
+below `OBS_MIN_PERCENT` (10) the observation is not trusted at all and the answer is the
+prior, labelled as such; above it the observation earns weight `min(0.75, pct/100)`, so
+one mis-measured step cannot take the number over. The prior knows the *relative* cost
+of each stage and is already profile- and throttle-aware; the observation knows the
+*actual* rate on this machine. Neither alone is trustworthy.
+
+**2. Governor pauses are removed from the work rate and added back as a duty cycle.**
+A job throttled to a 40 % CPU ceiling, or waiting on its RAM floor, spends real wall
+clock in `time.sleep()` during which no work happens. Measuring throughput over wall
+clock reports a machine several times slower than it is, and the ETA creeps upwards for
+ever. So `work = elapsed − throttle_seconds` drives the rate, and the pause is
+re-added as `1 + duty/(1−duty)` on the *remaining* work — **on the observed term only**,
+because the prior already carries the requested throttle factor and applying it twice
+double-counts. The duty cycle is capped at `MAX_THROTTLE_DUTY` (0.8): uncapped, a job
+spending 90 % of its life waiting for its RAM floor yields a 10× ETA — arithmetically
+defensible, useless to read.
+
+**3. Smoothing is asymmetric, and that is the whole trick.** The rate is already an
+EMA, so smoothing the ETA symmetrically on top of it is double-smoothing and it lags in
+*both* directions. Measured on a 145 s job with a 600 s prior: a symmetric ETA EMA
+quoted **168 s remaining at 95 %, when 5 s remained.** The lag, not the prior, was the
+dominant error. So a falling countdown (work being consumed) is followed at α=0.8 and
+only a *rise* is damped (α=0.35), where the real risk is a spike. Both directions are
+also bounded — 1.5×/frame up, 0.35×/frame down — because **a collapse is as much a lie
+as a spike**: promising a job is nearly done when it is not is the identical defect.
+> If a symmetric smoother is ever proposed as "simpler", that measurement is the
+> counter-argument.
+
+**Never a fake zero** (§16 again, the fourth instance in this file). `eta_seconds` is
+`None` when there is neither a prior nor a measurement, and `0` **only** when
+`percent >= 100`, where it is true; below 100 the value is floored at 1 s so a 0.2 s
+remainder cannot round down into a false "done". A prior of `0` is treated as *absent*,
+not as "zero seconds remaining". A drop from 100 % is a restart, not a band recompute:
+the observation is dropped and the answer is `None` with a reason, never `0`.
+
+Wiring: one `EtaTracker` per job, created when the job is marked `Running` and seeded
+from `estimated_seconds` so the *first* frame already shows a countdown. One reused
+session for the whole job, committed per frame — a session per tick would open and
+close a SQLite connection hundreds of times on a large ingest. The tick is written to be
+**incapable of raising**: every failure is logged and reported as "unknown", because a
+progress path that raises is the B11 shape (an exception out of the progress path left
+the job `Running` for ever). `_broadcast_progress` gained the two fields as *keyword*
+arguments — the first five parameters are the contract `ingestion.py` calls and are
+positional by design, since an arity mismatch there is swallowed behind a bare `except`
+inside the pipeline and silently kills every intermediate update (§13 B7).
+
+> **Trap:** the elapsed/eta tick runs inside the progress callback, so it sits directly
+> on the B7 seam. If you ever see the live queue jump from 0 % to 100 % with no
+> intermediate frames, check the callback arity before anything else.
+
+`eta_seconds` is a **nullable** column added by `migrate_eta.py` (registry entry 19) with
+**no backfill**, for the same reason `ingestion_mode` is: SQLite cannot `ALTER TABLE ADD
+COLUMN` with a non-constant default, and every existing row's correct value is NULL.
+Migration is idempotent — the second run prints the same `duplicate column name` note
+every other migration in this repo prints, which is the established style, not a failure.
+
+### ✅ FIXED B25. The AI looked permanently offline while answering correctly
+
+**Reported as:** the assistant "is not functioning properly", the only message is that it
+is "offline", and rephrasing the question changes nothing. The backend was in fact
+answering correctly the whole time — verified live: `ollama_available: true`,
+`model_used: llama3.2:3b`, a grounded answer naming operators and hosts.
+
+Three separate frontend defects, all in the *display* of status, none in the AI:
+
+1. **`App.jsx` fabricated a failure in its `catch`.** `getStatus()` throwing produced
+   `setSystemStatus({ database: 'error', ollama: 'offline' })` — the exact fabrication
+   B22 removed from `SystemHealthPage.jsx`, one layer up, in the component that owns the
+   Sidebar dot. It also polled only every 30 s, so a backend that was merely still
+   starting read as a permanently dead AI. Now the catch sets `null` (unknown) and a fast
+   4 s retry runs until a real reading lands, then settles to 30 s.
+2. **`Sidebar.jsx` treated "not yet known" as failure.** `ollamaOk = status?.ollama ===
+   'running'` is `false` while `status` is `null` — and `status` is `null` for the entire
+   ~2 s that `/api/status` is in flight, because that endpoint asks Ollama for its model
+   list. So the red "Ollama offline" dot was drawn *while the request was still running*,
+   and a slow or hung `/api/tags` made it look permanent. There are now three states —
+   ok / measured-and-broken / **not measured yet** — and the third is a neutral grey dot
+   with a neutral tooltip, never a failure colour.
+3. **`InvestigatePage.jsx` still rendered the B21 text.** `ResponseText` — live, at line
+   1358 — said *"The AI did not return a response for this query. Try rephrasing your
+   question."* The backend had been fixed to name the real fault; this fallback had not
+   been. It now says to check the System Health page and names `ollama pull`.
+
+> **The general rule, fourth time it has bitten:** a status that has not been measured yet
+> is not a failure. `null` must render as "unknown", never as red. The same fix had to be
+> applied in `SystemHealthPage.jsx` (B22), in `Sidebar.jsx` and `App.jsx` (here), and in
+> `eta.py` (B24) — four places, one rule.
+
+**Also fixed while in there:** `setup_windows.bat` and `setup.sh` both installed with
+`pip install --no-index --find-links=vendor\python`, but `vendor/` is **gitignored**, so a
+fresh clone has no wheels and the one-click setup failed outright. Both now detect the
+kit and fall back to a normal online install. `setup_windows.bat` also used `yarn install`
+while `start_windows.bat` explicitly warns that yarn is broken on Windows, and it never ran
+migrations at all — so an existing `forensic.db` kept its old schema and the backend failed
+with `no such column: ingestion_jobs.eta_seconds` (`create_all` creates tables but never
+adds columns to existing ones). Both scripts now use npm and both run `migrate_all.py`.
+`setup.sh` also created `data/qdrant_store`, a directory nothing in the codebase reads or
+writes — the same phantom path the health page used to cite in B22.
 
 
 

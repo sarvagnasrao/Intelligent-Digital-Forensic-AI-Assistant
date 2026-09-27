@@ -1,5 +1,6 @@
 import React, { useState,
                 useEffect,
+                useMemo,
                 useRef } from 'react'
 import { useParams } from 'react-router-dom'
 import {
@@ -24,13 +25,20 @@ import PageLayout from '../components/PageLayout'
 
 // Renders AI response with citations
 function ResponseText({ text }) {
+  // The old text here blamed the investigator's question ("Try rephrasing your
+  // question"). That advice was guaranteed to fail: the usual cause is a missing
+  // model, and no rewording of a question installs one. The backend now names the
+  // actual fault; this fallback only covers the case where it returned nothing at
+  // all, and it says what to check rather than what to retype.
   if (!text) return (
     <p style={{
       color: 'var(--color-white-2)',
       fontStyle: 'italic',
       fontSize: 12,
     }}>
-      The AI did not return a response for this query. Try rephrasing your question.
+      The assistant returned no text for this question. Check the System Health
+      page - if Ollama is not ready to answer, the model needs pulling
+      (&apos;ollama pull llama3.2:3b&apos;).
     </p>
   )
 
@@ -389,8 +397,6 @@ export default function InvestigatePage() {
   const { user } = useAuth()
   const [queries, setQueries] =
     useState([])
-  const [question, setQuestion] =
-    useState('')
   const [loading, setLoading] =
     useState(false)
   const [loadingHistory, setLoadingHistory] =
@@ -412,6 +418,78 @@ export default function InvestigatePage() {
   const bottomRef = useRef()
   const textareaRef = useRef()
 
+  // ── Prompt durability ──────────────────────────────────────
+  // Two separate things were lost when the investigator moved to
+  // another tab, and they are lost for different reasons.
+  //
+  // 1. An unsent draft. It lived in component state, and changing
+  //    route unmounts this page, so it went with it.
+  //
+  // 2. A question already submitted but still generating. This one
+  //    is subtler: the API writes its QueryLog only AFTER
+  //    run_rag_query returns (backend/routers/queries.py), so a
+  //    question in flight does not exist in the database yet. The
+  //    refetch on return could not find a row that had not been
+  //    created, so the investigator's own question vanished from
+  //    the screen while the model was still working on it.
+  //
+  // Both are persisted, so the words survive the navigation and the
+  // pending question is reconciled against the server once it lands.
+  const draftKey = `cfi_draft_${caseId}`
+  const PENDING_KEY = 'cfi_pending_questions'
+  // A pending entry older than this is assumed lost (the backend
+  // died mid-request) rather than polled for ever.
+  const PENDING_TTL_MS = 10 * 60 * 1000
+
+  const readPending = (cid) => {
+    try {
+      const all = JSON.parse(
+        localStorage.getItem(PENDING_KEY) || '[]')
+      if (!Array.isArray(all)) return []
+      const cutoff = Date.now() - PENDING_TTL_MS
+      return all.filter(p =>
+        p && p.caseId === cid &&
+        typeof p.text === 'string' &&
+        p.at > cutoff)
+    } catch {
+      return []
+    }
+  }
+
+  const writePending = (all) => {
+    try {
+      localStorage.setItem(
+        PENDING_KEY, JSON.stringify(all))
+    } catch {}
+  }
+
+  // Mirror for the polling interval, which must not close over a
+  // stale snapshot of the list.
+  const pendingRef = useRef([])
+
+  const [pending, setPending] = useState(
+    () => readPending(caseId))
+  pendingRef.current = pending
+
+  // Restore the unsent draft on mount.
+  const [question, setQuestion] = useState(() => {
+    try {
+      return localStorage.getItem(draftKey) || ''
+    } catch {
+      return ''
+    }
+  })
+
+  useEffect(() => {
+    try {
+      if (question) {
+        localStorage.setItem(draftKey, question)
+      } else {
+        localStorage.removeItem(draftKey)
+      }
+    } catch {}
+  }, [question, draftKey])
+
   useEffect(() => {
     loadData()
   }, [caseId])
@@ -426,8 +504,11 @@ export default function InvestigatePage() {
     }
   }, [loadingHistory])
 
-  const loadData = async () => {
-    setLoadingHistory(true)
+  // `quiet` suppresses the skeleton. The background poll that
+  // watches for a landed answer must not blank the transcript
+  // every few seconds — that reads as the page breaking.
+  const loadData = async (quiet = false) => {
+    if (!quiet) setLoadingHistory(true)
     try {
       const [qRes, eRes] =
         await Promise.all([
@@ -454,15 +535,71 @@ export default function InvestigatePage() {
       setQueries(filtered)
       setHasMoreQueries(
         qRes.data.has_next || false)
+
+      // Fold the in-flight questions back into the transcript.
+      // The backend writes a QueryLog only after the model has
+      // answered, so a question that is still generating is absent
+      // from this response. Anything the server now knows about has
+      // landed and stops being pending; whatever is left is still in
+      // flight and is re-rendered as a waiting entry.
+      const serverTexts = filtered.map(
+        f => f.question_text)
+      const outstanding =
+        pendingRef.current.filter(
+          p => !serverTexts.includes(p.text))
+
+      if (outstanding.length
+          !== pendingRef.current.length) {
+        const kept = new Set(outstanding.map(
+          p => `${p.caseId}::${p.text}`))
+        let all = []
+        try {
+          all = JSON.parse(
+            localStorage.getItem(PENDING_KEY) || '[]')
+          if (!Array.isArray(all)) all = []
+        } catch {
+          all = []
+        }
+        writePending(all.filter(p =>
+          p && (p.caseId !== caseId ||
+                kept.has(`${p.caseId}::${p.text}`))))
+        setPending(outstanding)
+      }
+
+      setQueries([
+        ...filtered,
+        ...outstanding.map((p, i) => ({
+          id: `pending_${p.at}_${i}`,
+          question_text: p.text,
+          processed_response: null,
+          asked_by: p.askedBy || 'Investigator',
+          asked_at: new Date(p.at).toISOString(),
+          is_loading: true,
+        })),
+      ])
       setEvidence(
         (eRes.data || []).filter(
           e => e.status === 'Indexed'))
     } catch {
-      toast.error('Failed to load')
+      if (!quiet) toast.error('Failed to load')
     } finally {
-      setLoadingHistory(false)
+      if (!quiet) setLoadingHistory(false)
     }
   }
+
+  // While a question is in flight, keep asking the server for
+  // its answer. The QueryLog is written only once generation
+  // finishes, so without this poll the answer stays invisible
+  // until the investigator reloads by hand — which is the same
+  // "it disappeared" complaint one level down.
+  useEffect(() => {
+    if (!pending.length) return
+    const t = setInterval(() => {
+      loadData(true)
+    }, 3000)
+    return () => clearInterval(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending.length, caseId])
 
   const loadEarlier = async () => {
     const next = queryPage + 1
@@ -495,6 +632,30 @@ export default function InvestigatePage() {
     if (!q || loading) return
     setQuestion('')
     setLoading(true)
+
+    // Record the question as in flight BEFORE the request goes
+    // out, so that navigating away mid-generation cannot lose it.
+    // The request itself is not cancelled on unmount — the backend
+    // finishes and persists it — it simply stops being visible
+    // until something brings it back on screen.
+    const stamp = {
+      caseId,
+      text: q,
+      askedBy,
+      at: Date.now(),
+    }
+    const nextPending = [...pendingRef.current, stamp]
+    pendingRef.current = nextPending
+    setPending(nextPending)
+    let stored = []
+    try {
+      stored = JSON.parse(
+        localStorage.getItem(PENDING_KEY) || '[]')
+      if (!Array.isArray(stored)) stored = []
+    } catch {
+      stored = []
+    }
+    writePending([...stored, stamp])
 
     // Optimistic UI — show question
     // immediately
@@ -581,11 +742,96 @@ export default function InvestigatePage() {
     }
   }
 
+  // ── Prompt history (terminal-style ↑ / ↓) ─────────────────
+  // Sourced from the questions already asked in this case rather
+  // than a second private store, so the recall list and the
+  // visible transcript can never disagree. Ascending order is
+  // reversed to newest-first, and duplicates are dropped so
+  // re-asking the same thing does not pad the list.
+  const promptHistory = useMemo(() => {
+    const seen = new Set()
+    const out = []
+    for (let i = queries.length - 1; i >= 0; i--) {
+      const t = (queries[i].question_text || '').trim()
+      if (!t || seen.has(t)) continue
+      seen.add(t)
+      out.push(t)
+    }
+    return out
+  }, [queries])
+
+  const [historyIndex, setHistoryIndex] =
+    useState(null)
+  // What the investigator had typed before they started
+  // arrowing back, restored when they arrow past the newest
+  // entry — the same courtesy a shell gives you.
+  const historyDraftRef = useRef('')
+
+  // Arrow keys are only taken over at the edges of the text.
+  // In a textarea ArrowUp is also the ordinary way to move
+  // between lines, so hijacking it unconditionally would break
+  // Shift+Enter multi-line editing.
+  const recallPrompt = (dir) => {
+    const ta = textareaRef.current
+    if (!ta || !promptHistory.length) return false
+    const atStart = ta.selectionStart === 0
+    const atEnd =
+      ta.selectionStart === ta.value.length
+    if (dir === 'up' && !atStart) return false
+    if (dir === 'down' && !atEnd) return false
+
+    let idx
+    if (historyIndex === null) {
+      // Nothing being recalled yet: only Up starts a recall.
+      if (dir === 'down') return false
+      historyDraftRef.current = question
+      idx = 0
+    } else {
+      idx = historyIndex + dir
+    }
+
+    if (idx < 0) idx = 0
+
+    if (idx >= promptHistory.length) {
+      // Past the newest — hand back the original draft.
+      setHistoryIndex(null)
+      setQuestion(historyDraftRef.current)
+      historyDraftRef.current = ''
+      focusEndOfPrompt()
+      return true
+    }
+
+    setHistoryIndex(idx)
+    setQuestion(promptHistory[idx])
+    focusEndOfPrompt()
+    return true
+  }
+
+  const focusEndOfPrompt = () => {
+    requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (!el) return
+      el.focus()
+      el.setSelectionRange(
+        el.value.length, el.value.length)
+    })
+  }
+
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' &&
         !e.shiftKey) {
       e.preventDefault()
+      setHistoryIndex(null)
+      historyDraftRef.current = ''
       handleAsk()
+      return
+    }
+    if (e.key === 'ArrowUp' && !e.shiftKey) {
+      if (recallPrompt('up')) e.preventDefault()
+      return
+    }
+    if (e.key === 'ArrowDown' && !e.shiftKey) {
+      if (recallPrompt('down')) e.preventDefault()
     }
   }
 
@@ -1163,10 +1409,16 @@ export default function InvestigatePage() {
         <textarea
           ref={textareaRef}
           value={question}
-          onChange={e =>
-            setQuestion(e.target.value)}
+          onChange={e => {
+            setQuestion(e.target.value)
+            // Typing invalidates a recall in progress, so the
+            // next ArrowUp starts again from the newest prompt
+            // rather than jumping relative to a stale position.
+            setHistoryIndex(null)
+            historyDraftRef.current = ''
+          }}
           onKeyDown={handleKeyDown}
-          placeholder="Ask a forensic question about the evidence... (Enter to send, Shift+Enter for newline)"
+          placeholder="Ask a forensic question about the evidence... (Enter to send, Shift+Enter for newline, ↑/↓ for recent)"
           rows={3}
           style={{
             width: '100%',

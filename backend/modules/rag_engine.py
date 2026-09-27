@@ -2,24 +2,29 @@ from backend.modules.vector_store import search_chunks
 from backend.modules.graph_builder import (
     get_graph_context, extract_entities)
 from backend.modules.ollama_client import (
-    generate_response, is_ollama_running)
+    generate_response, ollama_diagnostic)
 from backend.dependencies import get_settings
 import re
 import time
 
-SYSTEM_PROMPT = """You are the IDF AI Assistant, a forensic AI analyst. You have been given excerpts from digital evidence.
+SYSTEM_PROMPT = """You are the senior forensic analyst sitting next to the investigator who is working a case. You have the case's extracted evidence in front of you: files, documents, logs, emails, images and the entities linked between them.
 
-Your job:
-- Answer the investigator's question using the evidence provided
-- Be direct and specific
-- If the evidence mentions something relevant, state it clearly
-- If the evidence does not contain enough information, say what you found and what is missing
-- Never refuse to engage with the evidence
-- Do not add disclaimers about your limitations
-- Do not use markdown headers
-- Write in clear paragraphs
+Talk to them the way a colleague would — as someone who has already read the material and has something useful to say about it.
 
-Base your answer only on the provided excerpts."""
+How to answer:
+- Lead with what the evidence actually shows. Be specific: name the files, the timestamps, the people, the IPs, the artefacts. "The evidence contains references to the suspect" helps nobody; "three files in the recovered Documents folder mention an account at 192.168.1.44, the last on 14 March" does.
+- Connect things. An investigator needs the joins between artefacts, not a file-by-file summary. Who talked to whom, what was sent where, what changed and when.
+- When the evidence answers the question, say so plainly and stop.
+- When it does not, do not pad and do not apologise. Say what you did find, say plainly what is missing, and tell them the specific next step — which file, folder, artefact or search term would close the gap. An investigator can act on that.
+- Distinguish what the evidence shows from what you are inferring. Never state an inference as a fact.
+- Never invent a filename, a name, a date or a quote. If it is not in the excerpts, it is not in the case.
+
+How to write:
+- Plain professional English. Contractions are fine.
+- Short paragraphs. No headings, no bullet-point walls, no bold.
+- Never say "based on the provided excerpts", "the excerpts show", or "as an AI". You are reading the case, not quoting a document pack.
+- Never pad with "Great question" or restate the question back before answering.
+- Be concise. A colleague answering a colleague does not write an essay."""
 
 
 def clean_response(text: str) -> str:
@@ -138,12 +143,35 @@ def process_response(
     cited_count = number of unique sources retrieved.
     uncited_count = 0 (we no longer mark individual sentences).
     """
-    # Step 1: Fallback for empty / refused responses
+    # Step 1: Fallback for empty / refused responses.
+    #
+    # This used to say "Please try rephrasing your question", which is the one
+    # piece of advice guaranteed not to work: the commonest cause is a model
+    # that is not installed or an Ollama that is not running, and no rewording
+    # of the question installs a model. Blaming the investigator's phrasing for
+    # a server-side fault is the same defect class as the ingestion bugs — a
+    # confident message that is not what happened.
     if not raw or len(raw.strip()) < 20:
-        fallback = (
-            "The AI did not generate a response. "
-            "Please try rephrasing your question."
-        )
+        n_sources = len({
+            c.get('source', '') for c in chunks if c.get('source')
+        }) if chunks else 0
+        if n_sources:
+            fallback = (
+                "The model returned an empty response for this question. "
+                f"The search did match {n_sources} "
+                f"source{'s' if n_sources != 1 else ''}, so the evidence was "
+                "found — the model produced nothing usable. This is a model "
+                "or Ollama problem, not a problem with your question. "
+                "Check System Health, then try again."
+            )
+        else:
+            fallback = (
+                "Nothing in this case matched that question, and the model "
+                "returned no analysis. Try terms you would expect to find in "
+                "the evidence itself — a name, a domain, an IP, a filename or "
+                "a phrase from a recovered document — or ingest more evidence "
+                "for this case."
+            )
         return fallback, 0, 0
 
     # Step 2: Clean noise from the raw response
@@ -151,8 +179,9 @@ def process_response(
 
     if not cleaned or len(cleaned) < 20:
         fallback = (
-            "The AI did not generate a response. "
-            "Please try rephrasing your question."
+            "The model's reply contained nothing usable once cleaned of "
+            "citation tags. This is a model or Ollama problem, not a problem "
+            "with your question — check System Health and try again."
         )
         return fallback, 0, 0
 
@@ -248,11 +277,25 @@ def run_rag_query(
         f"on the evidence above:"
     )
 
-    # Step 6: Call Ollama
-    if not is_ollama_running():
+    # Step 6: Call Ollama.
+    #
+    # Gated on the model being present, not merely on the daemon answering.
+    # "Ollama is up" and "there is a model to talk with" are separate facts:
+    # /api/tags returns 200 with an empty list on a machine that never pulled
+    # a model, so the old is_ollama_running() check passed and the request went
+    # on to 404. One diagnostic is taken here and reused in the result, rather
+    # than probing twice and risking the two answers disagreeing.
+    diag = ollama_diagnostic()
+    if not diag["running"]:
         raw_answer = (
-            "⚠️ Ollama is offline. "
-            "Please start Ollama and try again."
+            f"⚠️ Ollama is not running, so there is no model to answer "
+            f"with. Start it with `ollama serve` and ask again — your "
+            f"question has not been answered."
+        )
+    elif not diag["model_ready"]:
+        raw_answer = (
+            f"⚠️ {diag['reason']} Nothing was searched, so your question "
+            f"has not been answered."
         )
     else:
         raw_answer = generate_response(
@@ -270,7 +313,9 @@ def run_rag_query(
         "raw_llm_response": raw_answer,
         "chunks_used": chunks,
         "graph_context": graph_ctx,
-        "ollama_available": is_ollama_running(),
+        "ollama_available": diag["running"],
+        "model_ready": diag["model_ready"],
+        "model_diagnostic": diag,
         "cited_sentence_count": cited_count,
         "uncited_sentence_count": uncited_count,
         "response_time_ms": elapsed_ms,

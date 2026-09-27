@@ -321,6 +321,10 @@ def get_queue(
         "progress_percent": j.progress_percent,
         "current_step": j.current_step,
         "estimated_seconds": j.estimated_seconds,
+        # Live remaining time, NULL when the worker has not produced a
+        # defensible estimate. Null means "unknown", not "no time left" -
+        # render it as an em dash.
+        "eta_seconds": j.eta_seconds,
         "started_at": str(j.started_at) if j.started_at else None,
         "cpu_throttle_percent": j.cpu_throttle_percent,
         "min_free_ram_mb": j.min_free_ram_mb
@@ -355,6 +359,10 @@ def get_queue_history(
         "progress_percent": j.progress_percent,
         "current_step": j.current_step,
         "estimated_seconds": j.estimated_seconds,
+        # See get_queue: NULL here is "unknown", never "nothing left".
+        # A terminal job has no live estimate; elapsed_seconds is the
+        # honest figure for these rows and is on /queue/list.
+        "eta_seconds": j.eta_seconds,
         "started_at": str(j.started_at) if j.started_at else None,
         "completed_at": str(j.completed_at) if j.completed_at else None,
         "error_message": j.error_message
@@ -405,6 +413,11 @@ def list_all_jobs(
             "ingestion_mode": j.ingestion_mode or "normal",
             "estimated_seconds": j.estimated_seconds,
             "elapsed_seconds": j.elapsed_seconds,
+            # NULL means the worker has not produced a defensible estimate
+            # yet. It must not be rendered as 0 - a fake "no time left" on
+            # a job that has been running for ten minutes is precisely what
+            # elapsed_seconds used to be (see AGENTS.md §16).
+            "eta_seconds": j.eta_seconds,
             "started_at": str(j.started_at) if j.started_at else None,
             "completed_at": str(j.completed_at) if j.completed_at else None,
             "error_message": j.error_message,

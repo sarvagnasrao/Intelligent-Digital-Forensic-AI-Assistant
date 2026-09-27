@@ -105,15 +105,22 @@ echo ""
 echo -e "${YELLOW}[5/8] NLP model...${NC}"
 if python3 -c "import spacy; spacy.load('en_core_web_lg')" 2>/dev/null; then
   echo -e "${GREEN}✓ en_core_web_lg already installed${NC}"
-else
+elif [ -f "vendor/python/en_core_web_lg-3.7.1.tar.gz" ]; then
+  # vendor/ is deliberately NOT in git, so it only exists on a machine that
+  # was handed the offline kit. Installing from it with --no-index against a
+  # directory that is not there fails outright - which is what a fresh git
+  # clone used to do.
   pip install --no-index --find-links=vendor/python vendor/python/en_core_web_lg-3.7.1.tar.gz -q
+  echo -e "${GREEN}✓ en_core_web_lg installed from vendor${NC}"
+else
+  python3 -m spacy download en_core_web_lg
   echo -e "${GREEN}✓ en_core_web_lg downloaded${NC}"
 fi
 
 # ── 6. Data directories ───────────────────────────────────────────────────────
 echo ""
 echo -e "${YELLOW}[6/8] Creating data directories...${NC}"
-mkdir -p data/cases data/qdrant_store
+mkdir -p data/cases
 echo -e "${GREEN}✓ Directories ready${NC}"
 
 # ── 7. Database migrations ────────────────────────────────────────────────────
@@ -125,7 +132,8 @@ echo -e "${GREEN}✓ Migrations complete${NC}"
 # ── 8. Frontend packages ──────────────────────────────────────────────────────
 echo ""
 echo -e "${YELLOW}[8/8] Frontend packages...${NC}"
-cd frontend && yarn install --silent && cd ..
+# npm, NOT yarn - frontend/package-lock.json is the lockfile of record.
+cd frontend && npm install --silent && cd ..
 echo -e "${GREEN}✓ Frontend packages installed${NC}"
 
 # ── Pull Ollama models ────────────────────────────────────────────────────────

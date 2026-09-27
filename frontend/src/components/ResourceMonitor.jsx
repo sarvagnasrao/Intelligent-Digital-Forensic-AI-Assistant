@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
-  Cpu, MemoryStick, HardDrive, Gauge, ChevronDown, ChevronUp,
+  Cpu, MemoryStick, HardDrive, ChevronDown, ChevronUp,
   RefreshCw, Monitor, Network, Battery, Server, ShieldAlert,
 } from 'lucide-react'
 import { getSystemInfo, rescanSystemInfo } from '../api/client'
@@ -16,6 +16,13 @@ import usePreferences from '../hooks/usePreferences'
  * re-walks the hardware whenever the set of attached devices changes, so
  * plugging in an evidence drive or an eGPU shows up here automatically.
  *
+ * The three load gauges at the top - CPU, memory, GPU - are deliberately
+ * independent rather than sharing one bar, because that is the question an
+ * operator actually has while an ingest runs: which of the three is the
+ * bottleneck, and did the GPU get used at all. See LoadGauge for the
+ * unmeasurable case, which is a real state here - a machine with no
+ * telemetry source must never be drawn as "0% busy".
+ *
  * Rendered on both the Evidence page and the Queue page so an operator
  * sees an identical hardware description in both places.
  *
@@ -26,23 +33,6 @@ import usePreferences from '../hooks/usePreferences'
  */
 
 const GB = (mb) => (mb == null ? '—' : `${(mb / 1024).toFixed(1)} GB`)
-
-function Metric({ icon: Icon, label, value, sub, tone = 'text-ink-0' }) {
-  return (
-    <div className="min-w-0">
-      <p className="text-xs text-ink-2 mb-1 flex items-center gap-1">
-        <Icon size={11} className="shrink-0" />
-        <span className="truncate">{label}</span>
-      </p>
-      <p className={`text-xl font-bold tabular-nums truncate ${tone}`}>
-        {value}
-        {sub && (
-          <span className="text-sm font-normal text-ink-2 ml-1">{sub}</span>
-        )}
-      </p>
-    </div>
-  )
-}
 
 function SpecRow({ label, value, mono = true }) {
   if (value == null || value === '') return null
@@ -60,16 +50,118 @@ function SpecRow({ label, value, mono = true }) {
   )
 }
 
-function Bar({ percent, tone }) {
+/**
+ * One resource, measured on its own scale, with its own bar.
+ *
+ * The point of separating these is that they are independent: a job can sit at
+ * 90% RAM with the CPU idle, or peg the GPU while memory is untouched. A single
+ * shared bar cannot show that, and an operator watching an ingest needs to
+ * know which of the three is the bottleneck.
+ *
+ * `percent === null` is a first-class state, not zero. The backend reports a
+ * metric it cannot measure as null with a reason, and rendering that as "0%"
+ * would claim an idle GPU during a transcription that is quietly running on
+ * the CPU - the exact lie the null is there to prevent. So an unknown reading
+ * shows an em dash, a neutral track, and the reason.
+ */
+function LoadGauge({ icon: Icon, label, percent, detail, note, toneFor }) {
+  const known = percent != null && !Number.isNaN(percent)
+  const clamped = known ? Math.min(100, Math.max(0, percent)) : 0
+  const tone = known ? toneFor(clamped) : 'bg-ink-3'
+  const textTone = known ? toneFor(clamped).replace('bg-', 'text-') : 'text-ink-2'
+
   return (
-    <div className="h-1.5 bg-surface-3 rounded-full overflow-hidden mt-2">
+    <div className="min-w-0">
+      <p className="text-xs text-ink-2 mb-1 flex items-center gap-1">
+        <Icon size={11} className="shrink-0" />
+        <span className="truncate">{label}</span>
+      </p>
+      <p className={`text-xl font-bold tabular-nums truncate ${textTone}`}>
+        {known ? `${clamped.toFixed(0)}%` : '—'}
+        {detail && (
+          <span className="text-xs font-normal text-ink-2 ml-1.5">
+            {detail}
+          </span>
+        )}
+      </p>
       <div
-        className={`h-full rounded-full transition-all duration-500 ${tone}`}
-        style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
-      />
+        className="h-1.5 bg-surface-3 rounded-full overflow-hidden mt-2"
+        role="meter"
+        aria-label={label}
+        aria-valuenow={known ? Math.round(clamped) : undefined}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuetext={known ? `${Math.round(clamped)} percent` : 'not measurable'}
+      >
+        <div
+          className={`h-full rounded-full transition-all duration-500 ${tone}`}
+          style={{ width: `${clamped}%` }}
+        />
+      </div>
+      {(note || !known) && (
+        <p className="text-[10px] text-ink-2 mt-1 leading-snug">
+          {note || 'Not measurable on this machine'}
+        </p>
+      )}
     </div>
   )
 }
+
+/**
+ * Per-logical-core CPU load, as a strip of thin bars.
+ *
+ * Worth showing during ingestion: a transcription pinned to one core looks
+ * identical to a balanced workload on a single averaged percentage, and the
+ * two call for different amounts of throttling. Capped so a 64-core server
+ * does not render 64 slivers.
+ */
+const MAX_CORE_BARS = 16
+
+function CoreStrip({ perCore }) {
+  if (!Array.isArray(perCore) || perCore.length === 0) return null
+  const shown = perCore.slice(0, MAX_CORE_BARS)
+  const hidden = perCore.length - shown.length
+
+  return (
+    <div className="mt-2">
+      <div className="flex items-end gap-[2px] h-6" aria-hidden="true">
+        {shown.map((value, i) => {
+          const known = value != null
+          const h = known ? Math.max(4, Math.min(100, value)) : 0
+          return (
+            <div
+              key={i}
+              className={`flex-1 rounded-sm transition-all duration-500 ${
+                known
+                  ? value >= 90 ? 'bg-danger'
+                    : value >= 70 ? 'bg-warning' : 'bg-accent'
+                  : 'bg-surface-3'
+              }`}
+              style={{ height: `${h}%` }}
+            />
+          )
+        })}
+      </div>
+      <p className="text-[10px] font-mono text-ink-2 mt-1">
+        {shown.length} logical core{shown.length === 1 ? '' : 's'}
+        {hidden > 0 ? ` (+${hidden} more not shown)` : ''}
+      </p>
+    </div>
+  )
+}
+
+/** Shared "everything is fine" tone ladder, for a resource where high is bad. */
+const pressureTone = (warn, danger) => (percent) =>
+  percent >= danger ? 'bg-danger'
+    : percent >= warn ? 'bg-warning' : 'bg-accent'
+
+/**
+ * High GPU utilisation during an ingest is the *desired* outcome - it means
+ * Whisper reached the card instead of falling back to the CPU - so the bar is
+ * tinted positively rather than alarmed. VRAM pressure is the thing that
+ * actually goes wrong, and it gets its own meter below.
+ */
+const gpuTone = (percent) => (percent >= 90 ? 'bg-success' : 'bg-accent')
 
 function Section({ icon: Icon, title, count, children }) {
   return (
@@ -144,20 +236,41 @@ export default function ResourceMonitor({
 
   if (!show) return null
 
-  const ramPct = info?.ram_percent ?? 0
-  const ramTone = ramPct >= 90 ? 'bg-danger'
-    : ramPct >= 75 ? 'bg-warning' : 'bg-accent'
-  const ramText = ramPct >= 90 ? 'text-danger'
-    : ramPct >= 75 ? 'text-warning' : 'text-ink-0'
-
-  const diskPct = info?.disk_percent ?? 0
-  const diskTone = diskPct >= 90 ? 'bg-danger'
-    : diskPct >= 75 ? 'bg-warning' : 'bg-success'
+  // Every one of these may be null. `?? 0` is deliberately NOT used: a missing
+  // measurement and an idle machine must not look the same. See LoadGauge.
+  const cpuPct = info?.cpu_percent ?? null
+  const ramPct = info?.ram_percent ?? null
+  const gpuPct = info?.gpu_util_available ? info.gpu_util_percent : null
+  const diskPct = info?.disk_percent ?? null
 
   const volumes = info?.volumes || []
   const shownVolumes = showAllVolumes ? volumes : volumes.slice(0, 3)
   const gpus = info?.gpus || []
   const adapters = info?.network_adapters || []
+
+  // The backend's reason is shown whenever it has one, *including* when a
+  // number is available. On a mixed machine - a discrete card plus an
+  // integrated one that exposes no counter - the aggregate is the busiest
+  // measured adapter, not a reading of the whole machine. Suppressing the note
+  // just because a number came back would turn "the one card I could measure is
+  // idle" into "the GPU is idle", which is the lie this panel exists to avoid.
+  const gpuReason = info?.gpu_telemetry_reason
+    || (info?.gpu_util_available ? null : 'No GPU utilisation source on this machine')
+  const gpuMeasured = info?.gpu_adapters_measured
+  const gpuTotal = info?.gpu_adapters_total
+  const gpuPartial = gpuTotal > 1 && gpuMeasured != null && gpuMeasured < gpuTotal
+  const vramUsed = info?.gpu_vram_used_mb ?? null
+  // The denominator MUST be the one covering the same adapters as the
+  // numerator. `gpu_vram_total_mb` is summed over every card in the inventory,
+  // while `gpu_vram_used_mb` only sums the cards that were actually measured -
+  // so pairing them yields a ratio of two different populations, which on a
+  // mixed machine understates by roughly the unmeasured share. The backend
+  // therefore reports a measured-only total, and that wins when present.
+  const vramTotal =
+    info?.gpu_vram_measured_total_mb || info?.gpu_vram_total_mb || null
+  const vramPct = vramUsed != null && vramTotal
+    ? (vramUsed / vramTotal) * 100
+    : null
 
   return (
     <div className={`bg-surface-1 border border-line rounded-xl shadow-sm ${className}`}>
@@ -198,41 +311,102 @@ export default function ResourceMonitor({
 
           {info && (
             <>
-              {/* ── Live load ── */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <Metric
-                  icon={MemoryStick}
-                  label="Available RAM"
-                  tone={ramText}
-                  value={GB(info.available_ram_mb)}
-                  sub={`of ${GB(info.total_ram_mb)}`}
+              {/* ── Live load: three independent resources ──
+                  Each has its own bar, its own scale and its own
+                  unmeasurable state, because they do not move together. */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                <LoadGauge
+                  icon={Cpu}
+                  label="CPU"
+                  percent={cpuPct}
+                  toneFor={pressureTone(70, 90)}
+                  detail={`${info.cpu_count_physical || info.cpu_count || '?'}C/${info.cpu_count_logical || '?'}T`}
+                  note="Sustained load above the queue ceiling throttles ingestion"
                 />
-                <Metric
-                  icon={Gauge}
-                  label="CPU Usage"
-                  value={`${info.cpu_percent ?? 0}%`}
-                  sub={`${info.cpu_count_physical || info.cpu_count || '?'}C/${info.cpu_count_logical || '?'}T`}
-                />
-                <Metric
-                  icon={Monitor}
-                  label="GPU"
-                  value={info.gpu_count ? `${info.gpu_count}` : '—'}
-                  sub={info.gpu_vram_total_mb
-                    ? GB(info.gpu_vram_total_mb)
-                    : info.gpu_count === 1 ? 'adapter' : 'adapters'}
-                />
-                <Metric
-                  icon={HardDrive}
-                  label="Storage Free"
-                  value={GB(info.disk_free_mb)}
-                  sub={`of ${GB(info.disk_total_mb)}`}
-                />
+                <div>
+                  <LoadGauge
+                    icon={MemoryStick}
+                    label="Memory"
+                    percent={ramPct}
+                    toneFor={pressureTone(75, 90)}
+                    detail={`${GB(info.available_ram_mb)} free`}
+                    note={info.swap_total_mb
+                      ? `of ${GB(info.total_ram_mb)} · ${GB(info.swap_used_mb || 0)} swap`
+                      : `of ${GB(info.total_ram_mb)} · no pagefile`}
+                  />
+                </div>
+                <div>
+                  <LoadGauge
+                    icon={Monitor}
+                    label="GPU"
+                    percent={gpuPct}
+                    toneFor={gpuTone}
+                    detail={info.gpu_count
+                      ? `${info.gpu_count} adapter${info.gpu_count === 1 ? '' : 's'}`
+                      : undefined}
+                    note={gpuReason}
+                  />
+                  {/* When only some adapters are measurable, the number is the
+                      busiest of those - say so on the label, where it cannot be
+                      skimmed past as "the GPU". */}
+                  {gpuPartial && (
+                    <p className="text-[10px] font-mono text-ink-2 mt-1">
+                      busiest of {gpuMeasured}/{gpuTotal} measured
+                    </p>
+                  )}
+                  {/* VRAM gets its own meter: it is the part of the GPU
+                      that actually runs out during an ingest. */}
+                  {vramPct != null && (
+                    <div className="mt-2">
+                      <div className="h-1 bg-surface-3 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            vramPct >= 92 ? 'bg-danger'
+                              : vramPct >= 75 ? 'bg-warning' : 'bg-accent'
+                          }`}
+                          style={{ width: `${Math.min(100, vramPct)}%` }}
+                        />
+                      </div>
+                      <p className="text-[10px] font-mono text-ink-2 mt-1">
+                        VRAM {GB(vramUsed)} of {GB(vramTotal)}
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
 
-              <Bar percent={ramPct} tone={ramTone} />
-              <div className="flex justify-between text-[10px] font-mono text-ink-2 mt-1">
-                <span>RAM {ramPct.toFixed(0)}% used</span>
-                <span>Storage {diskPct.toFixed(0)}% used</span>
+              {/* Per-core detail, under the CPU gauge it belongs to. */}
+              {cpuPct != null && (
+                <CoreStrip perCore={info.cpu_per_core_percent} />
+              )}
+
+              {/* Storage is a capacity fact rather than a load metric, so it
+                  gets a line rather than a fourth competing gauge. */}
+              <div className="mt-4 pt-3 border-t border-line">
+                <div className="flex items-center justify-between gap-4">
+                  <p className="text-xs text-ink-2 flex items-center gap-1.5">
+                    <HardDrive size={11} className="shrink-0" />
+                    Storage
+                  </p>
+                  <p className="text-xs text-ink-0 tabular-nums">
+                    {GB(info.disk_free_mb)} free
+                    <span className="text-ink-2">
+                      {' '}of {GB(info.disk_total_mb)}
+                      {diskPct != null ? ` · ${diskPct.toFixed(0)}% used` : ''}
+                    </span>
+                  </p>
+                </div>
+                {diskPct != null && (
+                  <div className="h-1.5 bg-surface-3 rounded-full overflow-hidden mt-2">
+                    <div
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        diskPct >= 90 ? 'bg-danger'
+                          : diskPct >= 75 ? 'bg-warning' : 'bg-success'
+                      }`}
+                      style={{ width: `${Math.min(100, diskPct)}%` }}
+                    />
+                  </div>
+                )}
               </div>
 
               {/* ── Machine / CPU ── */}
@@ -288,28 +462,81 @@ export default function ResourceMonitor({
                     No display adapter reported by the operating system.
                   </p>
                 )}
-                {gpus.map((g, i) => (
-                  <div
-                    key={`${g.name}-${i}`}
-                    className="flex items-start justify-between gap-4 py-0.5"
-                  >
-                    <span className="text-xs text-ink-2 shrink-0">
-                      {g.shared_memory ? 'Integrated' : 'Dedicated'}
-                    </span>
-                    <span className="text-xs text-ink-0 text-right font-mono break-words">
-                      {g.name}
-                      <span className="text-ink-2">
-                        {g.vram_total_mb
-                          ? ` — ${GB(g.vram_total_mb)} VRAM`
-                          : ' — shared memory, no dedicated VRAM'}
-                      </span>
-                    </span>
-                  </div>
-                ))}
+                {gpus.map((g, i) => {
+                  const util = g.util_percent ?? null
+                  return (
+                    <div
+                      key={`${g.name}-${i}`}
+                      className="py-1 first:pt-0 last:pb-0"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <span className="text-xs text-ink-2 shrink-0">
+                          {g.shared_memory ? 'Integrated' : 'Dedicated'}
+                        </span>
+                        <span className="text-xs text-ink-0 text-right font-mono break-words">
+                          {g.name}
+                          <span className="text-ink-2">
+                            {/* Three distinct states, deliberately not
+                                collapsed. "no dedicated VRAM" (integrated),
+                                "total unknown" (a dedicated card we could
+                                not measure) and a real figure are different
+                                facts, and conflating the last two would let a
+                                measurement gap read as a hardware fact. */}
+                            {g.vram_total_mb
+                              ? ` — ${GB(g.vram_total_mb)} VRAM`
+                              : g.shared_memory
+                                ? ' — shared memory, no dedicated VRAM'
+                                : ' — VRAM total not measurable'}
+                          </span>
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-4 mt-0.5">
+                        <span className="text-[10px] font-mono text-ink-2 shrink-0">
+                          {util != null
+                            ? `${util}% busy`
+                            : (g.gpu_telemetry_reason
+                              ? 'utilisation unavailable'
+                              : 'no telemetry for this adapter')}
+                        </span>
+                        <span className="text-[10px] font-mono text-ink-2">
+                          {g.vram_used_mb != null
+                            ? `${GB(g.vram_used_mb)}${
+                                g.vram_total_mb ? ` of ${GB(g.vram_total_mb)}` : ''
+                              } VRAM in use`
+                            : 'VRAM in use unknown'}
+                        </span>
+                      </div>
+                      {/* Per-adapter bar. Null renders as a flat neutral
+                          track, so "unmeasured" cannot read as "idle". */}
+                      <div className="h-1 bg-surface-3 rounded-full overflow-hidden mt-1">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            util == null ? 'bg-ink-3'
+                              : util >= 90 ? 'bg-success' : 'bg-accent'
+                          }`}
+                          style={{ width: `${util == null ? 0 : util}%` }}
+                        />
+                      </div>
+                    </div>
+                  )
+                })}
                 {info.gpu_vram_shared_only && gpus.length > 0 && (
                   <p className="text-[10px] text-warning mt-1">
                     No discrete GPU detected — local LLM inference will run
                     on CPU and will be slow.
+                  </p>
+                )}
+                {/* Say plainly when a real adapter is present but cannot be
+                    measured. "0% busy" here would be actively misleading. */}
+                {!info.gpu_util_available && gpuReason && (
+                  <p className="text-[10px] text-ink-2 mt-1">
+                    {gpuReason}.
+                  </p>
+                )}
+                {info.gpu_telemetry_source === 'nvml'
+                  && info.gpu_driver_version && (
+                  <p className="text-[10px] font-mono text-ink-3 mt-1">
+                    Live via NVML · driver {info.gpu_driver_version}
                   </p>
                 )}
               </Section>

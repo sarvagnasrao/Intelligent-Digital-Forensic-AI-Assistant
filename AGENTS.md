@@ -82,6 +82,7 @@ backend/
     rag_engine.py           retrieval + prompt + citation processing
     vector_store.py         Qdrant wrapper  (🔴 stale torch import, §2)
     hardware_probe.py       ★ live hardware + device inventory (CPU/GPU/volumes/NICs)
+    gpu_telemetry.py        ★ live GPU utilisation + VRAM via NVML/ctypes (§16)
     ollama_client.py        Ollama HTTP client
     graph_builder.py        NetworkX entity graph
     job_worker.py           background ingestion worker
@@ -446,12 +447,14 @@ PYTHONPATH=. python -W error::RuntimeWarning \
 PYTHONPATH=. python tests/verify_queue_api.py         # 37 assertions, ~5 s
 PYTHONPATH=. python tests/verify_job_stop.py          # 17 assertions, ~20 s
 PYTHONPATH=. python tests/verify_vector_store.py      # 17 assertions, ~10 s
+PYTHONPATH=. python tests/verify_cpu_sampler.py       #  9 assertions, ~10 s
+PYTHONPATH=. python tests/verify_gpu_telemetry.py     # 171 assertions, ~20 s
 PYTHONPATH=. python tests/verify_live_stack.py        # 26 assertions, ~90 s
 ```
 
 Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
 
-The first five are self-contained; **151 assertions total**. `verify_live_stack.py`
+The first seven are self-contained; **305 assertions total**. `verify_live_stack.py`
 is the exception — it needs `ollama serve`, uvicorn on `:8000` and Vite on
 `:3000` already running, and it is the only one that crosses a real socket
 (see §14). All of them clean up every row and per-case Qdrant directory they
@@ -908,4 +911,249 @@ names the missing package.
 MiniLM-L6-v2 is 384-dim and matches `VECTOR_SIZE`. Ollama's embedder is 768-dim,
 so switching **invalidates every existing per-case collection** and forces a full
 re-index. It is a migration with its own decision, not a bug fix.
+
+---
+
+## 16. Per-resource hardware telemetry (CPU / GPU / memory, measured separately)
+
+`hardware_probe` (§4b) could already say *which* adapters exist. Nothing could say
+how **busy** one is — which is the number that matters during an ingest, because it
+is how you tell whether Whisper reached the GPU or quietly stayed on the CPU.
+
+New file `backend/modules/gpu_telemetry.py`. Constraints honoured (§2/§9): **stdlib
++ `psutil` only, no new dependency, no shell calls.** That rules out `nvidia-smi`,
+`system_profiler` and `wmic`, so NVIDIA is read through **NVML via `ctypes`** — the
+driver library already on the machine, loaded rather than invoked. AMD/Intel on
+Linux come from sysfs `gpu_busy_percent` / `gt_busy_percent`, `mem_info_vram_used`.
+
+**New aggregate keys** (per adapter: `util_percent`, `vram_used_mb`,
+`gpu_telemetry_reason`): `gpu_util_percent` (busiest adapter, not an average),
+`gpu_vram_used_mb`, `gpu_util_available`, `gpu_telemetry_source`
+(`nvml`/`sysfs`/`null`), `gpu_telemetry_reason`, `gpu_driver_version`,
+`gpu_adapters_measured`, `gpu_adapters_total`. **All legacy keys are preserved**
+(`cpu_count`, `platform`, `gpu_names`, `gpu_vram_total_mb`) — the ingestion
+budget, the volume list and the evidence-store check all read this same dict, so
+`verify_queue_api.py` guards its shape.
+
+CPU sampling was also de-blocking: `_cpu()` called `psutil.cpu_percent(interval=0.3)`,
+i.e. a guaranteed **300 ms sleep inside the module lock on every cache miss**, so the
+Evidence page's budget request, the Queue page's poll and the worker's governor all
+serialised behind a quarter-second pause to produce one number. Now non-blocking
+(`interval=None`), primed at import, plus `cpu_per_core_percent`. Forced re-scan
+worst case measured **43 ms**, versus a guaranteed 300 ms before.
+
+### 🔴 TRAP 1 — a `_vN` entry point does not share its base's struct
+
+This is the most important thing in this section, and it is a **latent 16-byte stack
+buffer overflow that was shipped in the first draft of this module.**
+
+`nvmlDeviceGetMemoryInfo_v2` was called with the 24-byte `nvmlMemory_t` struct, on
+the reasonable-sounding grounds that both entry points return memory info. But
+`nvmlMemory_v2_t` is a **different, larger** struct — `version, total, reserved,
+free, used`, **40 bytes** — so the driver writes 40 bytes through a 24-byte buffer.
+
+It never fired on the dev box, and the reason why is the interesting part: the v2
+struct's first field is a **version handshake** (`sizeof(struct) | (2 << 24)`), and
+the draft never set it. The driver therefore rejected the malformed request with
+`rc=2` *before writing anything*, and the code read that rejection as "v2 is not
+supported on this driver" and fell back to v1. **The masked bug and the masking were
+the same fact.** Called correctly, v2 works fine on this driver and additionally
+reports `reserved` (92 MB on the 1050 Ti).
+
+Two rules, both generalising past NVML:
+1. **Never share a struct between an entry point and its `_vN` sibling.** The
+   version suffix changes the *layout*, not just the name.
+2. **A versioned struct is a request as well as a return value.** The caller fills
+   in `version` to tell the driver how much space it has been handed. An
+   uninitialised version is not a default, it is a malformed request.
+
+Struct sizes are now `assert`ed at import (24 / 40 / 8), because a wrong-sized
+struct is not something to discover at run time on someone else's machine.
+
+### 🔴 TRAP 2 — a 32-bit struct returns SUCCESS while writing nonsense
+
+Measured on this box (driver 582.66), not assumed:
+
+| call | result |
+|---|---|
+| `nvmlDeviceGetMemoryInfo_v2` called *incorrectly* | `rc=2`, nothing written |
+| `nvmlDeviceGetMemoryInfo_v2` called correctly | `rc=0`, total=4096MB, reserved=92MB |
+| `nvmlDeviceGetMemoryInfo` (v1) | `rc=0`, total=4096MB, used=479MB |
+| `nvmlDeviceGetMemoryInfo` with **32-bit** fields | **`rc=0`** — total=0MB, used=3501MB |
+
+That last row is the dangerous one: it **reports success**. `nvmlMemory_t` is three
+`unsigned long long`, so a 32-bit struct hands the callee a 12-byte buffer for a
+24-byte write — `total` reads 0 and `used` reads what is really `free`. A
+return-code check passes and the panel displays confidently wrong numbers.
+
+**So return code alone is never sufficient. Three layers, all in `_memory`:**
+- **The struct is 64-bit.** Non-negotiable.
+- **The values are validated** — `total > 0`, `free <= total`, `used <= total`, and
+  the fields must *reconcile* — checked in **bytes**, not MB, so integer flooring
+  cannot manufacture a violation. The total is then cross-checked against the
+  dedicated VRAM the registry reported, within `max(64MB, 5%)`.
+
+### 🔴 TRAP 3 — the reconciliation formula depends on a convention the docs and the driver disagree about
+
+NVIDIA's reference for `nvmlMemory_v2_t.used` describes it as **including**
+`reserved`, giving `total ≈ free + used`. Measured on this box (582.66), it
+**excludes** it:
+
+```
+total == reserved + free + used   delta = 0 bytes       <- what this driver does
+total ==           free + used   delta = 96468992 bytes  <- what the docs describe
+v1.used - v2.used == v2.reserved  (92 MB, exactly)
+```
+
+The trap is not the disagreement — it is what a *hard-coded* identity does about
+it. A driver following the documented convention fails the `reserved + free + used`
+test, the code falls back to v1, and v1's `used` **includes** the reservation, so
+the panel shows a plausible number that is right by accident and for the wrong
+reason. A refusal that quietly becomes a different answer is silent degradation,
+which is the B1/B10 defect class one layer down.
+
+`_reconcile_memory()` therefore **accepts either convention, detects which it got,
+and normalises** so `vram_used_mb` means application VRAM (excluding the driver
+reservation) on every driver. A reading satisfying neither is refused. The v1
+witness check follows whichever convention was detected, so it stays sharp rather
+than accepting both and proving nothing.
+
+### 🔴 TRAP 4 — a conservation sum cannot detect a field-order error
+
+`total == reserved + free + used` is **order-independent**. If the field order
+were wrong but the size right, every value still lands in range, the three still
+sum to `total`, and `total` still matches the registry — all guards pass.
+Demonstrated: a misordered read displays **3459 MB** against a true **544 MB**.
+
+The v1 call is the independent witness, precisely because it defines `used`
+differently: `v1.used == v2.used + v2.reserved` (convention A) or
+`v1.used == v2.used` (convention B). Those only agree if the layout is right.
+`verify_gpu_telemetry.py` feeds the code a deliberately misordered 40-byte struct
+and requires the reading to be **refused**, not displayed.
+
+> Trap when *writing* that test: the misordered struct must be **standalone**.
+> Subclassing `_NvmlMemoryV2` and redefining `_fields_` **appends** the new
+> fields after the base class's, yielding an 80-byte struct in which the
+> driver's 40-byte write lands in the base fields and the subclass's own fields
+> stay zero. The first version of that test did exactly this and silently
+> simulated nothing.
+
+### 🔴 TRAP 5 — a ratio needs a denominator covering the same population
+
+`gpu_vram_used_mb` summed only the adapters that were **measured**, while
+`gpu_vram_total_mb` (summed by `hardware_probe` over the whole inventory) was the
+denominator. Two different populations. With a measurable 4 GB card and an
+unmeasurable 16 GB one, 1 GB in use renders as **5 %** instead of **25 %** — 5×
+understated, and 5 % looks entirely plausible.
+
+`gpu_vram_measured_total_mb` now sums the totals of exactly the adapters that
+contributed a used figure, and the panel prefers it. Note the test fixture must
+give the *unmeasured* adapter a real dedicated total: an unmeasured card with
+`vram_total_mb = 0` contributes to neither total, so that shape **cannot**
+discriminate the two denominators and the test passes for the wrong reason.
+
+### The invariant: never report a fake `0`
+
+**A metric that cannot be measured is `None` plus a reason, never `0`.** `None`
+renders as `—` with a neutral track; a fabricated `0` renders as "idle", and an
+idle reading during a two-hour transcription is the exact lie this module exists to
+prevent. This is the same defect class as B1, B10 and B11 — *silent success* — in a
+new place, and it is why `LoadGauge` treats `null` as a first-class state rather
+than coercing it.
+
+Two leaks found in my own first draft, both by this rule:
+- An appended "extra" adapter used `reading.get("vram_total_mb") or 0`, converting
+  an **unknown** VRAM total into **zero** VRAM. Now `None`, and the UI distinguishes
+  "no dedicated VRAM" (integrated) from "VRAM total not measurable" (a dedicated
+  card we could not read).
+- The aggregate became "known" as soon as *any* adapter was measured, so on a mixed
+  machine it implied all of them were. Now `gpu_adapters_measured` /
+  `gpu_adapters_total` are reported, the label reads "busiest of 1/2 measured", and
+  a partial-coverage note is shown **even when a number exists** — because "the one
+  adapter I could measure is idle" and "the GPU is idle" are different answers.
+
+**A telemetry failure must never fail a hardware scan**, which also feeds the
+ingestion budget, the volume list and the evidence-store check. Three nested guards:
+`sample_matched` degrades, `attach_gpu_telemetry` catches everything, and
+`hardware_probe._gpu()` has its own fallback if the telemetry *module* itself raises.
+Asserted in `verify_gpu_telemetry.py` part E.
+
+### A failed session is not terminal
+
+`ensure_ready` originally made `"unavailable"` permanent for the life of the
+process. That contradicts the live-device premise: the driver may be absent when the
+backend starts, the box may be suspended, and an eGPU gets plugged into a dock
+mid-session. The panel would show a permanent em dash for a working GPU, and
+**Rescan would not help** — the opposite of what Rescan is for. Success is now cached
+for the process; failure expires after 30 s, and `rescan_hardware()` /
+`get_hardware_spec(force=True)` bypass the backoff entirely via
+`scan_hardware(telemetry_retry=True)`.
+
+### Known limitation, stated rather than implied
+
+The registry/sysfs inventory and the NVML device list are **two independent
+enumerations joined by name** (vendor id as a Linux fallback). That is a guess, not
+an identity: two identical cards, or hybrid-GPU silicon appearing twice, can bind a
+reading to the wrong physical device, and the VRAM cross-check cannot catch it when
+both cards have the same memory. Making it authoritative means matching PCI
+location (NVML `busId` vs the registry's PCI path) and is **not done** — it needs a
+Windows-side PCI enumeration. Documented at the join rather than left to read as
+exact.
+
+### Verification
+
+```bash
+PYTHONPATH=. python tests/verify_gpu_telemetry.py   # 171 assertions, ~20 s
+PYTHONPATH=. python tests/verify_cpu_sampler.py     #   9 assertions, ~10 s
+```
+
+`verify_gpu_telemetry.py` (new, in `tests/`) covers the v2 struct rule and version
+handshake, the 32-bit misread being *refused* (it first asserts the trap still
+exists on this driver, so the guard cannot quietly become decorative), **both**
+`used` conventions, the misordered-struct guard, the VRAM denominator, the
+sysfs byte→MB conversion, retry semantics, partial coverage, and every
+`None`-not-`0` path. `verify_cpu_sampler.py` (new) loads all cores in
+**subprocesses** and requires the figure to move, because a primed sampler that
+silently returned `0.0` forever would look exactly like an idle machine — correct
+code, unverifiable by reading.
+
+**Full gate, servers stopped: 305 assertions across seven scripts, 0 failures**
+(39 + 37 + 15 + 17 + 17 + 9 + 171). `npm run build` clean. `verify_live_stack.py`
+(26) is not in that count — it needs ollama + uvicorn + Vite up.
+
+**Test-harness traps hit while verifying** — read before extending these files:
+- Utilisation and VRAM-used are **live** values. Compare with a tolerance, never for
+  exact equality against a separately-timed read (observed 0% on one run, 23% the
+  next). `vram_total_mb` *is* compared exactly — it is a stable per-adapter
+  constant, and neither a mis-join nor a truncated struct produces 4096 by accident.
+- **Ground truth must use the same NVML version as the code under test.** v1 folds
+  the driver's reserved region into `used`; v2 reports it separately. Comparing the
+  probe's v2 reading against a v1 ground truth showed a 92 MB discrepancy that was
+  not a bug in either — just two definitions of "used".
+- **Subclassing a `ctypes.Structure` appends fields; it does not reorder them.**
+  See TRAP 4 above. A test that builds a misordered struct as a subclass silently
+  tests nothing.
+- **A fixture must be able to *discriminate* the thing it guards.** The VRAM
+  denominator is only distinguishable when the unmeasured adapter has a non-zero
+  total; with a `0`-total unmeasured card both denominators are equal and the
+  assertion passes for the wrong reason. I also wrote a literally vacuous
+  assertion (`x != 4096 or True`) while drafting this suite. Prefer a fixture that
+  would *fail* if the fix were reverted.
+- **Prefer outcome tests to spy tests.** An early version asserted
+  `attach_gpu_telemetry` passed `force=True` down to the session — which would pass
+  even if the rescan path were never wired to it, because it tested plumbing
+  instead of behaviour. Force a failed session, rescan, require the reading back.
+- Load generators must be `subprocess`, not `multiprocessing` (Windows spawn
+  re-imports `__main__`) and not threads (the GIL caps eight Python threads at ~12%,
+  so a 28% "full load" is an artefact of the generator, not the sampler).
+- `x or -1` is a **bug** in a percentage range check: an idle GPU reports `0`, and
+  `0 or -1` is `-1`. I wrote that bug into the test that guards the null-vs-zero
+  contract — twice, and Codex found the second one. Use an explicit `is not None`.
+- Simulating a failed NVML session must also set `_failed_at = time.monotonic()`.
+  Failure is no longer terminal, so a failure with no timestamp is one whose backoff
+  has already expired — and the next sample silently re-initialises and succeeds.
+- When stubbing a method whose signature gained a keyword, update the stub. A stub
+  `ensure_ready(self)` called as `ensure_ready(force=...)` raises `TypeError`,
+  which looks like a product bug rather than a stale test double.
+
 

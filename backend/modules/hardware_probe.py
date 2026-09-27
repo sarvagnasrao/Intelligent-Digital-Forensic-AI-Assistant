@@ -32,12 +32,35 @@ import time
 
 import psutil
 
+from backend.modules.gpu_telemetry import attach_gpu_telemetry
+
 DEFAULT_TTL_SECONDS = 4.0
 
 _cache = None
 _cache_at = 0.0
 _cache_key = None
 _lock = threading.Lock()
+
+
+def _prime_cpu_sampler():
+    """
+    Seeds psutil's non-blocking CPU sampler.
+
+    `cpu_percent(interval=None)` measures the load accumulated since the
+    *previous* call, and returns 0.0 on the very first one because there is
+    nothing to compare against. Priming at import is what makes every later
+    reading mean "load since the last sample" rather than a startup artefact.
+
+    The caller discards this value; it exists only to establish a baseline.
+    """
+    try:
+        psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None, percpu=True)
+    except Exception:
+        pass
+
+
+_prime_cpu_sampler()
 
 
 def _decode(value):
@@ -133,7 +156,28 @@ def _cpu():
             out["cpu_freq_max_mhz"] = int(freq.max)
     out.setdefault("cpu_freq_mhz", None)
     out.setdefault("cpu_freq_max_mhz", None)
-    out["cpu_percent"] = psutil.cpu_percent(interval=0.3)
+
+    # Non-blocking, not interval=0.3.
+    #
+    # The blocking form slept 300 ms *inside this module's lock* on every cache
+    # miss, so the Evidence page's budget request, the Queue page's poll and
+    # the ingestion worker's governor all serialised behind a quarter-second
+    # sleep to produce one number. The non-blocking form compares against the
+    # previous call instead, which is what a percentage is supposed to mean:
+    # load averaged over the window since the last poll. _prime_cpu_sampler()
+    # runs at import so the baseline exists.
+    #
+    # The first sample after process start therefore covers the whole time
+    # since import rather than one poll window. That is a real measurement, not
+    # a placeholder, and it converges to a true 8-second window from the second
+    # poll onwards - long before an operator opens the panel.
+    try:
+        out["cpu_percent"] = psutil.cpu_percent(interval=None)
+        out["cpu_per_core_percent"] = psutil.cpu_percent(
+            interval=None, percpu=True)
+    except Exception:
+        out["cpu_percent"] = None
+        out["cpu_per_core_percent"] = None
     return out
 
 
@@ -230,6 +274,13 @@ def _gpus_linux():
             "name": "%s GPU (%s:%s)" % (label, vendor, device),
             "vram_total_mb": vram,
             "shared_memory": vram == 0,
+            # Consumed by gpu_telemetry: the sysfs node is where the AMD/Intel
+            # busy-percent and VRAM-used figures live, and the vendor id is the
+            # only reliable join key. The name above is synthetic ("NVIDIA GPU
+            # (0x10de:0x1c82)"), so it can never match a real adapter name -
+            # which is exactly why the vendor fallback exists.
+            "vendor": vendor,
+            "_sysfs_device": dev,
         })
     return cards
 
@@ -242,7 +293,7 @@ def _read_first(path):
         return None
 
 
-def _gpu():
+def _gpu(telemetry_retry=False):
     system = platform.system()
     if system == "Windows":
         cards = _gpus_windows()
@@ -253,15 +304,39 @@ def _gpu():
         # system_profiler (see module docstring); report nothing rather
         # than a wrong number.
         cards = []
-    discrete = [g for g in cards if not g["shared_memory"]]
-    return {
+
+    # Live utilisation and VRAM-used, per adapter. Fails soft by design: a
+    # telemetry problem must not take down the hardware scan, which also feeds
+    # the ingestion budget, the volume list and the evidence-store check.
+    try:
+        cards, live = attach_gpu_telemetry(cards, system, force=telemetry_retry)
+    except Exception as e:  # never let a metrics read break an inventory read
+        live = {
+            "gpu_util_percent": None,
+            "gpu_vram_used_mb": None,
+            "gpu_util_available": False,
+            "gpu_telemetry_source": None,
+            "gpu_telemetry_reason":
+                f"GPU telemetry raised {type(e).__name__}: {e}",
+            "gpu_adapters_measured": 0,
+            "gpu_adapters_total": len(cards),
+        }
+        for g in cards:
+            g.setdefault("util_percent", None)
+            g.setdefault("vram_used_mb", None)
+            g.setdefault("gpu_telemetry_reason", None)
+
+    discrete = [g for g in cards if not g.get("shared_memory")]
+    out = {
         "gpus": cards,
         "gpu_count": len(cards),
         "gpu_names": [g["name"] for g in cards],
-        "gpu_vram_total_mb": sum(g["vram_total_mb"] for g in cards),
+        "gpu_vram_total_mb": sum(g.get("vram_total_mb") or 0 for g in cards),
         "gpu_discrete_count": len(discrete),
         "gpu_vram_shared_only": bool(cards) and not discrete,
     }
+    out.update(live)
+    return out
 
 
 # ── Storage devices ──────────────────────────────────────────────────────────
@@ -442,18 +517,23 @@ def _machine():
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-def scan_hardware() -> dict:
+def scan_hardware(telemetry_retry: bool = False) -> dict:
     """
     Full live re-scan. No cache involved - walks the registry, sysfs,
     partitions and NICs every time. Use this after attaching a drive or an
     eGPU, or from a "Rescan devices" button.
+
+    `telemetry_retry` makes the GPU telemetry ignore its failure backoff. An
+    operator who has just plugged in an eGPU and pressed Rescan should see the
+    new card immediately, not after a 30-second wait - otherwise Rescan appears
+    to be broken for exactly the case it exists to serve.
     """
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
 
     spec = {}
     spec.update(_cpu())
-    spec.update(_gpu())
+    spec.update(_gpu(telemetry_retry))
     spec.update(_storage())
     spec.update(_network())
     spec.update(_machine())
@@ -490,6 +570,9 @@ def get_hardware_spec(force: bool = False,
     the video registry and every NIC on each tick. It is deliberately
     short: hot-plugged evidence drives and eGPUs show up within seconds.
     Call with force=True (or rescan_hardware) to bypass it entirely.
+
+    `force` also lifts the GPU telemetry's own failure backoff, so a re-scan
+    picks up an NVML session that failed earlier - see _NvmlSession.
     """
     global _cache, _cache_at, _cache_key
 
@@ -505,14 +588,19 @@ def get_hardware_spec(force: bool = False,
         if fresh and not force:
             return _cache
 
-        spec = scan_hardware()
+        spec = scan_hardware(telemetry_retry=force)
         _cache, _cache_at, _cache_key = spec, now, fingerprint
         return spec
 
 
 def rescan_hardware() -> dict:
-    """Force an immediate re-scan and refresh the cache. Use after the
-    operator attaches evidence media or an external GPU."""
+    """
+    Force an immediate re-scan and refresh the cache. Use after the operator
+    attaches evidence media or an external GPU.
+
+    This also retries NVML initialisation, so an operator who attaches a GPU
+    after the backend started does not have to restart it to see the card.
+    """
     return get_hardware_spec(force=True, ttl=0)
 
 

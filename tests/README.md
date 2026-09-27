@@ -14,6 +14,8 @@ PYTHONPATH=. venv/bin/python tests/verify_ws_progress.py
 PYTHONPATH=. venv/bin/python tests/verify_queue_api.py
 PYTHONPATH=. venv/bin/python tests/verify_job_stop.py
 PYTHONPATH=. venv/bin/python tests/verify_vector_store.py
+PYTHONPATH=. venv/bin/python tests/verify_cpu_sampler.py
+PYTHONPATH=. venv/bin/python tests/verify_gpu_telemetry.py
 PYTHONPATH=. venv/bin/python tests/verify_live_stack.py   # needs the stack running
 
 # Windows
@@ -22,12 +24,15 @@ $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_ws_progress.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_queue_api.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_job_stop.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_vector_store.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_cpu_sampler.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_gpu_telemetry.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_live_stack.py
 ```
 
-The first five are self-contained. The sixth needs `ollama serve`, uvicorn on
-`:8000` and the Vite dev server on `:3000` already running; it waits 90 s for
-the backend and skips cleanly if it never comes up.
+The first seven are self-contained — **305 assertions**. `verify_live_stack.py`
+is the eighth and needs `ollama serve`, uvicorn on `:8000` and the Vite dev
+server on `:3000` already running; it waits 90 s for the backend and skips
+cleanly if it never comes up.
 
 > **Stop the backend before running the self-contained ones.** A live server on
 > the same `data/forensic.db` runs its own worker thread, and that worker
@@ -46,6 +51,8 @@ the backend and skips cleanly if it never comes up.
 | `verify_job_stop.py` | The Stop button actually stops. Drives the real `_process_job` on a worker thread, fires `stop_job()` from another thread exactly as the endpoint does, and requires that the job halts, is recorded `Stopped` rather than `Failed`, reverts the evidence to `Uploaded`, and **did not reach 100 %** — a stop that is acknowledged but ignored is otherwise indistinguishable from a job that simply finished. Also pins the HTTP contract, including that `DELETE /queue/{id}/cancel` still refuses a `Running` job. | ~20 s |
 | `verify_vector_store.py` | One Qdrant client **per case**, keyed on a normalised path, with real data isolation: indexing case B leaves case A's storage untouched. Plus the optional-dependency contract — `backend.main` and `backend.ingestion` import with `torch` and `sentence_transformers` blocked, and a stop request surfaces as `StopIteration` rather than an indexing failure. | ~10 s |
 | `verify_live_stack.py` | End-to-end over a real socket: uploads a file, queues it as `accurate`, and asserts monotonic `INGESTION_PROGRESS` frames actually arrive on `/ws/global` and land on a `Completed` row. | ~90 s |
+| `verify_cpu_sampler.py` | The CPU figure is a real measurement, not a primed constant. Burns all logical cores in **subprocesses** and requires the reported load to climb and then fall, and pins the forced re-scan's worst case below the 300 ms the old blocking sampler cost on every cache miss. | ~10 s |
+| `verify_gpu_telemetry.py` | The NVML ABI, end to end. Each entry point gets its own struct and the version handshake; the 32-bit misread is *refused*; a field-order misread is *refused*; both `used` conventions are accepted and normalised; the VRAM ratio divides by a denominator covering the same adapters as its numerator; sysfs byte values are converted; a failed NVML session recovers; and no unmeasurable metric ever becomes `0`. | ~20 s |
 
 ## Why these exist
 
@@ -97,6 +104,29 @@ Both scripts therefore assert on behaviour under motion — a stop that halts a
 real thread mid-flight, chunks written into one case's storage and proven
 absent from another's — rather than on the presence of a function call.
 
+`verify_gpu_telemetry.py` exists because the NVML binding is the one place in
+the project where **the compiler is not checking anything**. A wrong struct
+width, a shared `_vN` buffer, or a field order declared backwards all produce a
+struct the right size that the driver fills without complaint, and the first two
+return `SUCCESS` while doing it. Reading the code cannot find these, because the
+code is correct *as written* and wrong *as ABI*. They have to be measured, and
+the guards deliberately assert the traps **still exist on this driver** first, so
+a guard cannot quietly become decorative if the driver ever changes.
+
+Three lessons from writing it, all of which are ways to write a test that passes
+while the behaviour is wrong:
+
+- **A fixture must be able to discriminate.** The VRAM-denominator bug only
+  shows when the *unmeasured* adapter has a non-zero total; with a `0`-total
+  unmeasured card both denominators are equal and the assertion passes for the
+  wrong reason. Prefer a fixture that would fail if the fix were reverted.
+- **Prefer outcomes to spies.** An early version asserted `force=True` reached an
+  internal call, which would still pass if the rescan path were never wired to
+  it. Force a failed session, rescan, require the reading back.
+- **`ctypes.Structure` subclassing appends; it does not reorder.** The
+  misordered-struct guard has to declare a *standalone* struct, or it is 80
+  bytes and silently tests nothing.
+
 ## Notes
 
 - `verify_queue_api.py` registers a throwaway user and cleans up every row
@@ -121,3 +151,17 @@ absent from another's — rather than on the presence of a function call.
   commit/rollback/close, so a naive poll loop re-reads one snapshot and
   reports the original value forever — it will watch a job run to completion
   and report 0 % throughout.
+- Live metrics are **live**. Compare utilisation and VRAM-used with a tolerance,
+  never for exact equality against a separately-timed read. `vram_total_mb` *is*
+  compared exactly — it is a stable per-adapter constant, and neither a
+  mis-joined reading nor a truncated struct produces 4096 by accident.
+- Ground truth must come from the **same NVML version** as the code under test.
+  v1 folds the driver's reserved region into `used` and v2 reports it separately;
+  comparing the probe's v2 reading against a v1 ground truth showed a 92 MB
+  discrepancy that was a definition difference, not a bug.
+- `x or -1` is a bug in a percentage range check: an idle GPU reports `0` and
+  `0 or -1` is `-1`. This appeared twice in this suite, including inside the
+  test guarding the null-vs-zero contract. Use an explicit `is not None`.
+- Simulating a failed NVML session must also set `_failed_at = time.monotonic()`.
+  Failure is no longer terminal, so a failure with no timestamp is one whose
+  backoff has already expired — and the next sample re-initialises and succeeds.

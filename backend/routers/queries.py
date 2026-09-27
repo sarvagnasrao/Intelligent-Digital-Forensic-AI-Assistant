@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from backend.database import get_db
 from backend import models, schemas
 from backend.modules.rag_engine import run_rag_query
+from backend.modules.vector_store import case_qdrant_path
 from backend.dependencies import get_settings
 from backend.auth import (
     get_current_user,
@@ -135,9 +136,7 @@ def ask_question(
     query + response to QueryLog.
     """
     settings = get_settings()
-    qdrant_path = (
-        f"{settings.cases_dir}/{case_id}/qdrant"
-    )
+    qdrant_path = case_qdrant_path(case_id)
 
     # Verify case exists
     case = db.query(models.Case).filter(

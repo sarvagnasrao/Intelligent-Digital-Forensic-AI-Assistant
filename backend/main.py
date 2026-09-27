@@ -22,6 +22,15 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     # Startup
     init_db()
+    # Move per-case Qdrant indexes onto a fast disk when the cases directory
+    # is on a rotating one. The upsert is ~92% of ingestion time and is
+    # seek-latency bound, so this is the difference between a job that takes a
+    # minute and one that takes eight. Idempotent; a no-op on an all-SSD box.
+    try:
+        from backend.modules.vector_store import migrate_qdrant_layout
+        migrate_qdrant_layout()
+    except Exception as e:
+        print(f"[STARTUP] Qdrant layout migration skipped: {e}")
     from backend.modules.job_worker import start_worker, set_main_loop
     # The ingestion worker runs in a background thread but must send
     # progress over WebSockets owned by *this* event loop. Hand it the loop

@@ -5,6 +5,7 @@ import uuid
 import os
 import threading
 import requests
+from typing import Optional
 
 from backend.dependencies import get_settings
 
@@ -14,6 +15,135 @@ VECTOR_SIZE = 384
 # smaller slices mean a shorter worst-case wait for a Stop, and more places
 # for the governor to throttle. The resulting vectors are identical.
 EMBED_SLICE = 16
+
+# Resolved once, because it consults the disk and the settings on first use.
+_resolved_qdrant_dir: Optional[str] = None
+
+
+def resolve_qdrant_dir() -> str:
+    """
+    Base directory holding every per-case Qdrant index.
+
+    Resolution order:
+
+    1. ``QDRANT_DIR``, when set explicitly.
+    2. A fast (SSD) location, when the cases directory is on a rotating disk.
+    3. The cases directory, when it is already on a fast disk - no split.
+
+    Why (2) exists: the per-point Qdrant upsert is ~92% of a document
+    ingestion (measured: 47s of 81s for a 2.7 MB file, against 3s for the
+    embedding and 3s for everything else combined). That cost is dominated by
+    disk *seek latency*, not CPU, so it measures ~13x slower on a 7200 RPM
+    SATA disk than on the NVMe system disk. The index is derived data -
+    rebuildable by re-ingesting the evidence - so keeping it on the fast disk
+    costs nothing in forensic integrity, and the evidence itself stays where
+    the operator put it.
+
+    Returns the cases directory unchanged when the disk type cannot be
+    determined: an unknown disk is not evidence of an SSD, and the caller
+    must not move data onto a drive it has misidentified.
+    """
+    global _resolved_qdrant_dir
+    if _resolved_qdrant_dir:
+        return _resolved_qdrant_dir
+
+    settings = get_settings()
+    configured = (settings.qdrant_dir or "").strip()
+    if configured:
+        _resolved_qdrant_dir = os.path.normpath(configured)
+        return _resolved_qdrant_dir
+
+    # abspath first: cases_dir is usually relative ("./data/cases"), and
+    # splitdrive on a relative path returns an empty drive - which would fall
+    # through to the system drive and conclude the cases dir is already fast.
+    cases_dir = os.path.abspath(os.path.normpath(settings.cases_dir or "."))
+    # The Windows system drive, NOT the current working directory: the backend
+    # is routinely started from the repo, which on this box is on D:, and
+    # treating the CWD as "the system drive" would conclude that the cases dir
+    # is already on the fast disk and skip the split.
+    system_drive = (os.environ.get("SystemDrive", "C:")
+                    .rstrip(":") or "C")
+    cases_drive = (os.path.splitdrive(cases_dir)[0]
+                   .rstrip(":") or system_drive)
+
+    # Already on the system (fast) disk - nothing to gain from a split.
+    if cases_drive.upper() == system_drive.upper():
+        _resolved_qdrant_dir = cases_dir
+        return _resolved_qdrant_dir
+
+    from backend.modules.hardware_probe import disk_media_type
+    if disk_media_type(cases_dir) == "HDD":
+        # User-writable by construction: %LOCALAPPDATA% needs no elevation,
+        # unlike the system-drive root.
+        base = os.environ.get("LOCALAPPDATA") or (system_drive + os.sep)
+        target = os.path.join(base, "IDFA", "qdrant")
+        print(f"[QDRANT] cases dir is on a rotating disk ({cases_drive}:); "
+              f"putting the vector index on the faster {system_drive}: disk at "
+              f"{target}. Set QDRANT_DIR to override.")
+        _resolved_qdrant_dir = target
+        return _resolved_qdrant_dir
+
+    _resolved_qdrant_dir = cases_dir
+    return _resolved_qdrant_dir
+
+
+def case_qdrant_path(case_id: str) -> str:
+    """
+    The Qdrant storage path for one case. The single source of truth.
+
+    This replaces the ``f"{cases_dir}/{case_id}/qdrant"`` literal that was
+    duplicated across ingestion.py, queries.py, entities.py, evidence.py and
+    cases.py - and spelled two different ways (os.path.join vs a forward-slash
+    f-string), which is the B14 trap where one directory was opened under two
+    different cache keys. Routing every caller through here means the storage
+    location can change once, in one place, and the per-case client cache can
+    never again hold two keys for one directory.
+    """
+    return os.path.join(resolve_qdrant_dir(), case_id, "qdrant")
+
+
+def migrate_qdrant_layout() -> int:
+    """
+    Move per-case Qdrant indexes from the old in-cases location to wherever
+    ``resolve_qdrant_dir()`` now points.
+
+    A no-op (returns 0) when QDRANT_DIR is unset and the cases directory is
+    already on a fast disk - the common case on an all-SSD box. Returns the
+    number of collections moved.
+
+    A collection that already exists at the destination is left alone rather
+    than overwritten: two indexes for one case is a problem, but silently
+    destroying one is a worse one.
+    """
+    import shutil
+
+    new_base = resolve_qdrant_dir()
+    settings = get_settings()
+    old_base = os.path.normpath(settings.cases_dir or ".")
+    if os.path.normpath(new_base) == old_base:
+        return 0
+    if not os.path.isdir(old_base):
+        return 0
+
+    moved = 0
+    for name in os.listdir(old_base):
+        old_path = os.path.join(old_base, name, "qdrant")
+        if not os.path.isdir(old_path):
+            continue
+        new_path = os.path.join(new_base, name, "qdrant")
+        if os.path.exists(new_path):
+            print(f"[QDRANT] {new_path} already exists - leaving "
+                  f"{old_path} in place rather than overwriting it.")
+            continue
+        try:
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            shutil.move(old_path, new_path)
+            moved += 1
+        except Exception as e:
+            print(f"[QDRANT] could not move {old_path} -> {new_path}: {e}")
+    if moved:
+        print(f"[QDRANT] moved {moved} collection(s) to {new_base}")
+    return moved
 
 # Local embedding model, loaded on first use.
 #

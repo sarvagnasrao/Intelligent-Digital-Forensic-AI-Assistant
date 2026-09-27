@@ -443,7 +443,7 @@ def generate_case_summary(
     ]) or "No notes added."
 
     # Retrieve key evidence chunks from vector store
-    qdrant_path = os.path.join(settings.cases_dir, case_id, "qdrant")
+    qdrant_path = case_qdrant_path(case_id)
     key_chunks = []
     if os.path.exists(qdrant_path):
         for term in ["suspect", "evidence", "timeline", "location", "communication"]:
@@ -652,10 +652,7 @@ def detect_contradictions(
     ).limit(15).all()
 
     # Get key evidence chunks
-    qdrant_path = os.path.join(
-        settings.cases_dir,
-        case_id, "qdrant"
-    )
+    qdrant_path = case_qdrant_path(case_id)
 
     key_chunks = []
     for term in [

@@ -36,6 +36,121 @@ from backend.modules.gpu_telemetry import attach_gpu_telemetry
 
 DEFAULT_TTL_SECONDS = 4.0
 
+
+def disk_media_type(path: str) -> str:
+    """
+    'SSD' or 'HDD' for the drive holding ``path``, or '' when it cannot be
+    told.
+
+    This exists because the single largest cost in ingestion is the per-point
+    Qdrant upsert, and that cost is dominated by *disk seek latency*, not CPU:
+    measured on this box, embedding 361 chunks costs ~3s while upserting the
+    same 361 points costs ~47s on a 7200 RPM SATA disk and ~4s on the NVMe
+    system disk - a 12x difference. So "which disk is the index on" is the
+    difference between a job that takes a minute and one that takes eight,
+    and it is a property of the hardware, not of the code.
+
+    The test is the storage seek-penalty property: an SSD has no mechanical
+    seek, so ``IncSeekPenalty`` is False. That is the same property the
+    Windows defragmenter uses to decide whether a volume needs optimizing,
+    so it does not depend on a vendor string or a heuristic.
+
+    Returns '' rather than a guess when the query fails - an unknown disk is
+    not evidence of an SSD, and the caller must not move data onto a drive it
+    has misidentified.
+    """
+    drive = os.path.splitdrive(os.path.abspath(path or "."))[0]
+    if not drive:
+        return ""
+    # splitdrive yields 'D:' - the colon is part of the drive specifier, and
+    # _disk_media_type_windows appends its own, so strip it here or the device
+    # path becomes '\\\\.\\D::' and the open fails.
+    drive = drive.rstrip(":")
+    if os.name != "nt":
+        # Linux: rotational flag from sysfs. 0 = SSD, 1 = rotating.
+        try:
+            dev = os.path.realpath(f"/dev/{os.path.basename(drive)}")
+            base = f"/sys/block/{os.path.basename(dev)}/queue/rotational"
+            with open(base) as fh:
+                return "HDD" if fh.read().strip() == "1" else "SSD"
+        except Exception:
+            return ""
+    try:
+        return _disk_media_type_windows(drive)
+    except Exception:
+        return ""
+
+
+def _disk_media_type_windows(drive: str) -> str:
+    """IOCTL_STORAGE_QUERY_PROPERTY on \\\\.\\<drive>: - see disk_media_type."""
+    import ctypes
+    from ctypes import wintypes
+
+    IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
+    STORAGE_PROPERTY_QUERY_STORAGE_DEVICE_SEEK_PENALTY = 7
+    PropertyStandardQuery = 0
+
+    class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+        _fields_ = [
+            ("PropertyId", wintypes.DWORD),
+            ("QueryType", wintypes.DWORD),
+            ("AdditionalParameters", ctypes.c_byte * 1),
+        ]
+
+    class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.DWORD),
+            ("Size", wintypes.DWORD),
+            ("IncSeekPenalty", wintypes.BOOLEAN),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    # Without an explicit restype ctypes assumes c_int, which truncates the
+    # 64-bit handle to 32 bits. A handle like 0x000000000000014C then becomes
+    # 0x014C by luck, but any handle with a zero low word truncates to 0 and the
+    # INVALID_HANDLE_VALUE check below never fires - so a failed open looked
+    # like a valid one and the function returned "" for every drive.
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    # dwDesiredAccess MUST be 0. Opening a volume with GENERIC_READ needs
+    # elevation and fails with ERROR_ACCESS_DENIED (5) for a standard user,
+    # which made this silently report "unknown" on every non-admin box.
+    # IOCTL_STORAGE_QUERY_PROPERTY needs no access rights - it only reads
+    # the device descriptor - so 0 is both sufficient and unprivileged.
+    handle = kernel32.CreateFileW(
+        f"\\\\.\\{drive}:",
+        0,                             # dwDesiredAccess: none required
+        0x00000001 | 0x00000002,       # FILE_SHARE_READ | FILE_SHARE_WRITE
+        None,
+        3,                             # OPEN_EXISTING
+        0,
+        None,
+    )
+    if handle in (-1, 0xFFFFFFFFFFFFFFFF):
+        return ""
+    try:
+        query = STORAGE_PROPERTY_QUERY()
+        query.PropertyId = STORAGE_PROPERTY_QUERY_STORAGE_DEVICE_SEEK_PENALTY
+        query.QueryType = PropertyStandardQuery
+        descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+        returned = wintypes.DWORD(0)
+        ok = kernel32.DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            ctypes.byref(query), ctypes.sizeof(query),
+            ctypes.byref(descriptor), ctypes.sizeof(descriptor),
+            ctypes.byref(returned),
+            None,
+        )
+        if not ok:
+            return ""
+        return "HDD" if descriptor.IncSeekPenalty else "SSD"
+    finally:
+        kernel32.CloseHandle(handle)
+
 _cache = None
 _cache_at = 0.0
 _cache_key = None

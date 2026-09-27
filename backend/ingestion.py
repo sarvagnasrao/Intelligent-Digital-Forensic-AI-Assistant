@@ -1,6 +1,6 @@
 from backend.modules.text_parser import (
     extract_text, chunk_text)
-from backend.modules.vector_store import store_chunks
+from backend.modules.vector_store import store_chunks, case_qdrant_path
 from backend.modules.graph_builder import build_graph
 from backend.modules.forensic_ingestion import (
     ingest_e01, ingest_raw,
@@ -137,10 +137,7 @@ def run_ingestion_with_progress(
     _progress(5, f"Step 1/5: Reading file [{mode.get('key', 'normal')}]")
 
     db = SessionLocal()
-    qdrant_path = (
-        f"{settings.cases_dir}"
-        f"/{case_id}/qdrant"
-    )
+    qdrant_path = case_qdrant_path(case_id)
 
     try:
         evidence = db.query(
@@ -290,8 +287,7 @@ def _run_document_with_progress(
     db = SessionLocal()
     evidence_id = evidence.id
     evidence = db.query(models.Evidence).filter(models.Evidence.id == evidence_id).first()
-    qdrant_path = (
-        f"{settings.cases_dir}/{case_id}/qdrant")
+    qdrant_path = case_qdrant_path(case_id)
 
     if mode is None:
         from backend.modules.ingestion_modes import resolve_mode_for_device

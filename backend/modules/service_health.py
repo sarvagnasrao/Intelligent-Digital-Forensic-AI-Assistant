@@ -396,7 +396,7 @@ def probe_vector_store(cases_dir: str) -> dict:
 
     qdrant_dirs = [
         d for d in case_dirs
-        if os.path.isdir(os.path.join(cases_dir, d, "qdrant"))
+        if os.path.isdir(case_qdrant_path(d))
     ]
     out["case_collections"] = len(qdrant_dirs)
 
@@ -406,7 +406,7 @@ def probe_vector_store(cases_dir: str) -> dict:
     skipped = 0
     for case_dir in qdrant_dirs:
         size, hit_cap, missed = _sum_dir_bytes(
-            os.path.join(cases_dir, case_dir, "qdrant"), budget
+            case_qdrant_path(case_dir), budget
         )
         total += size
         skipped += missed
@@ -684,7 +684,7 @@ def probe_embeddings() -> dict:
             missing.append(f"{module_name} is not installed")
 
     try:
-        from backend.modules.vector_store import VECTOR_SIZE
+        from backend.modules.vector_store import VECTOR_SIZE, case_qdrant_path
         out["vector_size"] = int(VECTOR_SIZE)
     except Exception as e:
         # Never fall back to a restated 384: if the constant cannot be

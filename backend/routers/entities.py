@@ -303,7 +303,7 @@ def generate_entity_profile(
     """
     from backend.modules.ollama_client import (
         generate_response, is_ollama_running)
-    from backend.modules.vector_store import search_chunks
+    from backend.modules.vector_store import search_chunks, case_qdrant_path
     from backend.modules.graph_builder import (
         load_graph, get_graph_context)
     from backend.dependencies import get_settings
@@ -371,7 +371,7 @@ Do NOT refuse to analyze.
         artifact_context = '\n'.join(lines)
 
     # Step 1: Retrieve relevant chunks from vector store
-    qdrant_path = f"{settings.cases_dir}/{case_id}/qdrant"
+    qdrant_path = case_qdrant_path(case_id)
     start_time = time.time()
 
     chunks = search_chunks(

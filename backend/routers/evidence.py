@@ -846,15 +846,13 @@ def archive_evidence(
         # Qdrant cleanup — remove this evidence's vectors before archiving
         try:
             from backend.modules.vector_store import (
-                get_client, get_collection_name)
+                get_client, get_collection_name, case_qdrant_path)
             from backend.dependencies import get_settings as _get_settings
             from qdrant_client.models import (
                 Filter as QFilter,
                 FieldCondition, MatchValue)
             _settings = _get_settings()
-            qdrant_path = (
-                f"{_settings.cases_dir}/{case_id}/qdrant"
-            )
+            qdrant_path = case_qdrant_path(case_id)
             _client = get_client(qdrant_path)
             _collection = get_collection_name(case_id)
             _client.delete(

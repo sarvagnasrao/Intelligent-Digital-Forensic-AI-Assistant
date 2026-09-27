@@ -8,23 +8,27 @@ import { refreshSystemInfo } from '../hooks/useSystemInfo'
 import usePreferences from '../hooks/usePreferences'
 
 /**
- * Live hardware + device monitor.
+ * Live hardware load monitor.
  *
- * Everything shown here is re-detected, not hardcoded: CPU model and core
- * counts, every GPU with its VRAM, every mounted volume (fixed and
- * removable), network adapters, chassis model, battery. The backend
- * re-walks the hardware whenever the set of attached devices changes, so
- * plugging in an evidence drive or an eGPU shows up here automatically.
- *
- * The three load gauges at the top - CPU, memory, GPU - are deliberately
- * independent rather than sharing one bar, because that is the question an
+ * The default view is deliberately small: three independent gauges - CPU,
+ * memory, GPU - plus a VRAM meter and a storage line. That is the question an
  * operator actually has while an ingest runs: which of the three is the
- * bottleneck, and did the GPU get used at all. See LoadGauge for the
- * unmeasurable case, which is a real state here - a machine with no
- * telemetry source must never be drawn as "0% busy".
+ * bottleneck, and did the GPU get used at all. They do not move together (a job
+ * can sit at 90% RAM with the CPU idle, or peg the GPU while memory is
+ * untouched), so each gets its own bar and its own scale rather than sharing
+ * one. See LoadGauge for the unmeasurable case, which is a real state here - a
+ * machine with no telemetry source must never be drawn as "0% busy".
  *
- * Rendered on both the Evidence page and the Queue page so an operator
- * sees an identical hardware description in both places.
+ * Everything else this component knows - chassis, BIOS, per-adapter rows, every
+ * mounted volume, every NIC, I/O since boot - is behind "Show device details".
+ * It is all genuinely re-detected rather than hardcoded (the backend re-walks
+ * the hardware whenever the attached device set changes, so plugging in an
+ * evidence drive or an eGPU shows up on its own), and it is what an investigator
+ * needs when a machine misbehaves. But it is a long list of static facts, and
+ * leaving it expanded buries the three live numbers it is supposed to support.
+ *
+ * Rendered on both the Evidence page and the Queue page so an operator sees an
+ * identical description in both places.
  *
  * Honours the "System resource monitoring" preference in
  * Settings > Preferences: when switched off this component renders nothing
@@ -193,6 +197,13 @@ export default function ResourceMonitor({
   const [open, setOpen] = useState(defaultOpen)
   const [scanning, setScanning] = useState(false)
   const [showAllVolumes, setShowAllVolumes] = useState(false)
+  // The full device inventory (chassis, BIOS, per-adapter rows, every volume,
+  // every NIC) is reference material, not a live reading, so it is collapsed
+  // by default. The thing an operator watches during an ingest is which of
+  // CPU, memory and GPU is the bottleneck, and a wall of static specs pushes
+  // that off the panel. Nothing is lost - it is one click away - but it no
+  // longer competes with the three gauges for attention.
+  const [showInventory, setShowInventory] = useState(false)
 
   const apply = useCallback((res) => {
     // The endpoint returns the same object under "system" and "hardware";
@@ -323,18 +334,21 @@ export default function ResourceMonitor({
                   detail={`${info.cpu_count_physical || info.cpu_count || '?'}C/${info.cpu_count_logical || '?'}T`}
                   note="Sustained load above the queue ceiling throttles ingestion"
                 />
-                <div>
-                  <LoadGauge
-                    icon={MemoryStick}
-                    label="Memory"
-                    percent={ramPct}
-                    toneFor={pressureTone(75, 90)}
-                    detail={`${GB(info.available_ram_mb)} free`}
-                    note={info.swap_total_mb
-                      ? `of ${GB(info.total_ram_mb)} · ${GB(info.swap_used_mb || 0)} swap`
-                      : `of ${GB(info.total_ram_mb)} · no pagefile`}
-                  />
-                </div>
+                {/* `swap_used_mb` is passed through untouched. An `|| 0` here
+                    would render a pagefile whose used-bytes could not be read
+                    as "0.0 GB swap", i.e. "swap is idle" - the same fabricated
+                    quiet a null GPU reading would imply during a CPU
+                    transcription. GB() already maps null to an em dash. */}
+                <LoadGauge
+                  icon={MemoryStick}
+                  label="Memory"
+                  percent={ramPct}
+                  toneFor={pressureTone(75, 90)}
+                  detail={`${GB(info.available_ram_mb)} free`}
+                  note={info.swap_total_mb
+                    ? `of ${GB(info.total_ram_mb)} · ${GB(info.swap_used_mb)} swap`
+                    : `of ${GB(info.total_ram_mb)} · no pagefile`}
+                />
                 <div>
                   <LoadGauge
                     icon={Monitor}
@@ -410,6 +424,26 @@ export default function ResourceMonitor({
               </div>
 
               {/* ── Machine / CPU ── */}
+              {/* Full device inventory, collapsed by default. Reference
+                  material, not a live reading: chassis, BIOS, per-adapter
+                  rows, every volume, every NIC. Kept behind one toggle rather
+                  than deleted, because a forensics box changes shape between
+                  cases and the operator needs to be able to see what was
+                  actually detected. */}
+              <button
+                type="button"
+                onClick={() => setShowInventory(s => !s)}
+                aria-expanded={showInventory}
+                className="mt-4 w-full flex items-center justify-center gap-1.5 text-[10px] font-mono uppercase tracking-widest text-ink-2 hover:text-accent transition-colors cursor-pointer bg-surface-3 border-0 rounded py-1.5"
+              >
+                {showInventory
+                  ? <ChevronUp size={11} />
+                  : <ChevronDown size={11} />}
+                {showInventory ? 'Hide device details' : 'Show device details'}
+              </button>
+
+              {showInventory && (
+                <>
               <Section icon={Server} title="Machine">
                 <SpecRow
                   label="Chassis"
@@ -623,6 +657,8 @@ export default function ResourceMonitor({
                   </div>
                 ))}
               </Section>
+                </>
+              )}
             </>
           )}
 

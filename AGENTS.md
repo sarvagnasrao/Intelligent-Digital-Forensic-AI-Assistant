@@ -206,6 +206,13 @@ the Queue page** so both show an identical description. It renders `null` and st
 `show_system_resources` is off — the gate lives in exactly one place, so the preference governs
 both surfaces by construction.
 
+Its default view is deliberately short: **CPU / memory / GPU as three independent gauges**, a VRAM
+meter, a per-core strip and a storage line. Everything else it knows (chassis, BIOS, per-adapter
+rows, every volume, every NIC, I/O counters) sits behind a **"Show device details"** disclosure,
+because a wall of static specs buries the three live numbers the panel exists for. Nothing was
+deleted — a forensics box changes shape between cases, so the operator still needs to be able to
+see what was detected.
+
 ---
 
 ## 5. Work completed (by branch)
@@ -1120,6 +1127,24 @@ code, unverifiable by reading.
 **Full gate, servers stopped: 305 assertions across seven scripts, 0 failures**
 (39 + 37 + 15 + 17 + 17 + 9 + 171). `npm run build` clean. `verify_live_stack.py`
 (26) is not in that count — it needs ollama + uvicorn + Vite up.
+
+**Also verified in a real browser** (logged in, `/queue`, after the first-ever
+render of the panel): the three gauges report `role="meter"` with correct
+`aria-valuenow`/`aria-valuetext`; the integrated adapter's row shows
+"shared memory, no dedicated VRAM" while the discrete one shows "4.0 GB VRAM";
+the unmeasured adapter carries its reason; the NVML driver line renders; the
+per-core strip draws one bar per logical thread (8 on a 4C/8T box); and the
+"Show device details" disclosure expands and collapses correctly.
+
+**What the browser pass changed.** It was worth doing, and not only for
+confidence: reading the rendered DOM showed the default view was carrying the
+whole device inventory expanded, which buried the three numbers the panel
+exists for. The inventory is now behind one disclosure. A screenshot was not
+possible in this environment (`browser.screenshot` requires a visible desktop
+window), so the check was done by reading `innerText` and the meter attributes
+out of the live DOM — which is stricter about values than a picture would have
+been, but does **not** prove the visual layout, spacing or responsive behaviour
+at any viewport width. That remains unverified.
 
 **Test-harness traps hit while verifying** — read before extending these files:
 - Utilisation and VRAM-used are **live** values. Compare with a tolerance, never for

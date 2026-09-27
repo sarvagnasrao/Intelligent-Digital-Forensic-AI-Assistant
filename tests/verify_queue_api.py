@@ -112,11 +112,30 @@ def main():
         # The invariant is that the ceiling *tracks* available memory, not
         # that it sits below some constant. Asserting "below 8 GB" would pass
         # on a hardcoded 8192 MB and fail on a 32 GB box, which is backwards.
-        ratio = b.get("ram_floor_max_mb", 0) / max(b.get("available_ram_mb", 1), 1)
-        check("slider ceiling tracks available RAM (70-100% of it)",
-              0.70 <= ratio <= 1.0,
-              f"max={b.get('ram_floor_max_mb')} avail={b.get('available_ram_mb')} "
-              f"ratio={ratio:.2f}")
+        #
+        # The ceiling is available RAM rounded DOWN to a whole GB
+        # (ingestion_modes.suggest_budget, `avail // 1024 * 1024`), with a
+        # 1 GB floor and a 64 GB cap. Pin the formula itself rather than a
+        # ratio band: the band is not a property of the design, it is a
+        # side-effect of where free memory happened to sit when this ran. An
+        # earlier version asserted "70-100% of free" and failed at 50% purely
+        # because the machine had 2047 MB free instead of 2538 - the 1 GB
+        # rounding discarded 1023 MB, which is correct behaviour, not a bug.
+        # A ratio assertion cannot distinguish that from a real regression.
+        avail = b.get("available_ram_mb", 0)
+        total = b.get("total_ram_mb", 0)
+        expected_max = max(1024, min(avail, total) // 1024 * 1024)
+        expected_max = max(1024, min(expected_max, 64 * 1024))
+        check("slider ceiling is free RAM floored to a whole GB",
+              b.get("ram_floor_max_mb") == expected_max,
+              f"max={b.get('ram_floor_max_mb')} expected={expected_max} "
+              f"avail={avail} total={total}")
+        check("slider ceiling is never above what is free",
+              b.get("ram_floor_max_mb", 0) <= avail,
+              f"max={b.get('ram_floor_max_mb')} avail={avail}")
+        check("slider ceiling has a 1 GB floor even on a starved machine",
+              b.get("ram_floor_max_mb", 0) >= 1024,
+              f"max={b.get('ram_floor_max_mb')}")
         check("default floor sits inside the slider range",
               b.get("ram_floor_min_mb", 0) <= b.get("ram_floor_default_mb", 0)
               <= b.get("ram_floor_max_mb", 0),
@@ -241,6 +260,136 @@ def main():
         check("patch validates the CPU range", r.status_code == 400,
               r.status_code)
 
+        # ── PATCH must not lie ──────────────────────────────────────────────
+        # Every assertion here is about a response that reports success for
+        # something that did not happen. The worker resolves the profile once,
+        # at job_worker.py:353, and never re-reads it, so accepting a profile
+        # change on a running job would write the column and change nothing.
+        print("\n=== PATCH refuses what it cannot do ===")
+
+        # A body with no recognised key used to answer ok:true having done
+        # nothing at all.
+        r = client.patch(f"/api/queue/{job_id}/settings", headers=H, json={})
+        check("empty PATCH is rejected, not reported as applied",
+              r.status_code == 400, r.status_code)
+        r = client.patch(f"/api/queue/{job_id}/settings", headers=H,
+                         json={"nonsense": 1})
+        check("unrecognised-only PATCH is rejected",
+              r.status_code == 400, r.status_code)
+
+        # Flip the fixture to Running to exercise the profile refusal. Inserted
+        # as Running rather than Queued on purpose: the worker only ever selects
+        # Queued jobs, so a Queued fixture can be picked up and executed by a
+        # second process (see AGENTS.md section 10).
+        db = SessionLocal()
+        try:
+            j = db.query(models.IngestionJob).filter(
+                models.IngestionJob.id == job_id).first()
+            j.status = "Running"
+            db.commit()
+        finally:
+            db.close()
+
+        r = client.patch(f"/api/queue/{job_id}/settings", headers=H,
+                         json={"ingestion_mode": "accurate"})
+        check("profile change on a Running job is refused",
+              r.status_code == 400, r.status_code)
+        check("the refusal explains itself",
+              "fixed" in (r.json().get("detail") or "").lower(),
+              (r.json().get("detail") or "")[:90])
+
+        # ...and the column must not have moved, which is the whole point.
+        db = SessionLocal()
+        try:
+            j = db.query(models.IngestionJob).filter(
+                models.IngestionJob.id == job_id).first()
+            check("refused profile left the stored mode untouched",
+                  j.ingestion_mode == "fastest", j.ingestion_mode)
+            j.status = "Queued"
+            db.commit()
+        finally:
+            db.close()
+
+        # CPU/RAM must still be accepted on a running job — the governor is
+        # live for those two, unlike the profile.
+        db = SessionLocal()
+        try:
+            j = db.query(models.IngestionJob).filter(
+                models.IngestionJob.id == job_id).first()
+            j.status = "Running"
+            db.commit()
+        finally:
+            db.close()
+        r = client.patch(f"/api/queue/{job_id}/settings", headers=H,
+                         json={"cpu_throttle_percent": 60})
+        check("CPU ceiling is still editable while running",
+              r.status_code == 200, r.status_code)
+        db = SessionLocal()
+        try:
+            j = db.query(models.IngestionJob).filter(
+                models.IngestionJob.id == job_id).first()
+            check("live CPU change was stored",
+                  j.cpu_throttle_percent == 60, j.cpu_throttle_percent)
+            j.status = "Queued"
+            db.commit()
+        finally:
+            db.close()
+
+        # ── A stopped job must remain visible ──────────────────────────────
+        # Stop sets status="Stopped" (job_worker.py:459). It is terminal, but
+        # it was in neither the active bucket nor the history bucket of any
+        # read endpoint, so a stopped job silently disappeared from the queue:
+        # the operator stopped it, watched the row leave the screen, and kept
+        # no record of how far it had got.
+        print("\n=== Stopped jobs stay in the queue ===")
+        # Pre-bound so the cleanup below cannot raise NameError and mask the
+        # real failure with a traceback from somewhere else entirely.
+        ev2 = stopped_job = None
+        db = SessionLocal()
+        try:
+            ev2 = str(uuid.uuid4())
+            db.add(models.Evidence(
+                id=ev2, case_id=case_id, filename="stopped.bin",
+                original_filename="stopped.bin", file_type="binary",
+                file_size_bytes=10, file_path=os.path.join(
+                    os.environ.get("TEMP", "."), "stopped.bin"),
+                sha256_hash="3" * 64, ingested_by="verify", status="Uploaded"))
+            stopped_job = str(uuid.uuid4())
+            db.add(models.IngestionJob(
+                id=stopped_job, evidence_id=ev2, case_id=case_id,
+                status="Stopped", progress_percent=42,
+                current_step="Stopped by user", created_by="verify",
+                ingestion_mode="accurate"))
+            db.commit()
+        finally:
+            db.close()
+
+        r = client.get("/api/queue/list", headers=H)
+        row = next((j for j in r.json() if j.get("id") == stopped_job), None)
+        check("stopped job appears in /queue/list", row is not None)
+        if row:
+            check("stopped job keeps the percent it reached",
+                  row.get("progress_percent") == 42,
+                  row.get("progress_percent"))
+        r = client.get("/api/queue/history", headers=H)
+        check("stopped job appears in /queue/history",
+              any(j.get("id") == stopped_job for j in r.json()),
+              [j.get("status") for j in r.json()][:8])
+
+        # And it must be re-queueable, since a stop reverts the evidence to
+        # Uploaded. A row the operator cannot act on is half a fix.
+        r = client.post("/api/queue/add", headers=H, json={
+            "evidence_id": ev2, "case_id": case_id,
+            "ingestion_mode": "accurate"})
+        check("stopped evidence can be re-queued", r.status_code == 200,
+              r.text[:160])
+        requeued = (r.json() or {}).get("job_id") or (r.json() or {}).get("id")
+        check("re-queue carried the profile forward",
+              (r.json() or {}).get("ingestion_mode") == "accurate",
+              (r.json() or {}).get("ingestion_mode"))
+        if requeued:
+            client.delete(f"/api/queue/{requeued}", headers=H)
+
         # ── POST /system-info/rescan ───────────────────────────────────────
         print("\n=== POST /api/queue/system-info/rescan ===")
         r = client.post("/api/queue/system-info/rescan", headers=H)
@@ -252,8 +401,9 @@ def main():
         client.delete(f"/api/queue/{job_id}", headers=H)
         db = SessionLocal()
         try:
+            ids = [i for i in (job_id, ev_id, case_id, ev2, stopped_job) if i]
             for m in (models.IngestionJob, models.Evidence, models.Case):
-                db.query(m).filter(m.id.in_([job_id, ev_id, case_id])).delete(
+                db.query(m).filter(m.id.in_(ids)).delete(
                     synchronize_session=False)
             db.commit()
         finally:

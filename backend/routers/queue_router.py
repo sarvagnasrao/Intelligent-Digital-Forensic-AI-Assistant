@@ -332,11 +332,18 @@ def get_queue_history(
     current_user = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Returns completed/failed jobs."""
+    """Returns completed/failed/stopped/cancelled jobs."""
     jobs = db.query(
         models.IngestionJob
     ).filter(
-        models.IngestionJob.status.in_(["Completed", "Failed", "Cancelled"])
+        # "Stopped" belongs here. A graceful stop (job_worker.py:459) sets that
+        # status, and it is terminal - the job is not queued or running and
+        # never will be again. Leaving it out of both this bucket and the
+        # active one made a stopped job invisible in every queue view: the
+        # operator stopped it, watched it leave the screen, and had no record
+        # of what it had reached or that it was theirs to stop.
+        models.IngestionJob.status.in_(
+            ["Completed", "Failed", "Cancelled", "Stopped"])
     ).order_by(
         models.IngestionJob.completed_at.desc()
     ).limit(limit).all()
@@ -371,7 +378,10 @@ def list_all_jobs(
 
     # History — most recent first, cap at 50 to keep payload small
     history = db.query(models.IngestionJob).filter(
-        models.IngestionJob.status.in_(["Completed", "Failed", "Cancelled"])
+        # "Stopped" is terminal and must be listed: see the note in
+        # get_queue_history. Omitting it made stopped jobs vanish entirely.
+        models.IngestionJob.status.in_(
+            ["Completed", "Failed", "Cancelled", "Stopped"])
     ).order_by(models.IngestionJob.completed_at.desc()).limit(50).all()
 
     def _row(j):
@@ -428,9 +438,17 @@ def cancel_job(
             status_code=404,
             detail="Job not found")
     if job.status == "Running":
+        # This used to advise "wait for it to complete or restart the server".
+        # Neither is true advice: the job does complete on its own, and a
+        # server restart is a destructive way to abandon a half-written index.
+        # A graceful stop already exists and is the correct tool.
         raise HTTPException(
             status_code=400,
-            detail="Cannot cancel a running job. Wait for it to complete or restart the server."
+            detail=(
+                "Cannot cancel a running job. Use the stop control instead - "
+                "it finishes the current step, leaves the case consistent and "
+                "re-queues the evidence for a later attempt."
+            )
         )
     job.status = "Cancelled"
     job.completed_at = datetime.utcnow()
@@ -617,9 +635,54 @@ def update_job_settings(
         changed.append(f"RAM floor→{v}MB")
 
     if "ingestion_mode" in body:
+        # ── Refused for a Running job, on purpose ──
+        # The worker resolves the profile exactly once, at
+        # job_worker.py:353, and passes the resolved values down. It is never
+        # re-read, so accepting a profile change here would write the column,
+        # answer `ok: true` with changed=["mode->accurate"], and have no
+        # effect whatsoever on the running job.
+        #
+        # It could not simply be honoured either. The profile fixes chunk
+        # size and embedding batch size; switching either mid-run would leave
+        # the case half-indexed at mixed granularity, which is worse than
+        # refusing: the retrieval results would depend on which portion of the
+        # document happened to be ingested under which profile.
+        #
+        # This is the B1/B10/B11 defect class - reporting success for something
+        # that did not happen - so it is refused rather than accepted and
+        # quietly ignored. A UI should disable the control on a running job and
+        # use this message as its explanation.
+        if job.status == "Running":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "The ingestion profile is fixed once a job starts - it "
+                    "sets the chunk size and embedding batch, and changing "
+                    "either mid-run would leave the case half-indexed at "
+                    "mixed granularity. Cancel this job and queue it again "
+                    "to ingest it under a different profile. CPU and RAM "
+                    "limits can still be changed while it runs."
+                ),
+            )
         mode = resolve_mode_for_device(body["ingestion_mode"])
         job.ingestion_mode = mode["key"]
         changed.append(f"mode→{mode['key']}")
+        if mode.get("warnings"):
+            # The device may have downgraded what was asked for; the operator
+            # needs to know the stored profile is not the requested one.
+            changed.extend(f"! {w}" for w in mode["warnings"])
+
+    if not changed:
+        # An empty (or wholly unrecognised) body would otherwise answer
+        # `ok: true` having done nothing at all. Same class of lie: a success
+        # response for an action that did not occur.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No recognised settings in the request body. Accepted keys: "
+                "cpu_throttle_percent, min_free_ram_mb, ingestion_mode."
+            ),
+        )
 
     db.commit()
 

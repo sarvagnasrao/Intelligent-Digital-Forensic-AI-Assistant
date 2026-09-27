@@ -13,6 +13,7 @@ PYTHONPATH=. venv/bin/python tests/verify_ingestion_modes.py
 PYTHONPATH=. venv/bin/python tests/verify_ws_progress.py
 PYTHONPATH=. venv/bin/python tests/verify_queue_api.py
 PYTHONPATH=. venv/bin/python tests/verify_job_stop.py
+PYTHONPATH=. venv/bin/python tests/verify_forensic_failure.py
 PYTHONPATH=. venv/bin/python tests/verify_vector_store.py
 PYTHONPATH=. venv/bin/python tests/verify_cpu_sampler.py
 PYTHONPATH=. venv/bin/python tests/verify_gpu_telemetry.py
@@ -23,14 +24,15 @@ $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_ingestion_modes.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_ws_progress.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_queue_api.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_job_stop.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_forensic_failure.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_vector_store.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_cpu_sampler.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_gpu_telemetry.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_live_stack.py
 ```
 
-The first seven are self-contained — **305 assertions**. `verify_live_stack.py`
-is the eighth and needs `ollama serve`, uvicorn on `:8000` and the Vite dev
+The first eight are self-contained — **334 assertions**. `verify_live_stack.py`
+is the ninth and needs `ollama serve`, uvicorn on `:8000` and the Vite dev
 server on `:3000` already running; it waits 90 s for the backend and skips
 cleanly if it never comes up.
 
@@ -47,8 +49,9 @@ cleanly if it never comes up.
 |---|---|---|
 | `verify_ingestion_modes.py` | The three ingestion profiles reach the pipeline: same file ingested under `fastest` / `normal` / `accurate` yields 2 / 3 / 8 chunks, matching the configured `chunk_size` exactly. Progress is monotonic, ends at 100, and the profile is persisted on the job. Also asserts **a failed index is never reported as a success**. | ~15 s |
 | `verify_ws_progress.py` | Ingestion progress reaches subscribers on the **server's** event loop — the exact defect that made live progress appear broken. Also asserts a strict 5-argument callback (the worker's shape) is honoured. | ~10 s |
-| `verify_queue_api.py` | The queue API surface the frontend depends on: the three profiles, a device-derived budget with slider bounds, mode-aware estimates, limit validation, live settings on a running job. | ~5 s |
+| `verify_queue_api.py` | The queue API surface the frontend depends on: the three profiles, a device-derived budget with slider bounds, mode-aware estimates, limit validation, live settings on a running job. Also asserts the **settings endpoint never reports success for something it did not do** — a profile change on a `Running` job is refused *and leaves the stored column untouched*, CPU/RAM stay editable while running, an empty body is refused, and a `Stopped` job is still listed in `/queue/list` and `/queue/history` and can be re-queued with its profile carried forward. | ~5 s |
 | `verify_job_stop.py` | The Stop button actually stops. Drives the real `_process_job` on a worker thread, fires `stop_job()` from another thread exactly as the endpoint does, and requires that the job halts, is recorded `Stopped` rather than `Failed`, reverts the evidence to `Uploaded`, and **did not reach 100 %** — a stop that is acknowledged but ignored is otherwise indistinguishable from a job that simply finished. Also pins the HTTP contract, including that `DELETE /queue/{id}/cancel` still refuses a `Running` job. | ~20 s |
+| `verify_forensic_failure.py` | A failed **disk-image** ingest must be terminal and must never announce success. Drives the real `_process_job` on a worker thread with an image that has no mountable filesystem, and requires the job `Failed` with the TSK diagnostic and a terminal timestamp, the evidence `Failed` (never `Indexed`), `INGESTION_FAILED` broadcast **and `INGESTION_COMPLETE` not**. Part B requires a user stop inside the walk loop to reach the caller *as a `StopIteration`* — not laundered into a `RuntimeError` and reclassified by substring match — leaving the job `Stopped` and the evidence re-queueable. | ~30 s |
 | `verify_vector_store.py` | One Qdrant client **per case**, keyed on a normalised path, with real data isolation: indexing case B leaves case A's storage untouched. Plus the optional-dependency contract — `backend.main` and `backend.ingestion` import with `torch` and `sentence_transformers` blocked, and a stop request surfaces as `StopIteration` rather than an indexing failure. | ~10 s |
 | `verify_live_stack.py` | End-to-end over a real socket: uploads a file, queues it as `accurate`, and asserts monotonic `INGESTION_PROGRESS` frames actually arrive on `/ws/global` and land on a `Completed` row. | ~90 s |
 | `verify_cpu_sampler.py` | The CPU figure is a real measurement, not a primed constant. Burns all logical cores in **subprocesses** and requires the reported load to climb and then fall, and pins the forced re-scan's worst case below the 300 ms the old blocking sampler cost on every cache miss. | ~10 s |
@@ -165,3 +168,17 @@ while the behaviour is wrong:
 - Simulating a failed NVML session must also set `_failed_at = time.monotonic()`.
   Failure is no longer terminal, so a failure with no timestamp is one whose
   backoff has already expired — and the next sample re-initialises and succeeds.
+- **Assert at the boundary you changed, not the one that is supposed to absorb.**
+  `job_worker._process_job` is the *terminal* handler: it catches, marks the row and
+  broadcasts, and returns normally by design. A test asserting that it re-raises is
+  wrong, and it would prove nothing about the re-raise one layer down. Drive
+  `run_ingestion_with_progress` directly for that.
+- **Never assert a ratio band over a device-derived number.** `ram_floor_max_mb` is
+  free RAM rounded down to a whole GB, so with 2047 MB free the ceiling is 1024, a
+  ratio of 0.50. A test asserting "70-100% of free" passed on one run and failed on
+  the next for no reason but a different amount of free memory, which reads exactly
+  like a regression. Pin the formula instead; a hardcoded 8192 still fails it.
+- An assertion on an exception's **type** beats one on its message. A stop sentinel
+  wrapped as `RuntimeError("Mount failed: ... stopped by user ...")` still produced
+  the right outcome, because the handler above classified it by substring match. The
+  test passed for the wrong reason until it checked `isinstance(..., StopIteration)`.

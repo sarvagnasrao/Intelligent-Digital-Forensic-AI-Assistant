@@ -745,6 +745,15 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                         print(f"[FORENSIC] {artifact_count} artifacts processed")
 
                 except Exception as e:
+                    # ── Re-raise the stop sentinel BEFORE the generic handler ──
+                    # This is the trap §15 documents, in the one place it was
+                    # left. `StopIteration` subclasses `Exception`, and
+                    # `governor.check_and_throttle()` above raises it on a user
+                    # stop, so `continue` swallowed the operator's stop once per
+                    # file and the walk carried on across the whole image — the
+                    # exact failure B13 fixed elsewhere.
+                    if isinstance(e, StopIteration) or "stopped by user" in str(e).lower():
+                        raise
                     print(f"[FORENSIC] File error: {e}")
                     continue
 
@@ -985,26 +994,63 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             print(f"[FORENSIC] Mount failed: {mount_error}")
             import traceback
             traceback.print_exc()
-            evidence.status = "Failed"
+            # A stop is not a failure, so do not write "Failed" for one. The
+            # outer handler corrects the status, but its own evidence update is
+            # wrapped in a `try/except: pass` — so if that update ever throws,
+            # a stopped job's evidence would be left marked Failed. Write the
+            # right state the first time instead of relying on a second pass.
+            is_stop = (isinstance(mount_error, StopIteration)
+                       or "stopped by user" in str(mount_error).lower())
+            evidence.status = "Uploaded" if is_stop else "Failed"
             evidence.error_message = (
                 f"Mount failed: {mount_error}")
             db.commit()
+            # Re-raise the stop sentinel unchanged. Wrapping it in a
+            # RuntimeError happened to still classify correctly, but only
+            # because the message happened to contain the words "stopped by
+            # user" — a control-flow decision made by substring match on an
+            # error string. Every handler above this one classifies on
+            # `isinstance(e, StopIteration)`, so the sentinel must arrive
+            # as itself or those checks silently stop working.
+            if is_stop:
+                raise
             raise RuntimeError(f"Mount failed: {mount_error}")
 
     except Exception as e:
         print(f"[FORENSIC] PIPELINE FAILED: {e}")
         import traceback
         traceback.print_exc()
+        # A stop is not a failure. The pipelines raise StopIteration for "the
+        # operator pressed stop", and the evidence must revert to Uploaded so it
+        # stays re-queueable, exactly as the document path does.
+        stopped = (isinstance(e, StopIteration)
+                   or "stopped by user" in str(e).lower())
         try:
             evidence = db.query(models.Evidence).filter(
                 models.Evidence.id == evidence_id
             ).first()
             if evidence:
-                evidence.status = "Failed"
+                evidence.status = "Uploaded" if stopped else "Failed"
                 evidence.error_message = str(e)
                 db.commit()
         except Exception:
             pass
+        # ── Re-raise. This is B11, and the forensic path was the one place the
+        # fix never reached ──
+        # The document pipeline was corrected to re-raise; this handler only
+        # printed and returned normally. Every consequence followed from that:
+        #   * the IngestionJob row was never touched, so it stayed "Running" at
+        #     whatever percent it had reached, with an empty error_message;
+        #   * run_ingestion_with_progress saw a normal return, so its own
+        #     handler (which marks the job Failed and re-raises) never ran;
+        #   * job_worker therefore saw a normal return too, skipped its failure
+        #     handler, and broadcast INGESTION_COMPLETE - announcing success
+        #     over the WebSocket for a job that had failed.
+        # Observed live on a truncated raw image: bar frozen at 20% "Walking
+        # filesystem", row "Processing" for ever, and a completion event sent.
+        # A silent success is worse than a visible failure, because the
+        # investigator concludes the evidence yielded nothing.
+        raise
     finally:
         # Always clean up temp directory
         if temp_dir:

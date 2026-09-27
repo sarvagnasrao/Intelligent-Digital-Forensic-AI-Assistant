@@ -459,8 +459,9 @@ PYTHONPATH=. python tests/verify_ingestion_modes.py   # 39 assertions, ~15 s
 PYTHONPATH=. python tests/verify_ws_progress.py       # 15 assertions, ~10 s
 PYTHONPATH=. python -W error::RuntimeWarning \
                     tests/verify_ws_progress.py       # also catches coroutine leaks
-PYTHONPATH=. python tests/verify_queue_api.py         # 37 assertions, ~5 s
+PYTHONPATH=. python tests/verify_queue_api.py         # 51 assertions, ~5 s
 PYTHONPATH=. python tests/verify_job_stop.py          # 17 assertions, ~20 s
+PYTHONPATH=. python tests/verify_forensic_failure.py  # 15 assertions, ~30 s
 PYTHONPATH=. python tests/verify_vector_store.py      # 17 assertions, ~10 s
 PYTHONPATH=. python tests/verify_cpu_sampler.py       #  9 assertions, ~10 s
 PYTHONPATH=. python tests/verify_gpu_telemetry.py     # 171 assertions, ~20 s
@@ -469,7 +470,7 @@ PYTHONPATH=. python tests/verify_live_stack.py        # 26 assertions, ~90 s
 
 Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
 
-The first seven are self-contained; **305 assertions total**. `verify_live_stack.py`
+The first **eight** are self-contained; **334 assertions total**. `verify_live_stack.py`
 is the exception — it needs `ollama serve`, uvicorn on `:8000` and Vite on
 `:3000` already running, and it is the only one that crosses a real socket
 (see §14). All of them clean up every row and per-case Qdrant directory they
@@ -1188,5 +1189,227 @@ at any viewport width. That remains unverified.
 - When stubbing a method whose signature gained a keyword, update the stub. A stub
   `ensure_ready(self)` called as `ensure_ready(force=...)` raises `TypeError`,
   which looks like a product bug rather than a stale test double.
+
+---
+
+## 17. Per-job ingestion controls (the queue page's missing half)
+
+The queue API has been complete since §13: `PATCH /queue/{id}/settings` (profile, CPU
+ceiling, RAM floor), `POST /{id}/force-start`, `POST /{id}/stop`, `DELETE /{id}/cancel`
+— and all four were already in `api/client.js`. **The Queue page used none of them.**
+A job row offered exactly two controls, Retry and Delete. Every one of those
+endpoints was built, exported, documented and unreachable from the UI.
+
+`frontend/src/pages/QueuePage.jsx` now wires them, behind a `SlidersHorizontal`
+button that expands a `JobSettingsPanel` inline beneath the row. Inline rather than
+a popover: a popover inside a grid row is clipped by the scroll container and has to
+fight the sidebar on z-index, and this way the panel cannot overlap what it edits.
+
+| Control | Queued | Running | Backend |
+|---|---|---|---|
+| Ingestion profile | editable | **disabled, with the reason shown** | `ingestion_mode` |
+| CPU ceiling | editable | editable, marked *live* | `cpu_throttle_percent` |
+| RAM floor | editable | editable, marked *live* | `min_free_ram_mb` |
+| Force-start (override) | ✓ | ✓ | `POST /{id}/force-start` |
+| Stop (graceful) | — | ✓ | `POST /{id}/stop` |
+| Cancel | ✓ | **not offered** | `DELETE /{id}/cancel` |
+| Retry | Failed, **Stopped** | — | `POST /queue/add` |
+
+Not built, deliberately: **queue reordering** and **pause/resume**. `queue_position`
+is honoured when picking the next job but nothing can change it, and the model
+comments list a `Paused` status the worker never implements. Both are real gaps, but
+pause would need worker support inside the interrupt path hardened in §15, and the
+operator did not ask for them.
+
+### ✅ FIXED B16. Changing the profile on a running job reported success and did nothing
+
+The worker resolves the profile **once**, at `job_worker.py:353`, and never re-reads
+it. `PATCH` accepted `ingestion_mode` for a `Running` job, wrote the column, returned
+`ok: true` with `changed: ["mode→accurate"]` — and the running job carried on under
+the old profile. The B1/B10/B11 defect class, fourth occurrence, in a control path.
+
+It could not simply be honoured, either. The profile fixes chunk size and embedding
+batch size, so switching either mid-run would leave the case **half-indexed at mixed
+granularity** — retrieval results would then depend on which part of the document
+happened to be ingested under which profile. That is worse than refusing.
+
+Now refused with a 400 whose message explains why and points at the two limits that
+*are* live. The UI disables the control on a running job and uses the same wording
+as its tooltip, so the reason is visible without provoking the error.
+
+An **empty or wholly unrecognised PATCH body** is refused for the same reason: it used
+to answer `ok: true` having changed nothing at all.
+
+### ✅ FIXED B17. A stopped job vanished from the queue
+
+`Stop` sets `status = "Stopped"` (`job_worker.py:459`) and reverts the evidence to
+`Uploaded`. But `Stopped` was in **neither** the active bucket
+(`["Queued","Running","Paused"]`) nor the history bucket
+(`["Completed","Failed","Cancelled"]`) of `/queue`, `/queue/history` **or**
+`/queue/list`. So a stopped job was invisible in every queue view: the operator
+stopped it, watched the row leave the screen, and kept no record of how far it had got
+— the same silent-disappearance class as B10, one level up.
+
+`"Stopped"` is now in both history buckets, has its own `STATUS_CONFIG` entry
+(neutral slate, `Square` icon — not an error, not a success, and the row keeps
+showing the percent it reached, which is what distinguishes it from `Cancelled`), and
+offers **Retry**, since a stop reverts the evidence to `Uploaded` and a row the
+operator cannot act on is only half a fix.
+
+### Three smaller lies, closed while wiring the UI
+
+- **Cancel was offered on a running job, where the backend always 400s.** The two
+  controls were near-duplicates anyway — Stop and Cancel differ mainly in the status
+  label, since both revert the evidence to `Uploaded`. Cancel is now offered only
+  while a job has not started; a button that is guaranteed to fail is worse than no
+  button. The backend's error also used to advise *"wait for it to complete or restart
+  the server"* — neither is good advice, and a restart is a destructive way to abandon
+  a half-written index. It now points at Stop, which exists and works.
+- **Retry silently reset the chosen profile.** `POST /queue/add` deletes any existing
+  job row for the same evidence (it must, to satisfy the `UNIQUE` constraint on
+  `evidence_id`) and rebuilds it from the request body. Retry sent only the evidence
+  and case ids, so an operator who deliberately chose `accurate` got the machine
+  default on the retry. The settings are now carried across, and `mode_warnings` are
+  surfaced so a device downgrade is still visible.
+- **The RAM slider guessed a maximum.** The panel originally fell back to a hardcoded
+  `8192` when the budget had not loaded — reintroducing B8, the very hardcode §13
+  removed. Both the slider and the profile buttons now render a muted placeholder
+  until the device answer lands, which is the precedent the Evidence page already set.
+
+**Verification:** 12 new assertions in `tests/verify_queue_api.py` (**37 → 49**), which
+now guards the profile refusal, that a refused profile leaves the stored column
+untouched, that CPU/RAM remain editable while running, the empty-PATCH refusal, and
+that a stopped job appears in both `/queue/list` and `/queue/history` and can be
+re-queued with its profile intact. (It later went to **51** when the RAM-ceiling
+assertion was rewritten — see *One test bug worth recording* below.) The browser pass
+then found B18 and B19, which needed a new script; the current full gate is **334
+assertions across eight scripts, 0 failures**.
+
+> Note for the next agent: fixtures that need a non-`Queued` status are written
+> directly to the database rather than through the API, precisely because the worker
+> only ever selects `Queued` jobs — a `Queued` fixture can be picked up and executed by
+> a second process, which then loses the race for the same per-case Qdrant directory
+> (§10). `ev2` / `stopped_job` are pre-bound to `None` before use so a failure in the
+> section above cannot make the cleanup `NameError` and mask it.
+
+### ✅ FIXED B18. A failed disk-image ingest stayed `Running` and announced success
+
+**Found by a browser pass, not by reading the code — and the thread that led to it was
+an honest UI string.** The settings panel reported `applied_live: false` for a job the
+worker was demonstrably executing. That is *correct* (`applied_live` is only true when a
+live governor exists), and it is the reason the panel was trustworthy — but it
+contradicted what the page showed, so it was worth resolving. The answer was in the
+backend log, and it was not what either could show:
+
+```
+[FORENSIC] PIPELINE FAILED: Mount failed: Could not open any filesystem in this raw image...
+<nothing further>
+```
+
+No `[INGESTION] FAILED`, no `[WORKER] Job failed`. And in the database, job `35025411`
+sat at **`Running` / 20 % / "Step 3: Walking filesystem"** with an **empty
+`error_message`**, while its evidence sat at `Processing` for ever.
+
+§14 fixed B11 — "a failed job stayed Running for ever" — by making the handlers
+re-raise. The **document** pipeline was corrected. The **forensic** pipeline was not:
+the outer handler in `_run_forensic_with_progress` printed the traceback, marked the
+*evidence* failed, and fell off the end of the `except` block. Every consequence then
+followed from that single missing `raise`:
+
+- the `IngestionJob` row was never touched, so it stayed `Running` with no error;
+- `run_ingestion_with_progress` saw a normal return, so its handler — which marks the
+  job `Failed` and re-raises — never ran;
+- `job_worker._process_job` saw a normal return too, skipped its failure handler, and
+  **broadcast `INGESTION_COMPLETE`** for a job that had failed.
+
+That last one is the worst of them: a success event went out over the WebSocket for a
+job that recovered nothing. The failure itself was B1 working correctly — the truncated
+image is B1's own test case, and the pre-flight plus the real TSK diagnostic both fired
+exactly as designed (§6). What was broken was everything *after* the failure.
+
+Verified live, not just by assertion: restarting the backend re-ran the orphaned job
+under the fix and the log now carries all three lines in order —
+`[FORENSIC] PIPELINE FAILED` → `[INGESTION] FAILED` → `[WORKER] Job failed` — and the
+row reads `Failed` with the full TSK diagnostic in `error_message`, rendered inline in
+the queue with a **Retry** button.
+
+### ✅ FIXED B19. A stop was swallowed once per file, in the forensic walk
+
+The §15 trap, in the one place §15's fix did not reach. The per-file handler in the walk
+loop was:
+
+```python
+except Exception as e:
+    print(f"[FORENSIC] File error: {e}")
+    continue
+```
+
+`StopIteration` subclasses `Exception`, and `governor.check_and_throttle()` — three lines
+above, inside the same loop — raises it on a user stop. So the operator's stop was
+discarded **once per file** and the walk carried on across the rest of the image. This
+is B13 again, in the loop that walks a 635 MB disk image.
+
+Fixed with the same guard §15 uses in `compute_sha256` and `store_chunks`: re-raise the
+sentinel *before* the generic handler.
+
+### A third fix, in how the two were distinguished
+
+The mount handler wrapped everything, sentinel included, as
+`RuntimeError(f"Mount failed: {mount_error}")`. A stop therefore arrived one layer up as
+a `RuntimeError` whose *message* happened to contain the words "stopped by user", and
+every handler above classified it by `isinstance(e, StopIteration) or "stopped by user"
+in str(e).lower()` — so it worked, **by substring match on an error string**. A control
+flow decision made that way is invisible to `isinstance`, survives a reworded message,
+and would break silently. The sentinel is now re-raised as itself, and the mount handler
+writes the correct evidence state the first time rather than writing `Failed` and
+letting the outer handler correct it — its own evidence update is wrapped in
+`try/except: pass`, so a throw there would leave a *stopped* job's evidence marked
+failed.
+
+### Verification — `tests/verify_forensic_failure.py` (new, 15 assertions)
+
+New script, because this is a distinct concern from "the Stop button stops" and from
+"a failed index is not a success": a disk-image failure must be **terminal** and must
+**never announce completion**. Three parts, all outcome assertions — it drives the real
+`_process_job` on a worker thread and reads the database row and the broadcast events,
+rather than checking that a function was called.
+
+| Part | Drives | Requires |
+|---|---|---|
+| A | the real worker, on 4 MB of random bytes (no partition table, no filesystem) | job `Failed` with the TSK diagnostic and a `completed_at`; evidence `Failed`, never `Indexed`; `INGESTION_FAILED` broadcast **and `INGESTION_COMPLETE` not** |
+| A2 | `run_ingestion_with_progress` directly | it **raises** rather than returning normally |
+| B | the walk loop, one file, a governor that raises the sentinel | the `StopIteration` reaches the caller **as a `StopIteration`**; job `Stopped`, evidence back to `Uploaded` |
+
+**A2 exists because of a trap I hit writing A.** The first version asserted that
+`_process_job` raises. It does not, and it *should* not: it is the terminal handler, its
+job is to mark the row and broadcast, and swallowing there is correct. Asserting through
+it proves nothing about the re-raise one layer down. §16's rule — prefer outcome tests to
+spy tests — has a sharper form here: **assert at the boundary you actually changed, and
+not at the boundary that is supposed to absorb.**
+
+Part B is the reason the classification fix exists. Before the mount-handler change the
+assertion read `RuntimeError` and the job still came out `Stopped` — it passed, for the
+wrong reason, via the substring match. The assertion is on the exception *type* precisely
+so that laundering it cannot pass.
+
+### One test bug worth recording
+
+`verify_queue_api.py` asserts on `ram_floor_max_mb` — a figure derived from the *live*
+machine. The original assertion was "the ceiling is 70–100 % of available RAM", and it
+failed at **50 %** on a re-run where free memory had dropped from 2538 MB to 2047 MB.
+The product was correct the whole time: `suggest_budget` rounds the ceiling **down to a
+whole GB** (`avail // 1024 * 1024`), so 2047 MB → 1024 MB. A 1 GB floor, deliberately —
+the ceiling is a *safety floor*, and rounding down never over-promises.
+
+The assertion was wrong, not the code, and it was wrong in a way that looked like a
+regression. **A ratio band over a device-derived number is a property of when you ran
+the test, not of the design.** It now pins the formula itself
+(`ram_floor_max_mb == max(1024, min(avail, total) // 1024 * 1024)`), which a
+hardcoded `8192` still fails, plus the two properties that actually matter: never above
+what is free, and never below 1 GB.
+
+**Full gate, servers stopped: 334 assertions across eight scripts, 0 failures**
+(39 + 15 + 51 + 17 + 15 + 17 + 9 + 171). `npm run build` clean.
+
 
 

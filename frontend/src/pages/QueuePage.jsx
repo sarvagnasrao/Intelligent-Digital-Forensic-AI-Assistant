@@ -2,10 +2,15 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Layers, RefreshCw, CheckCircle, XCircle,
   Clock, Trash2, HardDrive, Cpu,
+  SlidersHorizontal, Zap, Square,
 } from 'lucide-react'
-import { getQueueList, deleteQueueJob, addToQueue } from '../api/client'
+import {
+  getQueueList, deleteQueueJob, addToQueue,
+  updateJobSettings, forceStartJob, stopJob, cancelJob,
+} from '../api/client'
 import PageLayout from '../components/PageLayout'
 import ResourceMonitor from '../components/ResourceMonitor'
+import useSystemInfo from '../hooks/useSystemInfo'
 import toast from 'react-hot-toast'
 import { formatDistanceToNow, intervalToDuration } from 'date-fns'
 import { fromUtc } from '../utils/time'
@@ -53,6 +58,18 @@ const STATUS_CONFIG = {
     spin: false,
     label: 'Cancelled',
   },
+  // A graceful stop. Not an error and not a success, so it shares the neutral
+  // slate of Cancelled but keeps its own icon: Cancelled never started,
+  // Stopped ran partway and was halted on request. The row keeps showing the
+  // percent it reached, which is the fact that distinguishes the two.
+  Stopped: {
+    color: '#94a3b8',
+    bg: 'rgba(148,163,184,0.1)',
+    border: 'rgba(148,163,184,0.2)',
+    icon: Square,
+    spin: false,
+    label: 'Stopped',
+  },
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -89,8 +106,224 @@ if (!document.getElementById('queue-styles')) {
   document.head.appendChild(style)
 }
 
+// ─── Job settings panel ───────────────────────────────────────────────────────
+
+/**
+ * Per-job ingestion controls.
+ *
+ * Rendered inline beneath a job row rather than as a floating popover: a
+ * popover inside a grid row gets clipped by the scroll container and has to
+ * fight z-index against the sidebar, and this way the panel cannot overlap the
+ * thing it is editing.
+ *
+ * ── Why the profile is disabled on a running job ──
+ * The profile is resolved once, when the worker picks the job up, and is never
+ * re-read. It fixes chunk size and embedding batch size, so honouring a change
+ * mid-run would leave the case half-indexed at mixed granularity - retrieval
+ * results would then depend on which part of the document happened to be
+ * ingested under which profile. The backend refuses it for the same reason;
+ * the control is disabled rather than hidden so the reason stays visible.
+ *
+ * CPU ceiling and RAM floor are genuinely live: the governor is told the new
+ * limits and applies them at the next batch check. Those two say "live" and
+ * mean it.
+ */
+function JobSettingsPanel({ job, modes, ramMaxMb, onSave, onClose, saving }) {
+  const running = job.status === 'Running'
+  const [cpu, setCpu] = useState(job.cpu_throttle_percent ?? 100)
+  const [ram, setRam] = useState(job.min_free_ram_mb ?? 2048)
+  const [mode, setMode] = useState(job.ingestion_mode || 'normal')
+
+  // Re-seed from the row whenever it changes underneath us. The 3 s poll
+  // replaces the job object constantly, and without this the panel would keep
+  // showing a stale value after a save, or after another operator changed it.
+  useEffect(() => {
+    setCpu(job.cpu_throttle_percent ?? 100)
+    setRam(job.min_free_ram_mb ?? 2048)
+    setMode(job.ingestion_mode || 'normal')
+  }, [job.cpu_throttle_percent, job.min_free_ram_mb, job.ingestion_mode])
+
+  const dirty =
+    cpu !== (job.cpu_throttle_percent ?? 100) ||
+    ram !== (job.min_free_ram_mb ?? 2048) ||
+    (!running && mode !== (job.ingestion_mode || 'normal'))
+
+  const label = { fontSize: 10, color: 'rgba(255,255,255,0.45)', marginBottom: 5 }
+  const value = { fontSize: 11, color: '#e2e4f0', fontFamily: 'monospace' }
+
+  return (
+    <div
+      style={{
+        gridColumn: '1 / -1',
+        marginTop: 10,
+        padding: 14,
+        borderRadius: 8,
+        background: 'rgba(255,255,255,0.02)',
+        border: '1px solid rgba(255,255,255,0.06)',
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))',
+        gap: 18,
+        alignItems: 'start',
+      }}
+    >
+      {/* Profile */}
+      <div>
+        <p style={label}>
+          Ingestion profile{' '}
+          {running ? (
+            <span style={{ color: 'rgba(245,158,11,0.9)' }}>· locked while running</span>
+          ) : (
+            <span style={{ color: 'rgba(255,255,255,0.25)' }}>· applies at start</span>
+          )}
+        </p>
+        {modes.length === 0 ? (
+          <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.25)' }}>
+            Reading the available profiles…
+          </p>
+        ) : (
+          <div style={{ display: 'flex', gap: 4 }}>
+            {modes.map(m => {
+              const on = m.key === mode
+              return (
+                <button
+                  key={m.key}
+                  type="button"
+                  disabled={running}
+                  title={running
+                    ? 'The profile sets the chunk size and embedding batch, so it is fixed once the job starts.'
+                    : m.description}
+                  onClick={() => setMode(m.key)}
+                  style={{
+                    flex: 1,
+                    padding: '5px 4px',
+                    borderRadius: 6,
+                    cursor: running ? 'not-allowed' : 'pointer',
+                    opacity: running ? 0.4 : 1,
+                    fontSize: 11,
+                    fontWeight: on ? 600 : 400,
+                    color: on ? '#c7d2fe' : 'rgba(255,255,255,0.5)',
+                    background: on ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.03)',
+                    border: `1px solid ${on ? 'rgba(99,102,241,0.4)' : 'rgba(255,255,255,0.07)'}`,
+                  }}
+                >
+                  {m.label}
+                </button>
+              )
+            })}
+          </div>
+        )}
+        {modes.length > 0 && (
+          <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
+            {modes.find(m => m.key === mode)?.description || '—'}
+          </p>
+        )}
+      </div>
+
+      {/* CPU ceiling */}
+      <div>
+        <p style={label}>
+          CPU ceiling{' '}
+          {running && <span style={{ color: 'rgba(16,185,129,0.9)' }}>· live</span>}
+        </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input
+            type="range" min="10" max="100" step="5"
+            value={cpu}
+            onChange={e => setCpu(Number(e.target.value))}
+            style={{ flex: 1, accentColor: '#6366f1' }}
+          />
+          <span style={{ ...value, minWidth: 34, textAlign: 'right' }}>{cpu}%</span>
+        </div>
+        <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
+          The worker sleeps between batches to stay under this. 100% is full speed.
+        </p>
+      </div>
+
+      {/* RAM floor */}
+      <div>
+        <p style={label}>
+          Pause below free RAM{' '}
+          {running && <span style={{ color: 'rgba(16,185,129,0.9)' }}>· live</span>}
+        </p>
+        {/* Deliberately disabled until the device budget arrives. The queue
+            form used to hardcode a 0-8 GB range, which on a 16 GB machine
+            offered a ceiling the hardware could never reach and hid seven
+            gigabytes of usable headroom (B8). Guessing a fallback maximum here
+            would reintroduce exactly that. */}
+        {ramMaxMb == null ? (
+          <p style={{ fontSize: 11, color: 'rgba(255,255,255,0.25)' }}>
+            Reading this machine's memory…
+          </p>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="range" min="0" max={ramMaxMb} step="128"
+              value={Math.min(ram, ramMaxMb)}
+              onChange={e => setRam(Number(e.target.value))}
+              style={{ flex: 1, accentColor: '#6366f1' }}
+            />
+            <span style={{ ...value, minWidth: 52, textAlign: 'right' }}>
+              {ram} MB
+            </span>
+          </div>
+        )}
+        <p style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginTop: 6 }}>
+          {ram === 0
+            ? 'No floor — the job may consume all free memory.'
+            : 'Ingestion waits until this much RAM is free.'}
+          {ramMaxMb ? ` Bounded by this machine (${ramMaxMb} MB).` : ''}
+        </p>
+      </div>
+
+      {/* Actions */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', gridColumn: '1 / -1' }}>
+        <button
+          type="button"
+          disabled={!dirty || saving}
+          onClick={() => onSave({ cpu, ram, mode })}
+          style={{
+            padding: '7px 14px',
+            borderRadius: 6,
+            fontSize: 11,
+            fontWeight: 500,
+            cursor: !dirty || saving ? 'default' : 'pointer',
+            opacity: !dirty || saving ? 0.4 : 1,
+            color: '#c7d2fe',
+            background: 'rgba(99,102,241,0.15)',
+            border: '1px solid rgba(99,102,241,0.35)',
+          }}
+        >
+          {saving ? 'Saving…' : 'Apply'}
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          style={{
+            padding: '7px 12px',
+            borderRadius: 6,
+            fontSize: 11,
+            cursor: 'pointer',
+            color: 'rgba(255,255,255,0.45)',
+            background: 'none',
+            border: '1px solid rgba(255,255,255,0.1)',
+          }}
+        >
+          Close
+        </button>
+        {!dirty && (
+          <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.25)' }}>
+            No changes yet.
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── JobRow ───────────────────────────────────────────────────────────────────
-function JobRow({ job, onRetry, onDelete }) {
+function JobRow({ job, onRetry, onDelete, onSaveSettings, onForceStart, onStop, onCancel, modes, ramMaxMb }) {
+  const [showSettings, setShowSettings] = useState(false)
+  const [saving, setSaving] = useState(false)
   const cfg = STATUS_CONFIG[job.status] || STATUS_CONFIG.Queued
   const Icon = cfg.icon
 
@@ -249,10 +482,110 @@ function JobRow({ job, onRetry, onDelete }) {
       </div>
 
       {/* Actions */}
-      <div style={{ display: 'flex', gap: 4 }}>
-        {job.status === 'Failed' && (
+      <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+        {/* Settings: the only row control that edits ingestion itself. Shown
+            while the job can still be changed, and hidden once it is
+            terminal - there is nothing left to configure. */}
+        {['Queued', 'Running'].includes(job.status) && (
           <button
-            onClick={() => onRetry(job.evidence_id, job.case_id)}
+            type="button"
+            onClick={() => setShowSettings(s => !s)}
+            title="Ingestion profile, CPU ceiling and RAM floor"
+            aria-expanded={showSettings}
+            style={{
+              padding: 5,
+              borderRadius: 6,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              color: showSettings ? '#818cf8' : 'rgba(255,255,255,0.3)',
+              background: showSettings ? 'rgba(99,102,241,0.12)' : 'none',
+              border: `1px solid ${showSettings ? 'rgba(99,102,241,0.35)' : 'transparent'}`,
+              transition: 'color 0.15s',
+            }}
+          >
+            <SlidersHorizontal size={12} />
+          </button>
+        )}
+        {/* Force-start bypasses the CPU and RAM limits entirely. Offered on a
+            running job too, because the usual reason to want it is "this one
+            is nearly done and I need the machine back". */}
+        {['Queued', 'Running'].includes(job.status) && (
+          <button
+            type="button"
+            onClick={() => onForceStart(job)}
+            title="Run now at full speed, ignoring the CPU and RAM limits"
+            style={{
+              padding: 5,
+              borderRadius: 6,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              color: 'rgba(245,158,11,0.75)',
+              background: 'none',
+              border: '1px solid transparent',
+              transition: 'color 0.15s',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.color = '#fbbf24' }}
+            onMouseLeave={e => { e.currentTarget.style.color = 'rgba(245,158,11,0.75)' }}
+          >
+            <Zap size={12} />
+          </button>
+        )}
+        {job.status === 'Running' && (
+          <button
+            type="button"
+            onClick={() => onStop(job)}
+            title="Stop gracefully — finishes the current step, leaves the case consistent"
+            style={{
+              padding: 5,
+              borderRadius: 6,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              color: 'rgba(239,68,68,0.6)',
+              background: 'none',
+              border: '1px solid transparent',
+              transition: 'color 0.15s',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.color = '#f87171' }}
+            onMouseLeave={e => { e.currentTarget.style.color = 'rgba(239,68,68,0.6)' }}
+          >
+            <Square size={12} />
+          </button>
+        )}
+        {/* Cancel is offered only while the job has not started. The backend
+            refuses to cancel a running job, and offering a control that is
+            guaranteed to 400 is worse than not offering it: Stop is the right
+            tool there, and the two would have looked interchangeable. */}
+        {job.status === 'Queued' && (
+          <button
+            type="button"
+            onClick={() => onCancel(job)}
+            title="Cancel this job — it has not started, so nothing is discarded"
+            style={{
+              padding: 5,
+              borderRadius: 6,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              color: 'rgba(255,255,255,0.2)',
+              background: 'none',
+              border: '1px solid transparent',
+              transition: 'color 0.15s',
+            }}
+            onMouseEnter={e => { e.currentTarget.style.color = '#f87171' }}
+            onMouseLeave={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.2)' }}
+          >
+            <XCircle size={12} />
+          </button>
+        )}
+        {/* Retry re-queues the evidence. Offered for a stopped job as well as
+            a failed one: stopping is a pause, not a verdict, and the evidence
+            reverts to Uploaded so it is re-ingestable. */}
+        {['Failed', 'Stopped'].includes(job.status) && (
+          <button
+            onClick={() => onRetry(job)}
             title="Retry ingestion"
             style={{
               padding: '4px 10px',
@@ -268,7 +601,7 @@ function JobRow({ job, onRetry, onDelete }) {
             Retry
           </button>
         )}
-        {['Completed', 'Failed', 'Cancelled'].includes(job.status) && (
+        {['Completed', 'Failed', 'Cancelled', 'Stopped'].includes(job.status) && (
           <button
             onClick={() => onDelete(job.id)}
             title="Remove from history"
@@ -290,6 +623,24 @@ function JobRow({ job, onRetry, onDelete }) {
           </button>
         )}
       </div>
+
+      {showSettings && (
+        <JobSettingsPanel
+          job={job}
+          modes={modes}
+          ramMaxMb={ramMaxMb}
+          saving={saving}
+          onClose={() => setShowSettings(false)}
+          onSave={async payload => {
+            setSaving(true)
+            try {
+              await onSaveSettings(job, payload)
+            } finally {
+              setSaving(false)
+            }
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -333,6 +684,10 @@ export default function QueuePage() {
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState('all')
   const pollRef = useRef(null)
+  // The profile list and the device-derived RAM bound come from the backend, so
+  // a label cannot drift from the code that implements it and the slider
+  // cannot offer a ceiling this machine could never satisfy.
+  const { modes, budget } = useSystemInfo()
 
   const load = async () => {
     try {
@@ -372,10 +727,26 @@ export default function QueuePage() {
     }
   }, []))
 
-  const handleRetry = async (evidenceId, caseId) => {
+  // Retry re-queues the evidence. The settings are carried across deliberately:
+  // POST /queue/add deletes any existing job row for the same evidence (it has
+  // to, to satisfy the UNIQUE constraint on evidence_id) and rebuilds it from
+  // the request body. Sending only the evidence and case ids therefore reset
+  // the profile, CPU ceiling and RAM floor to the machine defaults - an
+  // operator who deliberately chose `accurate` would silently get `normal` on
+  // the retry. `ingestion_mode` is resolved again server-side, so a profile
+  // this device cannot honour is still downgraded, with its warning.
+  const handleRetry = async (job) => {
     try {
-      await addToQueue({ evidence_id: evidenceId, case_id: caseId })
+      const res = await addToQueue({
+        evidence_id: job.evidence_id,
+        case_id: job.case_id,
+        ingestion_mode: job.ingestion_mode,
+        cpu_throttle_percent: job.cpu_throttle_percent,
+        min_free_ram_mb: job.min_free_ram_mb,
+      })
+      const warnings = res.data?.mode_warnings || []
       toast.success('Job re-queued successfully')
+      warnings.forEach(w => toast(w, { icon: '⚠' }))
       load()
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Retry failed')
@@ -389,6 +760,82 @@ export default function QueuePage() {
       toast.success('Job removed from history')
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Delete failed')
+    }
+  }
+
+  // ── Per-job ingestion controls ─────────────────────────────────────────────
+  // Every one of these reports what the backend actually did, rather than
+  // assuming success. `applied_live` is false for a Queued job because there
+  // is no governor to push to yet - the limit is stored and the worker reads
+  // it at start. Saying "applied" for that would be a small lie of the same
+  // family the repo keeps guarding against.
+
+  const handleSaveSettings = async (job, { cpu, ram, mode }) => {
+    const running = job.status === 'Running'
+    // Only send the profile when it is actually changeable, so a Running job
+    // never trips the backend's deliberate 400.
+    const body = running
+      ? { cpu_throttle_percent: cpu, min_free_ram_mb: ram }
+      : { cpu_throttle_percent: cpu, min_free_ram_mb: ram, ingestion_mode: mode }
+    try {
+      const res = await updateJobSettings(job.id, body)
+      const d = res.data || {}
+      // Reflect the change locally at once: the 3 s poll would otherwise show
+      // the old numbers for up to three seconds after a successful save.
+      setJobs(prev => prev.map(j => (
+        j.id === job.id
+          ? {
+              ...j,
+              cpu_throttle_percent: d.cpu_throttle_percent ?? j.cpu_throttle_percent,
+              min_free_ram_mb: d.min_free_ram_mb ?? j.min_free_ram_mb,
+              ingestion_mode: d.ingestion_mode ?? j.ingestion_mode,
+            }
+          : j
+      )))
+      const warnings = (d.changed || []).filter(c => c.startsWith('!'))
+      // `applied_live` is false for a Queued job because there is no governor
+      // to push to yet — the limit is stored and the worker reads it at start.
+      // Saying "applied" there would be a small lie of the same family the
+      // repo keeps guarding against.
+      toast.success(
+        d.applied_live
+          ? 'Limits applied to the running job'
+          : 'Saved — takes effect when the job starts',
+      )
+      warnings.forEach(w => toast(w.replace(/^!\s*/, ''), { icon: '⚠' }))
+      load()
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Could not update settings')
+    }
+  }
+
+  const handleForceStart = async (job) => {
+    try {
+      await forceStartJob(job.id)
+      toast.success('Override on — running at full speed, limits bypassed')
+      load()
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Force-start failed')
+    }
+  }
+
+  const handleStop = async (job) => {
+    try {
+      await stopJob(job.id)
+      toast.success('Stopping — the current step finishes first')
+      load()
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Stop failed')
+    }
+  }
+
+  const handleCancel = async (job) => {
+    try {
+      await cancelJob(job.id)
+      toast.success('Job cancelled')
+      load()
+    } catch (e) {
+      toast.error(e.response?.data?.detail || 'Cancel failed')
     }
   }
 
@@ -581,6 +1028,12 @@ export default function QueuePage() {
               job={job}
               onRetry={handleRetry}
               onDelete={handleDelete}
+              onSaveSettings={handleSaveSettings}
+              onForceStart={handleForceStart}
+              onStop={handleStop}
+              onCancel={handleCancel}
+              modes={modes}
+              ramMaxMb={budget?.ram_floor_max_mb}
             />
           ))
         )}

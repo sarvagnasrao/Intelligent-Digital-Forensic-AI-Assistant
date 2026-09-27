@@ -399,7 +399,8 @@ def _run_document_with_progress(
                 source_filename=filename,
                 evidence_id=evidence.id,
                 case_id=case_id,
-                qdrant_path=qdrant_path
+                qdrant_path=qdrant_path,
+                stop_check=governor._stop_check
             )
             done = min(i + len(batch), total)
             # Report the share actually finished, over the 40-70 band that
@@ -609,7 +610,12 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
 
         # Step 1: Verify image hash
         print(f"[FORENSIC] Verifying image SHA-256...")
-        image_hash = compute_sha256(file_path)
+        # Pass the stop signal in. This runs over every byte of the image
+        # before any progress is reported, so without it a stop request is
+        # ignored for the whole hash.
+        image_hash = compute_sha256(
+            file_path,
+            stop_check=getattr(governor, "_stop_check", None))
         evidence.sha256_hash = image_hash
         db.commit()
         print(f"[FORENSIC] SHA-256: {image_hash[:16]}...")
@@ -804,7 +810,8 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                 source_filename=filename,
                 evidence_id=evidence.id,
                 case_id=case_id,
-                qdrant_path=qdrant_path
+                qdrant_path=qdrant_path,
+                stop_check=governor._stop_check
             )
 
             # Build entity graph

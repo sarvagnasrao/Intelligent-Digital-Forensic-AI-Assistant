@@ -194,8 +194,17 @@ def build_graph(chunks: list[str],
                        relationship="FOUND_IN")
             counts["ips"] += 1
 
-        for j in range(len(persons_resolved)):
-            for k in range(j + 1, len(persons_resolved)):
+        # Every pair of people gets a CO_MENTIONED_WITH edge, so this is
+        # quadratic. A document with a few hundred distinct names turns into
+        # tens of thousands of graph inserts, and none of them consulted the
+        # stop signal - the only check in this function ran every 50 spaCy
+        # documents, which for a short file means exactly once, at i=0.
+        # Checking per outer row keeps Stop responsive here.
+        n_persons = len(persons_resolved)
+        for j in range(n_persons):
+            if governor is not None and j % 10 == 0:
+                governor.check_and_throttle()
+            for k in range(j + 1, n_persons):
                 G.add_edge(
                     persons_resolved[j], persons_resolved[k],
                     relationship="CO_MENTIONED_WITH"

@@ -5,8 +5,10 @@
 > derivable from the code itself.
 >
 > Last verified against: `main3` @ `1915171` + the live-stack pass (2026-09-27) —
-> §13 covers the ingestion rework, **§14 covers the live end-to-end run and three
-> further bugs it found (B10/B11/B12)**. See §6 and §12 for the forensic-image fixes.
+> §13 covers the ingestion rework, §14 the live end-to-end run and the three
+> further bugs it found (B10/B11/B12), and **§15 the stop button, per-case
+> Qdrant isolation and the optional-dependency trap (B13/B14/B15)**.
+> See §6 and §12 for the forensic-image fixes.
 
 ---
 
@@ -52,7 +54,7 @@ Scale: **~13.2k lines** Python (57 files) · **~14.8k lines** React/JS/CSS (58 f
 | Backend | FastAPI 0.110 + Uvicorn | `backend/main.py`, port 8000 |
 | ORM/DB | SQLAlchemy 2.0 + SQLite | `data/forensic.db`, **14 tables** |
 | Vector store | Qdrant (embedded, local) | `data/cases/<case_id>/qdrant/` |
-| Embeddings | **SentenceTransformers `all-MiniLM-L6-v2`**, 384-dim | 🔴 `requirements.txt` declares torch/sentence-transformers *absent* (see B4) but `vector_store.py` still imports them — a fresh install per `requirements.txt` will `ImportError`. Unfixed. |
+| Embeddings | **local `all-MiniLM-L6-v2` via SentenceTransformers**, 384-dim | 🔴 `requirements.txt` declares torch/sentence-transformers *absent* — **fixed in B15 (§15)**: both are now imported lazily inside the function, so the backend starts without them and only embedding needs them. Do **not** switch to an Ollama embedder casually: that is 768-dim and invalidates every existing collection. |
 | LLM | Ollama, default `llama3.2:3b` | |
 | NER | spaCy 3.7 `en_core_web_lg` | GPU disabled by design for cross-platform stability |
 | Disk images | `pyewf` + `pytsk3` (Sleuth Kit) | installed here: pyewf `20260924`, pytsk3 `20260715` |
@@ -313,6 +315,14 @@ regression-tested. **Read §14 before touching the ingestion path** — the shor
 that a failed vector-store write used to finish as `Completed — 0 chunks` with the
 evidence marked `Indexed`, and a failed job used to stay `Running` for ever.
 
+### ✅ FIXED B13 / B14 / B15 — the Stop button, Qdrant isolation, the import
+
+**Read §15 before touching the vector store, the hash step, or the stop path.**
+The short version: Stop was correctly wired end to end and still useless, because the
+longest steps never asked (34.7 s → 1.0 s after the fix); `get_client` served every
+case the *first* case's Qdrant client, silently cross-contaminating cases; and
+`import backend.main` still required two packages `requirements.txt` omits.
+
 ---
 
 ## 7. Traps when porting UI between `main3` and `Main2`
@@ -434,16 +444,28 @@ PYTHONPATH=. python tests/verify_ws_progress.py       # 15 assertions, ~10 s
 PYTHONPATH=. python -W error::RuntimeWarning \
                     tests/verify_ws_progress.py       # also catches coroutine leaks
 PYTHONPATH=. python tests/verify_queue_api.py         # 37 assertions, ~5 s
+PYTHONPATH=. python tests/verify_job_stop.py          # 17 assertions, ~20 s
+PYTHONPATH=. python tests/verify_vector_store.py      # 17 assertions, ~10 s
 PYTHONPATH=. python tests/verify_live_stack.py        # 26 assertions, ~90 s
 ```
 
 Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
 
-The first three are self-contained; **117 assertions total**. `verify_live_stack.py`
+The first five are self-contained; **151 assertions total**. `verify_live_stack.py`
 is the exception — it needs `ollama serve`, uvicorn on `:8000` and Vite on
 `:3000` already running, and it is the only one that crosses a real socket
-(see §14). All four clean up every row and per-case Qdrant directory they
+(see §14). All of them clean up every row and per-case Qdrant directory they
 create, and are safe to re-run.
+
+> **Run the self-contained ones with the servers stopped.** A backend already
+> running on the same `data/forensic.db` has its own worker thread, and that
+> worker selects `Queued` jobs. A test fixture left in `Queued` therefore gets
+> picked up and executed in a *second process*, which then loses the race for
+> the same per-case Qdrant directory and reports
+> `Storage folder ... is already accessed by another instance of Qdrant client`.
+> The fix is on both sides: tests insert fixture jobs as `Running` (the worker
+> only ever selects `Queued`), and the server is stopped for the test run.
+> See §15 for why that error is a symptom rather than the disease.
 
 ### Inspecting a disk image by hand (when 0 artifacts)
 ```python
@@ -509,12 +531,15 @@ unproven after §13 as well.
 
 1. ~~Rotate the leaked GitHub PAT~~ ✅ done — both remotes are credential-free (§8).
 2. ~~Commit the air-gap/Windows porting work~~ ✅ done — working tree is clean (§8).
-3. **Delete `vendor/python/torch-2.3.0-*.whl`** (finishes B4, 152 MB of dead weight — but read the note in §8 first, a CUDA build is what GPU transcription needs).
-4. **Fix B5** — probe Ollama health before starting a generation request.
-5. **Decide the GUI question** (§7) — restore `Main2` layout onto `main3` via token migration.
-6. **Refresh `README.md`** against the real feature set; restore `CLAUDE.md` /
+3. ~~Fix B4's stale import~~ ✅ done — B15 (§15): torch/sentence-transformers are lazy now.
+4. **Delete `vendor/python/torch-2.3.0-*.whl`** (finishes B4, 152 MB of dead weight — but read the note in §8 first, a CUDA build is what GPU transcription needs).
+5. **Fix B5** — probe Ollama health before starting a generation request.
+6. **Decide the GUI question** (§7) — restore `Main2` layout onto `main3` via token migration.
+7. **Refresh `README.md`** against the real feature set; restore `CLAUDE.md` /
    `CFI_Setup_Guide.md` from `Main2`.
-7. **Keep this file updated** as work lands.
+8. **Decide the embedding backend** (§15) — staying on local SentenceTransformers is
+   deliberate; moving to Ollama is 768-dim and needs a full re-index.
+9. **Keep this file updated** as work lands.
 
 ---
 
@@ -678,6 +703,10 @@ actually engages.
 modules) · **117 behavioural assertions across four scripts, 0 failures**
 (see §14 for the live-stack pass and the three bugs it found).
 
+**Re-verified at the end of §15** after B13/B14/B15: the same gate plus the two
+new scripts — **151 assertions across six scripts, 0 failures**, including the
+live stack over a real socket (26/26, 12 monotonic frames on `/ws/global`).
+
 ---
 
 ## 14. Live-stack verification, and the three bugs it found
@@ -767,7 +796,116 @@ the code path these tests exercise, and B1's truncation reporting is now
 verified end to end over HTTP — but no fixture on disk is a complete image
 (`SCHARDT.001` is truncated, §6 B1).
 
-**Still to do:** B5 (Ollama offline probe), the `Main2` GUI question (§7), the
-stale `vector_store.py` torch import (§2), delete the vendored torch wheel (§8
-— read the note there first), refresh `README.md`.
+**Still to do:** B5 (Ollama offline probe), the `Main2` GUI question (§7), delete the
+vendored torch wheel (§8 — read the note there first), refresh `README.md`.
+
+---
+
+## 15. Stop button, per-case Qdrant isolation, and the optional-dependency trap
+
+Three more defects, found by actually asking "why doesn't Stop work?" rather than
+by reading the stop path — which looked correct end to end and had been read
+twice before it was tested. `tests/verify_job_stop.py` (17 assertions) and
+`tests/verify_vector_store.py` (17 assertions) are the guards.
+
+### ✅ FIXED B13. Stop was acknowledged, then ignored for tens of seconds
+
+`POST /api/queue/{id}/stop` returned 200, `stop_job()` set its `threading.Event`,
+`is_stop_requested()` read it, and the governor raised `StopIteration` — every
+link in the chain was present and correct. The button was still useless, because
+**stopping is cooperative and the longest steps never asked**:
+
+| Step | Checked? | Consequence |
+|---|---|---|
+| `compute_sha256` over the whole image | **no** | a stop ignored for the entire hash of every byte of evidence, before any progress is reported |
+| embedding a batch (up to 64 chunks) | **no** | 34.7 s measured on a loaded 4-core box, at a bar frozen at 40% |
+| `graph_builder`'s O(n²) person-pair loop | **no** | its only check ran every 50 spaCy docs — for a short file, exactly once at `i=0` |
+| forensic `store_chunks` (all extracted text in **one** call) | **no** | thousands of chunks embedded as a single uninterruptible stretch |
+
+Fixed by threading the stop signal into each of them: `compute_sha256` now takes
+`stop_check` and raises between 1 MB reads (also 128× fewer syscalls);
+`store_chunks` embeds in `EMBED_SLICE`-sized slices and takes `stop_check`; the
+entity pair loop calls the governor every 10 rows. **Measured stop latency on the
+same test: 34.7 s → 1.0 s.**
+
+Two traps hit while fixing this — both are the *same* trap as B1/B10:
+
+- `compute_sha256` ends in `except Exception: return ""`. `StopIteration` is a
+  subclass of `Exception`, so an unguarded fix **swallows the stop and returns an
+  empty hash**, writing `""` to `evidence.sha256_hash` and carrying on as though
+  verification had passed. It now re-raises before the generic handler.
+- Same in `store_chunks`, where swallowing would report an operator's stop as
+  `VectorStoreError` and turn the row red instead of `Stopped`.
+
+**Do not reintroduce:** a bare `except Exception` around any loop that can be
+interrupted. Check the re-raise exists.
+
+**Still not interruptible:** Whisper transcription in `extract_text_from_bytes`.
+Transcribing a long video is minutes of one library call. It needs segment-wise
+transcription to fix properly, and is the one remaining place where Stop is
+advisory rather than prompt.
+
+### ✅ FIXED B14. One Qdrant client for every case — silent cross-case contamination
+
+```python
+_qdrant_client = None
+def get_client(qdrant_path: str) -> QdrantClient:
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(path=qdrant_path)   # path ignored ever after
+    return _qdrant_client
+```
+
+`qdrant_path` was used to open the client and then **never consulted again**, so
+only the first case opened in a process was ever reachable. Every later case was
+served that same client: case B's chunks were written into case A's storage
+folder, and case B's collection never existed. A search over case B found nothing
+and the investigator concluded the evidence was clean — the exact failure mode
+B1 and B10 exist to prevent, in a place nobody was looking.
+
+Verified directly: `get_client(A) is get_client(B)` returned `True` before the
+fix, `False` after.
+
+The cache is now keyed on a **normalised absolute path**, which fixes a second
+failure that the shared client had been masking. Qdrant's embedded mode takes an
+*exclusive* lock per directory — verified: two clients on one path in one process
+raise `Storage folder ... is already accessed by another instance of Qdrant
+client`; two clients on *different* paths are fine. Callers spell the same
+directory two ways: `cases.py` uses `os.path.join` (backslashes on Windows) while
+`ingestion.py`, `queries.py`, `entities.py` and `evidence.py` use
+`f"{cases_dir}/{case_id}/qdrant"` (forward slashes) — the hardcoded `/` that §9
+forbids. Keyed on the raw string those are two keys for one directory. `abspath`
++ `normpath` collapses them. (It is also how the `Storage folder ... already
+accessed` error was reached in practice: a second process, e.g. a test whose
+fixture sat in `Queued` while a live server's worker selected it.)
+
+Also added `close_client()` / `close_all_clients()`, called from
+`delete_case_collection()`. Without releasing it, deleting a case removes the
+database row while `shutil.rmtree` fails on the locked directory, leaving the
+vector store on disk — on Windows that is guaranteed, not likely.
+
+### ✅ FIXED B15. `import backend.main` required two packages `requirements.txt` omits
+
+`vector_store.py` imported `torch` and `sentence_transformers` at module scope
+while `requirements.txt` pins neither (B4 removed the pins). On any install that
+follows `requirements.txt`, `import backend.main` raised `ImportError` — which
+does not degrade the embedding path, it **removes the entire backend**: no
+status endpoint, no queue, no cases. An optional, lazily-needed dependency must
+never be able to do that. Both are now imported inside the function that needs
+them, and the failure names the fix.
+
+Also removed `torch.set_num_threads(4)`, which was applied process-wide at
+import: it hardcoded 4 regardless of the machine's core count, and a global
+thread-pool override fights `ResourceGovernor`, whose entire job is to cap CPU at
+the operator's ceiling. It now sizes off `os.cpu_count()`.
+
+Verified by blocking both imports with a `MetaPathFinder`: `backend.main` and
+`backend.ingestion` both import, and embedding then fails with a message that
+names the missing package.
+
+**Trap — do not "fix" this by switching to Ollama embeddings.** Despite the name,
+`get_ollama_embeddings` uses local SentenceTransformers, and that is load-bearing:
+MiniLM-L6-v2 is 384-dim and matches `VECTOR_SIZE`. Ollama's embedder is 768-dim,
+so switching **invalidates every existing per-case collection** and forces a full
+re-index. It is a migration with its own decision, not a bug fix.
 

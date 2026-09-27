@@ -96,15 +96,41 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 VIDEO_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 
-def compute_sha256(file_path: str) -> str:
-    """Computes SHA-256 of a file on disk."""
+# Read size for hashing. Was 8 KB, which is a syscall every 8 KB across a
+# multi-gigabyte image. 1 MB cuts that by 128x and still gives the stop check
+# below a fine-grained place to fire. The digest is identical either way.
+_HASH_CHUNK = 1024 * 1024
+
+
+def compute_sha256(file_path: str, stop_check=None) -> str:
+    """
+    Computes SHA-256 of a file on disk.
+
+    stop_check is consulted between read chunks and raises to abort.
+
+    Hashing a disk image is the single longest uninterruptible step in the
+    whole product - it runs before anything is reported, over every byte of
+    the evidence. With no check in the loop, an operator who pressed Stop
+    watched the job sit on "Verifying image SHA-256" with no way out, and
+    concluded the Stop button was broken rather than slow.
+
+    The StopIteration re-raise is load-bearing: StopIteration is a subclass
+    of Exception, so the generic handler below would otherwise swallow it and
+    return "" - writing an empty hash to evidence.sha256_hash and carrying on
+    as if verification had succeeded. That is the same silent-success defect
+    as a truncated image reported as processed.
+    """
     sha256 = hashlib.sha256()
     try:
         with open(file_path, "rb") as f:
             for chunk in iter(
-                    lambda: f.read(8192), b""):
+                    lambda: f.read(_HASH_CHUNK), b""):
+                if stop_check is not None and stop_check():
+                    raise StopIteration("Ingestion stopped by user")
                 sha256.update(chunk)
         return sha256.hexdigest()
+    except StopIteration:
+        raise
     except Exception as e:
         print(f"[FORENSIC] SHA256 error: {e}")
         return ""

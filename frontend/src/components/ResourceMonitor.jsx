@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   Cpu, MemoryStick, HardDrive, ChevronDown, ChevronUp,
-  RefreshCw, Monitor, Network, Battery, Server, ShieldAlert,
+  RefreshCw, Monitor, Battery, Server, ShieldAlert,
 } from 'lucide-react'
 import { getSystemInfo, rescanSystemInfo } from '../api/client'
 import { refreshSystemInfo } from '../hooks/useSystemInfo'
@@ -19,13 +19,20 @@ import usePreferences from '../hooks/usePreferences'
  * one. See LoadGauge for the unmeasurable case, which is a real state here - a
  * machine with no telemetry source must never be drawn as "0% busy".
  *
- * Everything else this component knows - chassis, BIOS, per-adapter rows, every
- * mounted volume, every NIC, I/O since boot - is behind "Show device details".
- * It is all genuinely re-detected rather than hardcoded (the backend re-walks
- * the hardware whenever the attached device set changes, so plugging in an
- * evidence drive or an eGPU shows up on its own), and it is what an investigator
- * needs when a machine misbehaves. But it is a long list of static facts, and
- * leaving it expanded buries the three live numbers it is supposed to support.
+ * Everything else this component knows - per-adapter GPU rows, the CPU, RAM
+ * and pagefile the ingestion budget is derived from, the mounted volumes -
+ * sits behind "Show device details". It is all genuinely re-detected rather
+ * than hardcoded (the backend re-walks the hardware whenever the attached
+ * device set changes, so plugging in an evidence drive or an eGPU shows up on
+ * its own). But it is a long list of static facts, and leaving it expanded
+ * buries the three live numbers it is supposed to support.
+ *
+ * Deliberately NOT shown: the network adapter list, and the machine's
+ * serialisable identity (chassis, BIOS, hostname, OS version). A NIC list
+ * carries no information about resource use, and identifying the host is not
+ * resource monitoring - the audit log already records what machine a case was
+ * worked on. Both are still available from the backend (`network_adapters`,
+ * `machine_*`) for anything that genuinely needs them.
  *
  * Rendered on both the Evidence page and the Queue page so an operator sees an
  * identical description in both places.
@@ -257,7 +264,6 @@ export default function ResourceMonitor({
   const volumes = info?.volumes || []
   const shownVolumes = showAllVolumes ? volumes : volumes.slice(0, 3)
   const gpus = info?.gpus || []
-  const adapters = info?.network_adapters || []
 
   // The backend's reason is shown whenever it has one, *including* when a
   // number is available. On a mixed machine - a discrete card plus an
@@ -423,13 +429,17 @@ export default function ResourceMonitor({
                 )}
               </div>
 
-              {/* ── Machine / CPU ── */}
-              {/* Full device inventory, collapsed by default. Reference
-                  material, not a live reading: chassis, BIOS, per-adapter
-                  rows, every volume, every NIC. Kept behind one toggle rather
-                  than deleted, because a forensics box changes shape between
-                  cases and the operator needs to be able to see what was
-                  actually detected. */}
+              {/* ── Detail, collapsed by default ──
+                  Only what bears on an ingest: which adapter is actually being
+                  measured (and which cannot be), the CPU/RAM/pagefile the
+                  budget is derived from, and where the volumes are.
+
+                  Removed: the network adapter list, and the chassis / BIOS /
+                  hostname / OS identity block. A NIC list says nothing about
+                  resource use, and a machine's serialisable identity is not
+                  resource monitoring. Both remain available from the OS and
+                  the audit log; neither earns screen space next to a running
+                  transcription. */}
               <button
                 type="button"
                 onClick={() => setShowInventory(s => !s)}
@@ -444,12 +454,7 @@ export default function ResourceMonitor({
 
               {showInventory && (
                 <>
-              <Section icon={Server} title="Machine">
-                <SpecRow
-                  label="Chassis"
-                  value={[info.machine_manufacturer, info.machine_model]
-                    .filter(Boolean).join(' ') || null}
-                />
+              <Section icon={Server} title="Processor & Memory">
                 <SpecRow label="CPU" value={info.cpu_model} />
                 <SpecRow
                   label="Cores"
@@ -470,15 +475,6 @@ export default function ResourceMonitor({
                   value={info.swap_total_mb
                     ? `${GB(info.swap_total_mb)}${info.swap_used_mb ? ` (${GB(info.swap_used_mb)} used)` : ''}`
                     : 'None configured'}
-                />
-                {info.bios_version && (
-                  <SpecRow label="BIOS" value={info.bios_version} />
-                )}
-                <SpecRow label="Hostname" value={info.hostname} />
-                <SpecRow
-                  label="OS"
-                  value={[info.platform_system, info.platform_release,
-                    info.platform_machine].filter(Boolean).join(' ')}
                 />
                 {info.is_laptop && (
                   <SpecRow
@@ -626,36 +622,6 @@ export default function ResourceMonitor({
                     {GB(info.disk_write_mb)}
                   </p>
                 )}
-              </Section>
-
-              {/* ── Network ── */}
-              <Section
-                icon={Network}
-                title="Network Adapters"
-                count={info.network_count}
-              >
-                {adapters.length === 0 && (
-                  <p className="text-xs text-ink-2">
-                    No network interfaces reported.
-                  </p>
-                )}
-                {adapters.map((a, i) => (
-                  <div
-                    key={`${a.name}-${i}`}
-                    className="flex items-start justify-between gap-4 py-0.5"
-                  >
-                    <span className="text-xs text-ink-2 shrink-0">
-                      {a.virtual ? 'Virtual' : a.up ? 'Connected' : 'Down'}
-                    </span>
-                    <span className="text-xs text-ink-0 text-right font-mono break-words">
-                      {a.name}
-                      <span className="text-ink-2">
-                        {a.mac && a.mac !== '-' ? ` · ${a.mac}` : ''}
-                        {a.ips && a.ips.length ? ` · ${a.ips[0]}` : ''}
-                      </span>
-                    </span>
-                  </div>
-                ))}
               </Section>
                 </>
               )}

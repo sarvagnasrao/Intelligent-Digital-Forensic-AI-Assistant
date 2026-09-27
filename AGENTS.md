@@ -207,11 +207,19 @@ the Queue page** so both show an identical description. It renders `null` and st
 both surfaces by construction.
 
 Its default view is deliberately short: **CPU / memory / GPU as three independent gauges**, a VRAM
-meter, a per-core strip and a storage line. Everything else it knows (chassis, BIOS, per-adapter
-rows, every volume, every NIC, I/O counters) sits behind a **"Show device details"** disclosure,
-because a wall of static specs buries the three live numbers the panel exists for. Nothing was
-deleted — a forensics box changes shape between cases, so the operator still needs to be able to
-see what was detected.
+meter, a per-core strip and a storage line. Behind a **"Show device details"** disclosure sit only
+the things that bear on an ingest: the per-adapter GPU rows (which is where "this adapter exposes
+no utilisation counter" is actually stated), the CPU/RAM/pagefile the ingestion budget is derived
+from, battery state, and the mounted volumes.
+
+**Deliberately not shown, though the backend still returns them:** `network_adapters` and the
+machine's identity block (`machine_manufacturer`, `machine_model`, `bios_version`, `hostname`,
+`platform_*`). A NIC list carries no information about resource use, and identifying the host is
+not resource monitoring — the audit log already records what machine a case was worked on. They
+remain in `hardware_probe`'s output for anything that needs them; they just do not occupy screen
+space next to a running transcription. Two rounds of trimming got here: the first kept the whole
+inventory behind a toggle, the second removed the parts of it that were reference material rather
+than ingest-relevant.
 
 ---
 

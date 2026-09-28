@@ -103,19 +103,50 @@ echo -e "${GREEN}✓ Python packages installed${NC}"
 # ── 5. spaCy NLP model ────────────────────────────────────────────────────────
 echo ""
 echo -e "${YELLOW}[5/8] NLP model...${NC}"
-if python3 -c "import spacy; spacy.load('en_core_web_lg')" 2>/dev/null; then
-  echo -e "${GREEN}✓ en_core_web_lg already installed${NC}"
-elif [ -f "vendor/python/en_core_web_lg-3.7.1.tar.gz" ]; then
-  # vendor/ is deliberately NOT in git, so it only exists on a machine that
-  # was handed the offline kit. Installing from it with --no-index against a
-  # directory that is not there fails outright - which is what a fresh git
-  # clone used to do.
-  pip install --no-index --find-links=vendor/python vendor/python/en_core_web_lg-3.7.1.tar.gz -q
-  echo -e "${GREEN}✓ en_core_web_lg installed from vendor${NC}"
-else
-  python3 -m spacy download en_core_web_lg
-  echo -e "${GREEN}✓ en_core_web_lg downloaded${NC}"
-fi
+
+# en_core_web_sm is NOT optional: graph_builder.py loads it at module import
+# time, so without it `import backend.main` fails outright. The previous
+# version of this script installed only en_core_web_lg.
+#
+# `python3 -m spacy download <model>` was also replaced: against the live
+# spacy-models release index it resolves the model version to an empty string
+# and builds the URL
+#   .../releases/download/-en_core_web_lg/-en_core_web_lg.tar.gz
+# which is a guaranteed 404. Pin the version explicitly instead. 3.7.1 is the
+# model release built for spacy 3.7.x, which is what requirements.txt pins.
+SPACY_MODEL_VERSION=3.7.1
+SPACY_MODELS="en_core_web_sm en_core_web_lg"
+
+for model in $SPACY_MODELS; do
+  if python3 -c "import spacy; spacy.load('$model')" 2>/dev/null; then
+    echo -e "${GREEN}✓ $model already installed${NC}"
+    continue
+  fi
+
+  tarball="vendor/python/${model}-${SPACY_MODEL_VERSION}.tar.gz"
+  if [ -f "$tarball" ]; then
+    # vendor/ is deliberately NOT in git, so it only exists on a machine that
+    # was handed the offline kit. Installing from it with --no-index against a
+    # directory that is not there fails outright - which is what a fresh git
+    # clone used to do.
+    pip install --no-index --find-links=vendor/python "$tarball" -q
+    echo -e "${GREEN}✓ $model installed from vendor${NC}"
+  else
+    pip install -q \
+      "https://github.com/explosion/spacy-models/releases/download/${model}-${SPACY_MODEL_VERSION}/${model}-${SPACY_MODEL_VERSION}.tar.gz"
+    echo -e "${GREEN}✓ $model ${SPACY_MODEL_VERSION} installed${NC}"
+  fi
+done
+
+# Verify, do not assume: a silent no-op here is what made the broken download
+# above look like a success on a machine where the model was already present.
+for model in $SPACY_MODELS; do
+  if ! python3 -c "import spacy; spacy.load('$model')" 2>/dev/null; then
+    echo -e "${RED}✗ $model failed to load - the backend will not import${NC}"
+    exit 1
+  fi
+done
+echo -e "${GREEN}✓ NLP models verified loadable${NC}"
 
 # ── 6. Data directories ───────────────────────────────────────────────────────
 echo ""

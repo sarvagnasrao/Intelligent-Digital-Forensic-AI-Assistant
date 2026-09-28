@@ -4,7 +4,7 @@ sqlalchemy==2.0.30
 pydantic==2.13.4
 pydantic-settings==2.15.0
 python-dotenv==1.0.1
-python-multipart==0.9.9
+python-multipart==0.0.9
 aiofiles==23.2.1
 qdrant-client==1.9.1
 spacy==3.7.4
@@ -42,4 +42,4 @@ qrcode==7.4.2
 Pillow==10.3.0
 psutil==7.2.2
 websockets==17.0.1
-openai-whisper==20231117
+openai-whisper==20250625

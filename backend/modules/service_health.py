@@ -394,6 +394,12 @@ def probe_vector_store(cases_dir: str) -> dict:
 
     out["cases_total"] = len(case_dirs)
 
+    # Local import, matching probe_embeddings below: vector_store pulls in
+    # the embedding stack, and a health page must not pay for it (or fail)
+    # just to count directories. Without this the probe raised NameError
+    # and the card reported `unavailable` on every machine.
+    from backend.modules.vector_store import case_qdrant_path
+
     qdrant_dirs = [
         d for d in case_dirs
         if os.path.isdir(case_qdrant_path(d))
@@ -684,7 +690,7 @@ def probe_embeddings() -> dict:
             missing.append(f"{module_name} is not installed")
 
     try:
-        from backend.modules.vector_store import VECTOR_SIZE, case_qdrant_path
+        from backend.modules.vector_store import VECTOR_SIZE
         out["vector_size"] = int(VECTOR_SIZE)
     except Exception as e:
         # Never fall back to a restated 384: if the constant cannot be

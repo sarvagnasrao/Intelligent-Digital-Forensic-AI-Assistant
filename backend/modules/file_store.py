@@ -9,14 +9,32 @@ MAX_STORE_SIZE_BYTES = 100 * 1024 * 1024
 # 100MB per file
 
 # File types that are viewable in browser
-VIEWABLE_TYPES = {
+# Anything textual can be served as-is, so this tracks the accepted
+# text formats rather than restating a short subset of them: a .log or .csv
+# that indexes fine but 404s in the viewer reads as the file being lost.
+TEXT_VIEWABLE = {
+    '.txt', '.log', '.md', '.text', '.nfo', '.out',
+    '.err', '.trace', '.dump',
+    '.csv', '.tsv', '.json', '.jsonl', '.ndjson',
+    '.xml', '.plist', '.mobileconfig',
+    '.yaml', '.yml', '.ini', '.cfg', '.conf',
+    '.config', '.toml', '.properties',
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.java',
+    '.c', '.h', '.cpp', '.hpp', '.cs', '.go',
+    '.rb', '.php', '.pl', '.rs', '.lua', '.r',
+    '.sh', '.bash', '.bat', '.ps1', '.sql', '.vb',
+    '.srt', '.vtt', '.ass',
+    '.html', '.htm', '.xhtml',
+    '.rtf',
+}
+
+VIEWABLE_TYPES = TEXT_VIEWABLE | {
     # Images
     '.jpg', '.jpeg', '.png',
     '.gif', '.bmp', '.webp',
+    '.tif', '.tiff',
     # Documents
-    '.pdf', '.txt', '.log',
-    '.csv', '.xml', '.json',
-    '.md', '.py', '.js',
+    '.pdf',
     # Office
     '.docx', '.xlsx', '.pptx',
     # Media
@@ -25,8 +43,6 @@ VIEWABLE_TYPES = {
     '.mkv', '.ogg', '.flac',
     # Email
     '.eml', '.msg',
-    # Web
-    '.html', '.htm',
     # Database
     '.db', '.sqlite', '.sqlite3',
 }
@@ -127,6 +143,13 @@ def save_file(data: bytes, stored_path: str) -> bool:
 def get_mime_type(filename: str) -> str:
     """
     Returns MIME type for serving files.
+
+    Used by the in-browser artifact viewer, not by the download endpoint
+    (which forces an attachment). So for the text formats, text/plain is a
+    better answer than the application/octet-stream that mimetypes falls
+    through to: octet-stream makes the browser download the file rather than
+    display it, which for a viewer means the investigator gets a download
+    prompt for evidence they are trying to read.
     """
     import mimetypes
     mime, _ = mimetypes.guess_type(filename)
@@ -134,6 +157,14 @@ def get_mime_type(filename: str) -> str:
         return mime
 
     ext = os.path.splitext(filename.lower())[1]
+
+    # plist and mobileconfig are XML documents; the browser renders them.
+    if ext in {'.plist', '.mobileconfig'}:
+        return 'application/xml'
+
+    if ext in TEXT_VIEWABLE:
+        return 'text/plain; charset=utf-8'
+
     MIME_MAP = {
         '.txt':    'text/plain',
         '.log':    'text/plain',
@@ -142,8 +173,13 @@ def get_mime_type(filename: str) -> str:
         '.xml':    'application/xml',
         '.html':   'text/html',
         '.htm':    'text/html',
+        '.xhtml':  'application/xhtml+xml',
         '.md':     'text/markdown',
         '.pdf':    'application/pdf',
+        '.rtf':    'application/rtf',
+        '.srt':    'application/x-subrip',
+        '.vtt':    'text/vtt',
+        '.ass':    'text/x-ssa',
         '.docx':   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         '.xlsx':   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         '.pptx':   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
@@ -152,20 +188,28 @@ def get_mime_type(filename: str) -> str:
         '.m4a':    'audio/mp4',
         '.flac':   'audio/flac',
         '.ogg':    'audio/ogg',
+        '.aac':    'audio/aac',
+        '.wma':    'audio/x-ms-wma',
+        '.aiff':   'audio/aiff',
         '.mp4':    'video/mp4',
         '.avi':    'video/x-msvideo',
         '.mov':    'video/quicktime',
         '.mkv':    'video/x-matroska',
+        '.flv':    'video/x-flv',
+        '.webm':   'video/webm',
+        '.m4v':    'video/x-m4v',
         '.jpg':    'image/jpeg',
         '.jpeg':   'image/jpeg',
         '.png':    'image/png',
         '.gif':    'image/gif',
         '.bmp':    'image/bmp',
         '.tiff':   'image/tiff',
+        '.tif':    'image/tiff',
         '.webp':   'image/webp',
         '.eml':    'message/rfc822',
         '.db':     'application/x-sqlite3',
         '.sqlite': 'application/x-sqlite3',
+        '.sqlite3': 'application/x-sqlite3',
         '.py':     'text/x-python',
         '.js':     'text/javascript',
     }

@@ -6,6 +6,11 @@ from backend.modules.forensic_ingestion import (
     ingest_e01, ingest_raw,
     extract_file_content, compute_sha256,
     detect_image_format, inspect_raw_image)
+from backend.modules.file_formats import (
+    FORENSIC_IMAGE_EXTENSIONS as FORENSIC_EXTENSIONS,
+    is_forensic_image as _is_forensic_image,
+    normalize_extension,
+)
 from backend.modules.resource_governor import ResourceGovernor
 from backend.database import SessionLocal
 from backend import models
@@ -18,34 +23,15 @@ from datetime import datetime
 
 settings = get_settings()
 
-FORENSIC_EXTENSIONS = {'.e01', '.001', '.dd', '.raw', '.img'}
-DOCUMENT_EXTENSIONS = {
-    # Documents
-    '.pdf', '.txt',
-    # Office
-    '.docx', '.doc',
-    '.xlsx', '.xls',
-    '.pptx', '.ppt',
-    # Email
-    '.eml', '.msg',
-    # Audio
-    '.mp3', '.wav', '.m4a',
-    '.flac', '.ogg', '.aac',
-    '.wma', '.aiff',
-    # Video
-    '.mp4', '.avi', '.mov',
-    '.mkv', '.wmv', '.flv',
-    '.webm', '.m4v',
-    # Images (OCR)
-    '.jpg', '.jpeg', '.png',
-    '.tiff', '.tif', '.bmp',
-    '.gif', '.webp'
-}
-
-
-def _is_forensic_image(filename: str) -> bool:
-    ext = os.path.splitext(filename.lower())[1]
-    return ext in FORENSIC_EXTENSIONS
+# Which extensions take the pytsk3 disk-image walk comes from the shared
+# format policy, not from a local copy. If the upload gate and this dispatch
+# ever disagreed, a disk image would upload successfully and then be handed to
+# the document pipeline, which reads it as bytes and indexes nothing.
+#
+# DOCUMENT_EXTENSIONS used to live here as a second, hand-maintained copy of
+# the accepted formats. It was never read by anything: the document pipeline
+# dispatches on the extractor's own sets in forensic_ingestion, so it was a
+# third number to keep in sync. Removed.
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +134,7 @@ def run_ingestion_with_progress(
         if not evidence:
             return
 
-        ext = os.path.splitext(
-            filename.lower())[1]
+        ext = normalize_extension(filename)
         is_disk_image = ext in FORENSIC_EXTENSIONS
 
         if is_disk_image:
@@ -309,8 +294,7 @@ def _run_document_with_progress(
 
     try:
         
-        ext = os.path.splitext(
-            filename.lower())[1]
+        ext = normalize_extension(filename)
         print(
             f"[INGESTION] {ext.upper()} "
             f"file: {filename} "
@@ -337,7 +321,13 @@ def _run_document_with_progress(
             temp_dir = tempfile.mkdtemp(
                 prefix="cfi_media_")
             try:
-                text, extraction_type = \
+                # Unpacks 3, matching extract_text_from_bytes' uniform
+                # (text, extraction_type, metadata) contract. This used to
+                # unpack 2, which raised "too many values to unpack (expected
+                # 2)" on every plain-text file - the text branch has always
+                # returned 3; only the PDF/SQLite/HTML branches returned 2, and
+                # those never come through this multimedia path.
+                text, extraction_type, _metadata = \
                     extract_text_from_bytes(
                         data, filename,
                         temp_dir,
@@ -364,6 +354,10 @@ def _run_document_with_progress(
             evidence.status = "Indexed"
             evidence.chunk_count = 0
             evidence.entity_count = 0
+            # Cleared on success, not just set on failure: a retried file
+            # keeps the previous attempt's message, so the row would read
+            # "Indexed" while still carrying a stale failure string.
+            evidence.error_message = None
             db.commit()
             if job_id:
                 _finish_job_no_text(job_id, filename, extraction_type)
@@ -376,6 +370,7 @@ def _run_document_with_progress(
             evidence.status = "Indexed"
             evidence.chunk_count = 0
             evidence.entity_count = 0
+            evidence.error_message = None
             db.commit()
             if job_id:
                 _finish_job_no_text(job_id, filename, extraction_type)
@@ -491,6 +486,7 @@ def _run_document_with_progress(
         evidence.status = "Indexed"
         evidence.chunk_count = chunk_count
         evidence.entity_count = total_entities
+        evidence.error_message = None
         db.commit()
 
         _create_audit_log(
@@ -645,15 +641,29 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                 evidence.notes = truncation_warning
                 db.commit()
 
+        # When the image is truncated AND TSK cannot mount it at all (e.g.
+        # the MFT sits past EOF), wrap the raw TSK error in the human-readable
+        # truncation message so the investigator sees exactly what went wrong
+        # instead of "Cannot determine file system type".
+        def _make_generator():
+            try:
+                if container == "ewf":
+                    yield from ingest_e01(
+                        file_path, temp_dir,
+                        include_deleted=include_deleted)
+                else:
+                    yield from ingest_raw(
+                        file_path, temp_dir,
+                        include_deleted=include_deleted)
+            except RuntimeError as tsk_err:
+                if truncation_warning:
+                    raise RuntimeError(
+                        f"Truncated image cannot be mounted: {truncation_warning}"
+                    ) from tsk_err
+                raise
+
         try:
-            if container == "ewf":
-                file_generator = ingest_e01(
-                    file_path, temp_dir,
-                    include_deleted=include_deleted)
-            else:
-                file_generator = ingest_raw(
-                    file_path, temp_dir,
-                    include_deleted=include_deleted)
+            file_generator = _make_generator()
 
             artifact_count = 0
             total_chunks = 0
@@ -953,6 +963,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             evidence.status = "Indexed"
             evidence.chunk_count = total_chunks
             evidence.entity_count = total_entities
+            evidence.error_message = None
             db.commit()
 
             # Audit log
@@ -998,8 +1009,14 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             is_stop = (isinstance(mount_error, StopIteration)
                        or "stopped by user" in str(mount_error).lower())
             evidence.status = "Uploaded" if is_stop else "Failed"
-            evidence.error_message = (
-                f"Mount failed: {mount_error}")
+            # For truncated-image failures the inner message is already the
+            # full human-readable summary; skip the redundant "Mount failed: "
+            # prefix so the investigator sees the real reason in the UI.
+            err_str = str(mount_error)
+            if truncation_warning and err_str.startswith("Truncated image"):
+                evidence.error_message = err_str
+            else:
+                evidence.error_message = f"Mount failed: {err_str}"
             db.commit()
             # Re-raise the stop sentinel unchanged. Wrapping it in a
             # RuntimeError happened to still classify correctly, but only

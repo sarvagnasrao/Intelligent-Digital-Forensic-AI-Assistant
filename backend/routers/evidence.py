@@ -30,34 +30,30 @@ from datetime import datetime
 from backend.modules.file_store import (
     get_mime_type,
     get_case_storage_stats)
+from backend.modules.file_formats import (
+    UPLOAD_EXTENSIONS as ALLOWED_EXTENSIONS,
+    FORENSIC_IMAGE_EXTENSIONS,
+    accept_string,
+    category_for,
+    describe_groups,
+    is_forensic_image,
+    is_supported_upload,
+    normalize_extension,
+    warn_on_mismatch,
+)
 
 router = APIRouter(
     prefix="/api/cases/{case_id}/evidence",
     tags=["Evidence"],
 )
 
-ALLOWED_EXTENSIONS = {
-    # Documents
-    '.pdf', '.txt',
-    # Office
-    '.docx', '.doc',
-    '.xlsx', '.xls',
-    '.pptx', '.ppt',
-    # Forensic disk images
-    '.e01', '.001', '.dd',
-    '.raw', '.img',
-    # Audio
-    '.mp3', '.wav', '.m4a',
-    '.flac', '.ogg', '.aac',
-    # Video
-    '.mp4', '.avi', '.mov',
-    '.mkv', '.wmv',
-    # Email
-    '.eml', '.msg',
-    # Images (OCR)
-    '.jpg', '.jpeg', '.png',
-    '.tiff', '.bmp'
-}
+# The accepted-format policy lives in backend/modules/file_formats.py, not
+# here. It used to be a hand-maintained 31-entry set in this file that was
+# narrower than what the extraction cascade could already read, so the gate
+# refused .log, .csv, .json and .xml - formats the pipeline handled perfectly
+# well - and the frontend's file picker filtered them out before the request
+# was ever sent. Kept as an alias so existing importers still resolve.
+_CATEGORICAL_EXTENSIONS = ALLOWED_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +134,13 @@ async def upload_evidence(
     current_user: models.User = Depends(require_investigator),
 ):
     """
-    Upload a .pdf or .txt file as evidence for a case.
+    Upload an evidence file for a case.
     Saves to disk, computes SHA-256, records in DB, writes audit log,
-    then launches background ingestion thread.
-    For forensic disk images, include_deleted=True will attempt
+    then leaves extraction to the queue.
+    Accepts every format in backend/modules/file_formats.py - documents,
+    plain text, logs, CSV/JSON/XML, config, source, subtitles, email,
+    office, images, audio, video, SQLite databases, and forensic disk
+    images. For disk images, include_deleted=True will attempt
     to recover deleted files from the filesystem.
     """
     try:
@@ -160,18 +159,19 @@ async def upload_evidence(
 
         # 2. Verify file extension
         original_filename = file.filename or "unknown"
-        _, ext = os.path.splitext(original_filename.lower())
-        if ext not in ALLOWED_EXTENSIONS:
+        ext = normalize_extension(original_filename)
+        if not is_supported_upload(original_filename):
             raise HTTPException(
                 status_code=400,
                 detail=schemas.ErrorResponse(
                     error="Invalid file type",
                     detail=(
-                        f"Unsupported file type: {ext}. "
+                        f"Unsupported file type: {ext or 'none'}. "
                         f"Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
                     ),
                 ).model_dump(),
             )
+        warn_on_mismatch()
 
         # 3. Generate evidence ID
         evidence_id = str(uuid.uuid4())
@@ -183,23 +183,29 @@ async def upload_evidence(
         )
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
-        content = await file.read()
-        async with aiofiles.open(file_path, "wb") as out_file:
-            await out_file.write(content)
-
-        file_size_bytes = len(content)
-
-        # 5. Compute SHA-256 hash
+        # Streamed rather than `content = await file.read()`. Accepting
+        # .log and .csv means accepting files that are routinely hundreds of
+        # megabytes, and buffering the whole body in memory to write it to
+        # disk is how the upload worker runs the machine out of RAM. The
+        # SHA-256 is taken from the same pass, which also removes the
+        # redundant full re-read that used to follow.
+        file_size_bytes = 0
         sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
+        async with aiofiles.open(file_path, "wb") as out_file:
+            while True:
+                chunk = await file.read(4 * 1024 * 1024)  # 4 MB
+                if not chunk:
+                    break
+                await out_file.write(chunk)
                 sha256.update(chunk)
+                file_size_bytes += len(chunk)
+
         hash_value = sha256.hexdigest()
 
         # Determine file_type from extension
         file_type = ext.lstrip(".")
 
-        # 6. Create Evidence record in DB with status "Uploaded"
+        # 5. Create Evidence record in DB with status "Uploaded"
         db_evidence = models.Evidence(
             id=evidence_id,
             case_id=case_id,
@@ -219,7 +225,7 @@ async def upload_evidence(
         db.commit()
         db.refresh(db_evidence)
 
-        # 7. Create AuditLog entry
+        # 6. Create AuditLog entry
         _create_audit(
             db=db,
             action_type="FILE_UPLOADED",
@@ -233,10 +239,208 @@ async def upload_evidence(
             case_id=case_id,
         )
 
-        # 8. Removed background ingestion thread (now handled by queue)
+        # 7. Removed background ingestion thread (now handled by queue)
 
-        # 9. Return EvidenceResponse immediately
+        # 8. Return EvidenceResponse immediately
         return db_evidence
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=schemas.ErrorResponse(
+                error="Failed to upload evidence",
+                detail=str(exc),
+            ).model_dump(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/cases/{case_id}/evidence/upload_multi
+# ---------------------------------------------------------------------------
+
+from typing import List
+
+@router.post("/upload_multi", response_model=schemas.EvidenceResponse, status_code=201)
+async def upload_multi_evidence(
+    case_id: str,
+    ingested_by: str = Form(...),
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_investigator),
+):
+    """
+    Upload several files at once.
+
+    Split disk-image segments (.001, .002, ...) are concatenated into a
+    single image, because a split set is one artefact and the pytsk3 walk
+    needs it whole. Everything else is stored as its own evidence item.
+
+    This endpoint used to concatenate unconditionally, so selecting three
+    log files produced one .dd blob and handed it to the forensic walk - which
+    cannot mount it, and reported the failure with nothing to show for three
+    files that were each perfectly ingestable. It also stored the bare
+    filename in Evidence.file_path instead of the full path, so the job
+    worker could not open the file it was asked to ingest and the
+    chain-of-custody check reported the evidence as missing.
+
+    Returns the combined image when there is one, otherwise the first stored
+    item, so the response shape is unchanged.
+    """
+    try:
+        settings = get_settings()
+
+        db_case = db.query(models.Case).filter(models.Case.id == case_id).first()
+        if not db_case:
+            raise HTTPException(
+                status_code=404,
+                detail=schemas.ErrorResponse(
+                    error="Case not found",
+                    detail=f"No case with id={case_id}",
+                ).model_dump(),
+            )
+
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
+
+        # Same gate as the single-file endpoint. Drag-and-drop bypasses the
+        # input's accept filter, so the server is the only real check.
+        for f in files:
+            name = f.filename or "unknown"
+            if not is_supported_upload(name):
+                bad = normalize_extension(name)
+                raise HTTPException(
+                    status_code=400,
+                    detail=schemas.ErrorResponse(
+                        error="Invalid file type",
+                        detail=(
+                            f"Unsupported file type: {bad or 'none'} "
+                            f"in {name}. Supported: "
+                            f"{', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                        ),
+                    ).model_dump(),
+                )
+
+        image_files = [f for f in files if is_forensic_image(f.filename or "")]
+        plain_files = [f for f in files if f not in image_files]
+
+        created = []
+
+        # --- split disk image segments -> one combined image ---
+        if image_files:
+            # Sorted so .001, .002 ... reassemble in the right order.
+            sorted_images = sorted(
+                image_files, key=lambda f: f.filename or "")
+
+            evidence_id = str(uuid.uuid4())
+            base_name = sorted_images[0].filename or "unknown"
+            name_no_ext, _ = os.path.splitext(base_name)
+            final_filename = f"{name_no_ext}_combined.dd"
+
+            safe_filename = f"{evidence_id}_{final_filename}"
+            file_path = os.path.join(
+                settings.cases_dir, case_id, "evidence", safe_filename
+            )
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+            file_size_bytes = 0
+            sha256 = hashlib.sha256()
+
+            # Stream chunks to avoid loading gigabytes into RAM
+            async with aiofiles.open(file_path, "wb") as out_file:
+                for f in sorted_images:
+                    while True:
+                        chunk = await f.read(1024 * 1024 * 4)  # 4MB chunks
+                        if not chunk:
+                            break
+                        await out_file.write(chunk)
+                        sha256.update(chunk)
+                        file_size_bytes += len(chunk)
+
+            combined = models.Evidence(
+                id=evidence_id,
+                case_id=case_id,
+                filename=final_filename,
+                original_filename=final_filename,
+                file_type="dd",
+                file_size_bytes=file_size_bytes,
+                file_path=file_path,
+                sha256_hash=sha256.hexdigest(),
+                ingested_at=datetime.utcnow(),
+                ingested_by=ingested_by,
+                status="Uploaded",
+                notes=(
+                    f"Combined from {len(sorted_images)} split files"
+                ),
+            )
+            db.add(combined)
+            created.append(combined)
+
+        # --- everything else -> one evidence item per file ---
+        for f in plain_files:
+            original_filename = f.filename or "unknown"
+            ext = normalize_extension(original_filename)
+            ev_id = str(uuid.uuid4())
+            safe_name = f"{ev_id}_{original_filename}"
+            path = os.path.join(
+                settings.cases_dir, case_id, "evidence", safe_name
+            )
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            size = 0
+            digest = hashlib.sha256()
+            async with aiofiles.open(path, "wb") as out_file:
+                while True:
+                    chunk = await f.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    await out_file.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+
+            item = models.Evidence(
+                id=ev_id,
+                case_id=case_id,
+                filename=safe_name,
+                original_filename=original_filename,
+                file_type=ext.lstrip("."),
+                file_size_bytes=size,
+                file_path=path,
+                sha256_hash=digest.hexdigest(),
+                ingested_at=datetime.utcnow(),
+                ingested_by=ingested_by,
+                status="Uploaded",
+            )
+            db.add(item)
+            created.append(item)
+
+        if not created:
+            raise HTTPException(
+                status_code=400, detail="No files provided")
+
+        # Audit log
+        db.add(models.AuditLog(
+            id=str(uuid.uuid4()),
+            case_id=case_id,
+            action_type="EVIDENCE_UPLOADED",
+            performed_by=current_user.username,
+            details=json.dumps({
+                "evidence_ids": [e.id for e in created],
+                "filenames": [
+                    e.original_filename for e in created],
+                "files_received": len(files),
+                "combined_image_segments": len(image_files),
+                "total_size_bytes": sum(
+                    e.file_size_bytes or 0 for e in created),
+            })
+        ))
+
+        db.commit()
+        for e in created:
+            db.refresh(e)
+        return created[0]
 
     except HTTPException:
         raise

@@ -1,4 +1,5 @@
 import os
+from backend.modules.file_formats import category_for
 
 # Seconds per MB for each file type
 # Based on M1 Mac 8GB benchmarks
@@ -7,15 +8,20 @@ TIME_PER_MB = {
     '.txt':  0.05,
     '.log':  0.05,
     '.csv':  0.05,
+    '.tsv':  0.05,
     '.xml':  0.1,
     '.json': 0.05,
+    '.jsonl': 0.05,
+    '.ndjson': 0.05,
     '.html': 0.1,
-    '.htm':  0.1,
+    '.htm': 0.1,
+    '.xhtml': 0.1,
     '.eml':  0.1,
     '.msg':  0.2,
 
     # Medium — structured parsing
     '.pdf':  6.0,   # pdfminer is slow
+    '.rtf':  0.1,
     '.docx': 0.5,
     '.doc':  0.8,
     '.xlsx': 0.4,
@@ -28,7 +34,10 @@ TIME_PER_MB = {
     '.jpeg': 2.0,
     '.png':  2.0,
     '.tiff': 3.0,
+    '.tif':  3.0,
     '.bmp':  2.5,
+    '.gif':  2.5,   # single frame is all we OCR
+    '.webp': 2.0,
 
     # Very slow — Whisper transcription
     # Audio: roughly 15 sec per minute
@@ -39,6 +48,8 @@ TIME_PER_MB = {
     '.flac': 12.0,
     '.ogg':  15.0,
     '.aac':  15.0,
+    '.wma':  15.0,
+    '.aiff': 12.0,
 
     # Video: extract audio + transcribe
     '.mp4':  18.0,
@@ -46,6 +57,18 @@ TIME_PER_MB = {
     '.mov':  18.0,
     '.mkv':  20.0,
     '.wmv':  22.0,
+    '.flv':  22.0,
+    '.webm': 18.0,
+    '.m4v':  18.0,
+}
+
+# Categories whose files are read as text or parsed cheaply, so an extension
+# missing from TIME_PER_MB above still gets a realistic rate. Without this a
+# .sql or .yaml fell to the 1.0 s/MB default and was quoted at 20x the .txt
+# sitting beside it, for work that is a single decode.
+_CHEAP_CATEGORIES = {
+    'document', 'text', 'data', 'markup', 'config',
+    'code', 'subtitle', 'database', 'email', 'office',
 }
 
 # Disk images: seconds per GB
@@ -89,27 +112,37 @@ def estimate_ingestion_time(
     size_mb = file_size_bytes / (1024 * 1024)
     size_gb = size_mb / 1024
 
+    # The format category comes from the shared policy module, so a newly
+    # accepted media format is estimated as media on the day it is added
+    # rather than silently falling through to the document branch. The old
+    # hardcoded sets here omitted .gif, .webp, .tif, .wma, .aiff, .flv,
+    # .webm and .m4v - so an 80 MB webm was quoted as if it would produce
+    # 64 MB of transcript to embed, which is a fabricated number rather than
+    # a rough one.
+    category_key = category_for(filename)
+
     # Calculate base extraction time
-    if ext in DISK_IMAGE_EXTENSIONS:
+    if category_key == 'disk_image':
         # Disk images: per-GB rate
         extraction_seconds = size_gb * TIME_PER_GB_DISK_IMAGE
         # Assume ~10% of disk is text content
         estimated_text_mb = size_mb * 0.1
         category = "disk_image"
     else:
-        rate = TIME_PER_MB.get(ext, 1.0)
+        if ext in TIME_PER_MB:
+            rate = TIME_PER_MB[ext]
+        elif category_key in _CHEAP_CATEGORIES:
+            rate = 0.05
+        else:
+            rate = 1.0
         extraction_seconds = size_mb * rate
         # Estimate text output as fraction of input size
-        if ext in {'.mp3', '.wav', '.m4a',
-                   '.mp4', '.avi', '.mov',
-                   '.mkv', '.flac',
-                   '.ogg', '.aac',
-                   '.wmv'}:
+        if category_key in ('audio', 'video'):
+            # Only the audio track is transcribed, and a transcript is a
+            # tiny fraction of the file's bytes.
             estimated_text_mb = size_mb * 0.05
             category = "media"
-        elif ext in {'.jpg', '.jpeg',
-                     '.png', '.tiff',
-                     '.bmp'}:
+        elif category_key == 'image':
             estimated_text_mb = size_mb * 0.02
             category = "image"
         else:

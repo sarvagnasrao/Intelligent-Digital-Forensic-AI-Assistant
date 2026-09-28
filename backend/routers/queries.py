@@ -194,7 +194,10 @@ def ask_question(
                 "question": body.question_text,
                 "model": result["model_used"],
                 "response_time_ms": result[
-                    "response_time_ms"]
+                    "response_time_ms"],
+                "prompt_stats": result.get(
+                    "prompt_stats", {}),
+                "refused": result.get("refused", False)
             })
         )
         db.add(audit)
@@ -211,7 +214,12 @@ def ask_question(
                 "response_time_ms"],
             "model_used": result["model_used"],
             "ollama_available": result[
-                "ollama_available"]
+                "ollama_available"],
+            # Whether the model actually saw the evidence, and how much of
+            # it had to be dropped to fit the context window. Without these
+            # a trimmed answer is indistinguishable from a complete one.
+            "prompt_stats": result.get("prompt_stats", {}),
+            "refused": result.get("refused", False)
         }
 
     except Exception as e:

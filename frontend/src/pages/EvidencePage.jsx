@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from "react"
 import { useParams, useNavigate } from "react-router-dom"
 import {
-  Upload, File, FileText,
+  Upload, File, FileText, FileCode,
   Database, Music, Video,
-  Image, Mail, Table,
+  Image, Mail, Table, MessageSquare,
   CheckCircle, Clock,
   AlertCircle, RefreshCw,
   Info, Shield, Archive,
@@ -14,9 +14,9 @@ import {
   UploadCloud, Settings, Plus, User, Gauge, Circle
 } from "lucide-react"
 import {
-  getEvidence, uploadEvidence,
+  getEvidence, uploadEvidence, uploadMultiEvidence,
   getEvidenceItem, archiveEvidence,
-  verifyEvidence,
+  verifyEvidence, getEvidenceFormats,
   addToQueue, estimateTime,
   getStorageStats,
   getQueue, getQueueHistory, cancelJob,
@@ -33,73 +33,60 @@ import useWebSocket from "../hooks/useWebSocket"
 import useSystemInfo from "../hooks/useSystemInfo"
 
 // ── Supported format groups ────────────────────────────────
-const FILE_GROUPS = [
-  {
-    label: 'Forensic Images',
-    icon: Database,
-    color: 'text-accent',
-    exts: '.E01 .001 .dd .raw .img',
-    desc: 'Full disk image ingestion via pytsk3 — extracts all files inside the image'
-  },
-  {
-    label: 'Documents',
-    icon: FileText,
-    color: 'text-blue-400',
-    exts: '.pdf .txt .docx .doc',
-    desc: 'Text extraction with full content indexing'
-  },
-  {
-    label: 'Spreadsheets & Slides',
-    icon: Table,
-    color: 'text-green-400',
-    exts: '.xlsx .xls .pptx .ppt',
-    desc: 'Cell data and slide text extracted and indexed'
-  },
-  {
-    label: 'Audio',
-    icon: Music,
-    color: 'text-purple-400',
-    exts: '.mp3 .wav .m4a .flac .ogg .aac',
-    desc: 'Transcribed via Whisper (local AI) — no cloud required'
-  },
-  {
-    label: 'Video',
-    icon: Video,
-    color: 'text-pink-400',
-    exts: '.mp4 .avi .mov .mkv .wmv',
-    desc: 'Metadata extracted + audio track transcribed via Whisper'
-  },
-  {
-    label: 'Images',
-    icon: Image,
-    color: 'text-yellow-400',
-    exts: '.jpg .jpeg .png .tiff .bmp',
-    desc: 'OCR (text in images) + EXIF metadata (GPS, camera, date)'
-  },
-  {
-    label: 'Email',
-    icon: Mail,
-    color: 'text-orange-400',
-    exts: '.eml .msg',
-    desc: 'Headers, body, sender, recipient, date all extracted'
-  },
-]
+// The format groups themselves are served by the backend
+// (GET /api/evidence/formats) rather than restated here. Only the
+// presentation lives in the frontend: an icon and a colour per group key.
+//
+// This list used to be hardcoded, and it drifted from the server's own list
+// in both directions - the file picker offered formats the server refused
+// with a 400, and the format guide described a set the server no longer
+// accepted. A list of accepted evidence formats is a fact about the backend,
+// not a piece of UI copy.
+const GROUP_STYLE = {
+  Database:  { icon: Database,  color: 'text-accent' },
+  FileText:  { icon: FileText,  color: 'text-blue-400' },
+  Table:     { icon: Table,     color: 'text-green-400' },
+  Settings:  { icon: Settings,  color: 'text-cyan-400' },
+  FileCode:  { icon: FileCode,  color: 'text-amber-400' },
+  MessageSquare: { icon: MessageSquare, color: 'text-teal-400' },
+  Mail:      { icon: Mail,      color: 'text-orange-400' },
+  Image:     { icon: Image,     color: 'text-yellow-400' },
+  Music:     { icon: Music,     color: 'text-purple-400' },
+  Video:     { icon: Video,     color: 'text-pink-400' },
+}
+
+const DEFAULT_GROUP_STYLE = { icon: File, color: 'text-ink-2' }
 
 // ── Per-extension icon map ─────────────────────────────────
+// Presentation only. An extension with no entry here still uploads and
+// ingests correctly; it just gets the generic File glyph in the list, which
+// is why this is a lookup and not a gate.
 const EXT_ICON = {
-  '.pdf':  FileText, '.txt':  FileText,
+  '.pdf':  FileText, '.txt':  FileText, '.rtf': FileText,
+  '.log':  FileText, '.md':   FileText, '.nfo': FileText,
+  '.out':  FileText, '.err':  FileText, '.trace': FileText,
+  '.csv':  Table,    '.tsv':  Table,   '.xls': Table,
+  '.xlsx': Table,    '.json': Table,   '.jsonl': Table,
+  '.ndjson': Table,  '.xml':  Table,   '.plist': Table,
+  '.mobileconfig': Table, '.sqlite': Table, '.sqlite3': Table, '.db': Table,
+  '.yaml': Settings, '.yml':  Settings, '.ini':  Settings,
+  '.cfg':  Settings, '.conf': Settings, '.config': Settings,
+  '.toml': Settings, '.properties': Settings, '.env': Settings,
+  '.srt':  MessageSquare, '.vtt': MessageSquare, '.ass': MessageSquare,
   '.docx': FileText, '.doc':  FileText,
-  '.xlsx': Table,    '.xls':  Table,
   '.pptx': FileText, '.ppt':  FileText,
   '.mp3':  Music,    '.wav':  Music,
   '.m4a':  Music,    '.flac': Music,
   '.ogg':  Music,    '.aac':  Music,
+  '.wma':  Music,    '.aiff': Music,
   '.mp4':  Video,    '.avi':  Video,
   '.mov':  Video,    '.mkv':  Video,
-  '.wmv':  Video,
+  '.wmv':  Video,    '.flv':  Video,
+  '.webm': Video,    '.m4v':  Video,
   '.jpg':  Image,    '.jpeg': Image,
   '.png':  Image,    '.tiff': Image,
-  '.bmp':  Image,
+  '.tif':  Image,    '.bmp':  Image,
+  '.gif':  Image,    '.webp': Image,
   '.eml':  Mail,     '.msg':  Mail,
   '.e01':  Database, '.001':  Database,
   '.dd':   Database, '.raw':  Database,
@@ -115,18 +102,31 @@ const statusIcon = {
   'Failed': <AlertCircle size={14} className="text-danger" />
 }
 
-const ACCEPT_STRING =
-  '.pdf,.txt,.docx,.doc,' +
-  '.xlsx,.xls,.pptx,.ppt,' +
-  '.mp3,.wav,.m4a,.flac,.ogg,.aac,' +
-  '.mp4,.avi,.mov,.mkv,.wmv,' +
-  '.jpg,.jpeg,.png,.tiff,.bmp,' +
-  '.eml,.msg,.e01,.001,.dd,.raw,.img'
+// Mirrors normalize_extension() in backend/modules/file_formats.py, so the
+// icon shown matches the format the server actually ingested. Two cases the
+// naive `split('.').pop()` gets wrong, and both are common evidence:
+// rotated logs ("app.log.1" is a .log, not a ".1") and dotfiles (".env" has
+// no extension at all).
+const DOTFILE_ICONS = new Set([
+  '.env', '.envrc', '.gitignore', '.gitconfig', '.npmrc',
+  '.bashrc', '.bash_history', '.zsh_history', '.profile',
+  '.htaccess', '.htpasswd', '.netrc', '.pgpass',
+])
+
+function fileExtension(filename) {
+  if (!filename) return ''
+  const name = String(filename).split('\\').pop().toLowerCase()
+  if (DOTFILE_ICONS.has(name)) return name
+  const parts = name.split('.')
+  if (parts.length > 1 && /^\d{1,2}$/.test(parts[parts.length - 1])) {
+    return '.' + parts[parts.length - 2]
+  }
+  return parts.length > 1 ? '.' + parts[parts.length - 1] : ''
+}
 
 function getFileIcon(filename) {
   if (!filename) return File
-  const ext = '.' + filename.split('.').pop().toLowerCase()
-  return EXT_ICON[ext] || File
+  return EXT_ICON[fileExtension(filename)] || File
 }
 
 function formatBytes(bytes) {
@@ -716,6 +716,24 @@ export default function EvidencePage() {
   // Storage stats
   const [storageStats, setStorageStats] = useState(null)
 
+  // Accepted formats, served by the backend. Null until it answers, and
+  // null is rendered as "still loading" rather than as an empty list — a
+  // format guide that reads as empty because a request is in flight is the
+  // same not-yet-measaged-is-not-zero mistake the health panel makes.
+  const [formats, setFormats] = useState(null)
+
+  const loadFormats = async () => {
+    try {
+      const res = await getEvidenceFormats()
+      setFormats(res.data)
+    } catch (e) {
+      // Leave it null. The upload path does not depend on this: the picker
+      // simply stays unfiltered and the server remains the authority, so a
+      // failed request must not block uploading evidence.
+      console.warn('Could not load accepted evidence formats', e)
+    }
+  }
+
   const loadEvidence = async () => {
     try {
       const res = await getEvidence(caseId)
@@ -725,15 +743,28 @@ export default function EvidencePage() {
     }
   }
 
-  const handleUpload = async (file) => {
-    if (!file) return
+  const handleUpload = async (files) => {
+    if (!files || files.length === 0) return
     setUploading(true)
     try {
-      const formData = new FormData()
-      formData.append('file', file)
-      formData.append('ingested_by', investigator)
-      await uploadEvidence(caseId, formData)
-      toast.success(`Uploaded ${file.name}`)
+      if (files.length === 1) {
+        const formData = new FormData()
+        formData.append('file', files[0])
+        formData.append('ingested_by', investigator)
+        await uploadEvidence(caseId, formData)
+        toast.success(`Uploaded ${files[0].name}`)
+      } else {
+        const formData = new FormData()
+        for (let i = 0; i < files.length; i++) {
+          formData.append('files', files[i])
+        }
+        formData.append('ingested_by', investigator)
+        await uploadMultiEvidence(caseId, formData)
+        // Not "combined": the endpoint combines split disk-image segments
+        // and stores everything else individually, so claiming a merge here
+        // would misdescribe three logs turned into one evidence item.
+        toast.success(`Uploaded ${files.length} file${files.length === 1 ? '' : 's'}`)
+      }
       loadEvidence()
     } catch (e) {
       const d = e.response?.data?.detail;
@@ -823,6 +854,11 @@ export default function EvidencePage() {
   useEffect(() => {
     loadEvidence()
   }, [caseId])
+
+  // Accepted formats do not vary per case, so this is fetched once.
+  useEffect(() => {
+    loadFormats()
+  }, [])
 
   // --- QUEUE LOGIC ---
   const [queue, setQueue]           = useState([])
@@ -986,15 +1022,25 @@ export default function EvidencePage() {
             
             {showFormats && (
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-2 mb-5">
-                {FILE_GROUPS.map(group => (
-                  <div key={group.label} className="bg-surface-2 border border-line rounded-xl p-3 flex gap-3">
-                    <group.icon size={18} className={`${group.color} shrink-0 mt-0.5`} />
-                    <div>
-                      <p className="text-xs font-semibold text-ink-0">{group.label}</p>
-                      <p className="text-[10px] text-ink-2 leading-tight mt-0.5">{group.exts}</p>
-                    </div>
+                {!formats ? (
+                  <div className="md:col-span-4 text-xs text-ink-2">
+                    Loading supported formats…
                   </div>
-                ))}
+                ) : formats.groups.map(group => {
+                  const { icon: Icon, color } = GROUP_STYLE[group.icon] || DEFAULT_GROUP_STYLE
+                  return (
+                    <div key={group.key} className="bg-surface-2 border border-line rounded-xl p-3 flex gap-3">
+                      <Icon size={18} className={`${color} shrink-0 mt-0.5`} />
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-ink-0">{group.label}</p>
+                        <p className="text-[10px] text-ink-2 leading-tight mt-0.5 break-words">
+                          {group.extensions_label}
+                        </p>
+                        <p className="text-[10px] text-ink-2 leading-tight mt-1">{group.description}</p>
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
             )}
 
@@ -1006,7 +1052,7 @@ export default function EvidencePage() {
                 e.preventDefault()
                 setDragOver(false)
                 if (e.dataTransfer.files.length > 0) {
-                  handleUpload(e.dataTransfer.files[0])
+                  handleUpload(e.dataTransfer.files)
                 }
               }}
               onClick={() => fileRef.current?.click()}
@@ -1018,11 +1064,16 @@ export default function EvidencePage() {
               <p className="text-ink-2 text-sm">Drag & drop your files here, or click to browse</p>
               
               <input
-                type="file"
+                type="file" multiple
                 ref={fileRef}
+                // From the backend, so the native picker's filter is the
+                // same list the server accepts. Undefined until it loads,
+                // which leaves the input unfiltered rather than filtering to
+                // a guess — the server is the authority either way.
+                accept={formats?.accept}
                 className="hidden"
                 onChange={e => {
-                  if (e.target.files.length > 0) handleUpload(e.target.files[0])
+                  if (e.target.files.length > 0) handleUpload(e.target.files)
                 }}
               />
             </div>
@@ -1084,7 +1135,18 @@ export default function EvidencePage() {
                          </div>
                        </div>
                     </div>
-                  </div>
+                  {/* Error message banner for failed ingestion */}
+                  {ev.status === 'Failed' && ev.error_message && (
+                    <div className="px-4 pb-4">
+                      <div className="bg-danger/10 border border-danger/30 rounded-lg px-3 py-2 flex items-start gap-2">
+                        <AlertCircle size={13} className="text-danger shrink-0 mt-0.5" />
+                        <p className="text-[11px] text-danger leading-snug break-words">
+                          {ev.error_message}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
                 )
               })}
               {evidence.length === 0 && (

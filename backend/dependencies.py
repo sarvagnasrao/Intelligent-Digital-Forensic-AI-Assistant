@@ -21,6 +21,22 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.2:3b"
     ollama_base_url: str = "http://localhost:11434"
 
+    # The context window the *running* Ollama actually gives the model.
+    #
+    # This is not the model's trained length. llama3.2:3b trains at 131072,
+    # which is what /api/show reports, but Ollama serves it with n_ctx=4096
+    # unless the operator sets OLLAMA_CONTEXT_LENGTH or the Modelfile says
+    # otherwise. Budgeting against the trained figure over-estimates the real
+    # window by 32x, which is how a 212,000-character RAG prompt reached a
+    # 4,096-token model intact enough to look fine and was actually discarded.
+    # ollama_client.effective_context_tokens() prefers the live value from
+    # /api/ps and falls back to this.
+    ollama_num_ctx: int = 4096
+
+    # Generation ceiling, subtracted from the context window because Ollama's
+    # n_ctx is shared between prompt and completion.
+    ollama_num_predict: int = 1024
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

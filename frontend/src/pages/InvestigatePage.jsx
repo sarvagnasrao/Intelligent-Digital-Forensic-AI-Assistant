@@ -24,6 +24,10 @@ import { fromUtc } from '../utils/time'
 import PageLayout from '../components/PageLayout'
 
 // Renders AI response with citations
+// Must match EVIDENCE_NOTE_MARKER in backend/modules/rag_engine.py. Both
+// sides need it: the backend writes the caveat, this renders it.
+const EVIDENCE_CAVEAT_MARKER = 'Evidence caveat:'
+
 function ResponseText({ text }) {
   // The old text here blamed the investigator's question ("Try rephrasing your
   // question"). That advice was guaranteed to fail: the usual cause is a missing
@@ -45,6 +49,20 @@ function ResponseText({ text }) {
   // Highlight citation markers
   const parts = text.split(
     /(\[Source:[^\]]+\])/g)
+
+  // The backend appends an evidence caveat when retrieval matched more than
+  // the model's context window can carry, so only part of what was retrieved
+  // reached the model. It is split out and styled as its own block: a limit
+  // on the evidence behind a finding must not be rendered in the same voice
+  // as the finding, or it reads as part of the conclusion.
+  const caveatAt = parts.findIndex(
+    (p) => p.includes(EVIDENCE_CAVEAT_MARKER))
+  const bodyParts = caveatAt === -1
+    ? parts : parts.slice(0, caveatAt)
+  const caveat = caveatAt === -1
+    ? null
+    : parts.slice(caveatAt).join('').trim()
+
   return (
     <div style={{
       fontSize: 13,
@@ -53,7 +71,7 @@ function ResponseText({ text }) {
       whiteSpace: 'pre-wrap',
       wordBreak: 'break-word',
     }}>
-      {parts.map((part, i) =>
+      {bodyParts.map((part, i) =>
         part.startsWith('[Source:')
           ? (
             <span key={i} style={{
@@ -73,6 +91,23 @@ function ResponseText({ text }) {
           ) : (
             <span key={i}>{part}</span>
           )
+      )}
+      {caveat && (
+        <div style={{
+          marginTop: 10,
+          padding: '8px 10px',
+          borderLeft:
+            '2px solid rgba(245,158,11,0.5)',
+          background:
+            'rgba(245,158,11,0.06)',
+          borderRadius: '0 4px 4px 0',
+          color: 'rgba(253,230,138,0.85)',
+          fontSize: 11.5,
+          lineHeight: 1.7,
+          whiteSpace: 'normal',
+        }}>
+          {caveat}
+        </div>
       )}
     </div>
   )

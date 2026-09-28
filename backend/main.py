@@ -240,6 +240,37 @@ def system_status():
 
 
 
+@app.get("/api/evidence/formats")
+def evidence_formats():
+    """
+    Returns the evidence file formats this build accepts.
+
+    Served rather than hardcoded in the frontend, because the accepted set is
+    decided in one place (backend/modules/file_formats.py) and the file
+    picker's `accept` attribute has to agree with it. When the two were
+    separate hand-maintained lists, a format could be accepted by the server
+    and hidden by the browser dialog - and, in the other direction, offered by
+    the dialog and refused with a 400 on upload.
+
+    `unsupported` reports any format we advertise that the extraction
+    cascade cannot actually read. It is expected to be empty; a non-empty
+    list is the early warning for a format that would ingest successfully and
+    index nothing, which is the failure mode this repo keeps having to chase
+    down after the fact.
+    """
+    from backend.modules.file_formats import (
+        accept_string,
+        describe_groups,
+        unsupported_uploads,
+    )
+    return {
+        "accept": accept_string(),
+        "extensions": sorted(accept_string().split(",")),
+        "groups": describe_groups(),
+        "unsupported": unsupported_uploads(),
+    }
+
+
 @app.get("/api/media/capabilities")
 def media_capabilities():
     """

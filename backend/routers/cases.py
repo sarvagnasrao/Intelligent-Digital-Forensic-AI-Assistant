@@ -368,7 +368,8 @@ def generate_case_summary(
     Gathers all evidence, entities, queries, and notes,
     then synthesises them into a professional report via Ollama.
     """
-    from backend.modules.ollama_client import generate_response, is_ollama_running
+    from backend.modules.ollama_client import (
+        generate_response, ollama_diagnostic)
     from backend.modules.vector_store import search_chunks
     import time
 
@@ -517,7 +518,12 @@ KEY EVIDENCE EXCERPTS:
 Write the executive summary now:"""
 
     # Generate or fallback
-    if not is_ollama_running():
+    # Gated on a model existing, not merely on the daemon answering.
+    # /api/tags returns 200 with an empty model list on a machine that never
+    # pulled a model, so the old check passed and the "summary" persisted was
+    # the model's own error text filed as a case summary.
+    diag = ollama_diagnostic()
+    if not (diag["running"] and diag["model_ready"]):
         summary_text = (
             f"## {case.case_name} — Executive Summary\n\n"
             f"**Status:** {case.status}  \n"
@@ -525,7 +531,8 @@ Write the executive summary now:"""
             f"**Evidence Files:** {len(evidence)}  \n"
             f"**Entities Extracted:** {len(entities)}  \n"
             f"**Anomalies Detected:** {anomalies}  \n\n"
-            f"*Ollama is offline. Start Ollama and regenerate for a full AI summary.*"
+            f"*{diag['reason'] or 'Ollama is not ready to answer.'} "
+            f"Start Ollama and regenerate for a full AI summary.*"
         )
     else:
         summary_text = generate_response(
@@ -627,7 +634,7 @@ def detect_contradictions(
     """
     from backend.modules.ollama_client import (
         generate_response,
-        is_ollama_running
+        ollama_diagnostic
     )
     from backend.modules.vector_store import search_chunks
     from backend.dependencies import get_settings
@@ -763,10 +770,11 @@ TIMESTAMP ANOMALIES:
 Analyse for contradictions now:
 """
 
-    if not is_ollama_running():
+    diag = ollama_diagnostic()
+    if not (diag["running"] and diag["model_ready"]):
         result_text = (
             "## Contradiction Analysis\n\n"
-            "Ollama is offline. "
+            f"{diag['reason'] or 'Ollama is not ready to answer.'} "
             "Start Ollama and retry.\n\n"
             f"**Evidence statements "
             f"ready for analysis:** "

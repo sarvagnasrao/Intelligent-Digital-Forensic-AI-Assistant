@@ -302,7 +302,7 @@ def generate_entity_profile(
     that small models like llama3.2:3b will not refuse.
     """
     from backend.modules.ollama_client import (
-        generate_response, is_ollama_running)
+        generate_response, ollama_diagnostic)
     from backend.modules.vector_store import search_chunks, case_qdrant_path
     from backend.modules.graph_builder import (
         load_graph, get_graph_context)
@@ -429,7 +429,13 @@ Do NOT refuse to analyze.
     )
 
     # Step 4: Generate with Ollama
-    if not is_ollama_running():
+    #
+    # Gated on a model existing, not merely on the daemon answering:
+    # /api/tags answers 200 with an empty model list on a machine that never
+    # pulled one, so the old check passed and the "profile" persisted was the
+    # model's own error text.
+    diag = ollama_diagnostic()
+    if not (diag["running"] and diag["model_ready"]):
         profile_text = (
             f"## Offline Profile — Ollama Not Running\n\n"
             f"**Entity:** {entity_name}\n"
@@ -437,7 +443,8 @@ Do NOT refuse to analyze.
             f"**Frequency:** {entity.frequency} mention(s)\n\n"
             f"**Graph Relationships:**\n"
             f"{graph_context or 'None found'}\n\n"
-            f"*Start Ollama to generate a full AI profile.*"
+            f"*{diag['reason'] or 'Ollama is not ready to answer.'} "
+            f"Start Ollama to generate a full AI profile.*"
         )
         cited_count = 0
         uncited_count = 0
@@ -511,7 +518,7 @@ Do NOT refuse to analyze.
             "entity_type": entity.entity_type,
             "entity_id": entity_id,
             "chunks_used": len(chunks),
-            "ollama_available": is_ollama_running()
+            "ollama_available": diag["running"]
         })
     ))
     db.commit()
@@ -528,7 +535,7 @@ Do NOT refuse to analyze.
         "cited_sentence_count": cited_count,
         "uncited_sentence_count": uncited_count,
         "response_time_ms": elapsed_ms,
-        "ollama_available": is_ollama_running(),
+        "ollama_available": diag["running"],
         "chunks_used": len(chunks),
         "generated_at": str(profile_query_log.asked_at),
         "generated_by": current_user.username,

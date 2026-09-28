@@ -1,4 +1,5 @@
 import os
+import re
 import hashlib
 import json
 import sqlite3
@@ -14,6 +15,8 @@ from backend.modules.file_store import (
     save_file,
     get_stored_path,
     get_mime_type)
+from backend.modules.text_parser import decode_text_bytes
+from backend.modules.file_formats import normalize_extension
 
 # These imports are conditional —
 # wrap in try/except for graceful failure
@@ -44,13 +47,40 @@ from pdfminer.high_level import (
 from bs4 import BeautifulSoup
 
 # File types we extract text from
+# The upload gate in file_formats.py advertises a subset of these; the two are
+# reconciled by tests/verify_file_formats.py. A format that is extractable
+# here but not listed in file_formats is intentional (the in-image walk is
+# deliberately broader than direct upload), the reverse is a bug.
 TEXT_EXTENSIONS = {
-    '.txt', '.log', '.csv', '.xml',
-    '.json', '.md', '.py', '.js',
-    '.html', '.htm'
+    '.txt', '.log', '.csv', '.tsv', '.xml',
+    '.json', '.jsonl', '.ndjson', '.md', '.py', '.js',
+    '.html', '.htm',
+    # Config and secrets. Credential scanning needs these far more than the
+    # original list allowed for - a .env or a .properties file is one of the
+    # highest-yield artefacts in a real case.
+    '.yaml', '.yml', '.ini', '.cfg', '.conf',
+    '.config', '.toml', '.properties',
+    # Log/exec output, the shapes that carry crash and stack traces.
+    '.text', '.nfo', '.out', '.err', '.trace', '.dump',
+    # Source and shell. Opened read as text, so this is a superset of
+    # "languages we analyse" - it is a decoding decision, not a parser claim.
+    '.ts', '.jsx', '.tsx', '.java', '.c', '.h',
+    '.cpp', '.hpp', '.cs', '.go', '.rb', '.php',
+    '.pl', '.rs', '.lua', '.r', '.sh', '.bash',
+    '.bat', '.ps1', '.sql', '.vb',
+    # Extensionless dotfiles, which normalize_extension reports by name
+    # because splitext sees a leading dot as a hidden-file marker. A .env is
+    # one of the highest-yield artefacts in a case - live API keys, database
+    # URLs, internal hostnames - and the credential scanner needs it.
+    '.env', '.envrc', '.gitignore', '.gitconfig', '.npmrc',
+    '.bashrc', '.bash_history', '.zsh_history', '.profile',
+    '.htaccess', '.htpasswd', '.netrc', '.pgpass',
     # NOTE: .eml and .msg are now handled
     # by media_extractor (email extractor)
     # which parses headers + body properly.
+    # NOTE: .rtf, .plist and .srt/.vtt/.ass are handled by dedicated
+    # extractors below rather than a plain UTF-8 read, because each of them
+    # stores its payload in a way that a raw decode garbles.
 }
 PDF_EXTENSIONS = {'.pdf'}
 DB_EXTENSIONS = {'.db', '.sqlite', '.sqlite3'}
@@ -59,7 +89,19 @@ IMAGE_EXTENSIONS = {
     '.tiff', '.tif', '.bmp',
     '.gif', '.webp'
 }
-HTML_EXTENSIONS = {'.html', '.htm'}
+HTML_EXTENSIONS = {'.html', '.htm', '.xhtml'}
+
+# Rich Text Format: a Word export that still appears in older case material.
+# The payload is wrapped in control words, so it gets a real stripper.
+RTF_EXTENSIONS = {'.rtf'}
+
+# Apple property lists - the backbone of iOS/macOS artefacts (Info.plist,
+# .mobileconfig, preference payloads).
+PLIST_EXTENSIONS = {'.plist', '.mobileconfig'}
+
+# Subtitle / transcript formats. Interview and call recordings are routinely
+# exported alongside their subtitles, and a transcript is evidence.
+SUBTITLE_EXTENSIONS = {'.srt', '.vtt', '.ass'}
 
 # New multimedia extension sets
 OFFICE_EXTENSIONS = {
@@ -197,6 +239,290 @@ def is_supported_file(filename: str,
     return True
 
 
+# ---------------------------------------------------------------------------
+# Format-specific text extractors
+# ---------------------------------------------------------------------------
+
+# Destinations whose contents are markup, not prose. Skipping them is what
+# keeps font names and colour tables out of an extracted "document".
+_RTF_SKIP_DESTINATIONS = {
+    'fonttbl', 'colortbl', 'stylesheet', 'info', 'pict', 'object',
+    'filetbl', 'listtable', 'listoverridetable', 'rsidtbl', 'generator',
+    'themedata', 'colorschememapping', 'latentstyles', 'datastore',
+    'xmlnstbl', 'panose', 'falt', 'listtext', 'pn', 'shppict',
+    'nonshppict', 'field', 'shp', 'shpinst', 'do', 'objclass',
+    'objdata', 'result', 'atnid', 'atnauthor', 'atndate',
+    'bkmkstart', 'bkmkend', 'comment', 'annotation', 'footnote',
+}
+
+# Control words that contribute a literal character.
+_RTF_LITERALS = {
+    'emdash': '\u2014', 'endash': '\u2013',
+    'bullet': '\u2022', 'lquote': '\u2018', 'rquote': '\u2019',
+    'ldblquote': '\u201c', 'rdblquote': '\u201d',
+}
+
+_RTF_TOKEN_RE = re.compile(
+    r"""
+      \\(?P<hex>'[0-9a-fA-F]{2})
+    | \\(?P<word>[a-zA-Z]+)(?P<param>-?[0-9]+)?[ ]?
+    | \\(?P<symbol>.)
+    | (?P<open>\{)
+    | (?P<close>\})
+    | (?P<text>[^\\{}]+)
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+
+def _extract_rtf(data: bytes) -> tuple:
+    """
+    Pulls the readable text out of an RTF document.
+
+    RTF wraps its prose in control words (`\\b`, `\\fs24`, `\\par`) and hides
+    its tables inside `{\\*...}` destinations, so reading it as UTF-8 indexes
+    control words and font tables instead of the document. This is a text
+    stripper, not a layout-preserving RTF parser - it yields the words in
+    order, which is what the index and the entity extractor need.
+    """
+    raw, encoding = decode_text_bytes(data)
+    if not raw:
+        return "", 'rtf', {}
+
+    out = []
+    depth = 0
+    skip_from = None
+
+    for m in _RTF_TOKEN_RE.finditer(raw):
+        if m.group('open') is not None:
+            depth += 1
+            continue
+        if m.group('close') is not None:
+            if skip_from is not None and depth <= skip_from:
+                skip_from = None
+            depth = max(0, depth - 1)
+            continue
+        if skip_from is not None:
+            continue
+        if m.group('text') is not None:
+            out.append(m.group('text'))
+            continue
+        if m.group('hex') is not None:
+            out.append(bytes(
+                [int(m.group('hex')[1:], 16)]
+            ).decode('cp1252', 'replace'))
+            continue
+
+        word = m.group('word')
+        param = m.group('param')
+        if word is not None:
+            if word == 'u' and param:
+                # \uN? - a signed 16-bit code point
+                try:
+                    cp = int(param)
+                    if cp < 0:
+                        cp += 65536
+                    out.append(chr(cp))
+                except (ValueError, OverflowError):
+                    pass
+                continue
+            if word in _RTF_LITERALS:
+                out.append(_RTF_LITERALS[word])
+                continue
+            if word in ('par', 'line', 'sect', 'page'):
+                out.append('\n')
+                continue
+            if word in _RTF_SKIP_DESTINATIONS:
+                skip_from = depth
+            continue
+
+        symbol = m.group('symbol')
+        if symbol in ('\\', '{', '}'):
+            out.append(symbol)
+        elif symbol in ('~', '_'):
+            out.append(' ' if symbol == '~' else '-')
+        elif symbol in ('\r', '\n'):
+            out.append('\n')
+        elif symbol == '*':
+            skip_from = depth
+
+    text = ''.join(out)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n\s*\n+', '\n', text)
+    return text.strip()[:50000], 'rtf', {'_encoding': encoding}
+
+
+def _flatten_plist(obj, prefix='', out=None, depth=0) -> list:
+    """
+    Flattens a parsed plist into `dotted.key: value` lines.
+
+    Dotted keys rather than indented lines, because a line of text carrying a
+    bare value is what gets chunked and embedded - the key has to travel with
+    the value or "Last Modified" cannot be connected to a date.
+    """
+    if out is None:
+        out = []
+    if depth > 12:
+        # A hostile or malformed plist can nest deeply enough to exhaust the
+        # stack; truncating is recoverable, a RecursionError is not.
+        out.append(f"{prefix}: <nesting limit reached>")
+        return out
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            _flatten_plist(value, child, out, depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        if not obj:
+            out.append(f"{prefix}:")
+        for index, value in enumerate(obj):
+            _flatten_plist(
+                value, f"{prefix}[{index}]", out, depth + 1)
+    elif isinstance(obj, (bytes, bytearray)):
+        out.append(f"{prefix}: <{len(obj)} bytes>")
+    else:
+        out.append(f"{prefix}: {obj}")
+    return out
+
+
+def _extract_plist(data: bytes) -> tuple:
+    """
+    Parses an Apple property list with plistlib (stdlib) and flattens it.
+
+    Binary plists are the norm in iOS artefacts, and their strings are
+    length-prefixed binary - a plain read yields fragments interleaved with
+    binary noise, so the text would embed but be full of garbage tokens.
+    """
+    try:
+        import plistlib
+        parsed = plistlib.loads(data)
+    except Exception:
+        # Not a well-formed plist. Read it as text anyway: plenty of files
+        # called .plist are hand-written or truncated XML, and a partial
+        # read beats refusing the file.
+        text, encoding = decode_text_bytes(data)
+        return text[:50000], 'text', {'_encoding': encoding}
+
+    lines = _flatten_plist(parsed)
+    return '\n'.join(lines)[:50000], 'plist', {}
+
+
+def _strip_ass_tags(text: str) -> str:
+    """Removes ASS/SSA override blocks ({...}) and \\N line breaks."""
+    text = re.sub(r'\{[^}]*\}', '', text)
+    return text.replace('\\N', ' ').replace('\\n', ' ').replace('\\h', ' ')
+
+
+def _extract_ass(raw: str) -> str:
+    """
+    Reads an Advanced SubStation file, honouring its declared field order.
+
+    The field order is not fixed: an ASS file declares it in
+    `[Events]`/`Format:`, and the text is wherever that line puts it. Reading
+    a Dialogue record positionally instead indexes the font name, the layer
+    and the effect string - plausible-looking text that means nothing.
+    """
+    out = []
+    fields = None
+    text_index = 9  # the spec's default position
+    in_events = False
+
+    for line in raw.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith('['):
+            in_events = stripped.lower().startswith('[events')
+            continue
+        if not in_events:
+            continue
+        head, _, rest = stripped.partition(':')
+        key = head.strip().lower()
+        if key == 'format':
+            fields = [f.strip().lower() for f in rest.split(',')]
+            if 'text' in fields:
+                text_index = fields.index('text')
+        elif key == 'dialogue' and fields:
+            # Text is the last field and may itself contain commas, so the
+            # split is bounded to len(fields) - 1 pieces.
+            parts = rest.split(',', len(fields) - 1)
+            if text_index < len(parts):
+                cue = _strip_ass_tags(parts[text_index].strip())
+                if cue:
+                    out.append(cue)
+
+    return '\n'.join(out)
+
+
+def _extract_cues(raw: str) -> str:
+    """
+    Reads SRT / WebVTT cues, keeping the start time with each line.
+
+    Cue text can span several lines, so the body is collected until the blank
+    line that ends the block rather than one line at a time - reading a cue
+    as a single line keeps one fragment per line and splits sentences.
+    """
+    lines = raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    out = []
+    index = 0
+
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if '-->' in stripped:
+            start = stripped.split('-->')[0].strip()
+            body = []
+            index += 1
+            while index < len(lines) and lines[index].strip():
+                body.append(lines[index].strip())
+                index += 1
+            cue = ' '.join(body)
+            if cue:
+                out.append(f"[{start}] {cue}")
+            continue
+
+        # Bare integers are SRT cue numbers, and the remaining bare keywords
+        # are VTT block headers. Neither carries evidence text.
+        if (stripped.isdigit()
+                or stripped.upper() in _SUBTITLE_HEADER_LINES
+                or stripped.split(':')[0].lower() in _SUBTITLE_META_KEYS):
+            index += 1
+            continue
+
+        if stripped:
+            out.append(stripped)
+        index += 1
+
+    return '\n'.join(out)
+
+
+_SUBTITLE_HEADER_LINES = {
+    'WEBVTT', 'NOTE', 'STYLE', 'REGION', 'END',
+}
+
+_SUBTITLE_META_KEYS = {'kind', 'language', 'voice'}
+
+
+def _extract_subtitle(data: bytes) -> tuple:
+    """
+    Extracts text from SRT / WebVTT / ASS subtitle and transcript files.
+
+    Interview and call recordings are routinely accompanied by a subtitle
+    file, and that transcript is evidence in its own right - often the only
+    searchable form of a recording whose audio transcribes poorly.
+    """
+    raw, encoding = decode_text_bytes(data)
+    if not raw:
+        return "", 'subtitle', {}
+
+    if re.search(r'^\s*\[events\]', raw, re.IGNORECASE | re.MULTILINE):
+        text = _extract_ass(raw)
+        extraction_type = 'subtitle_ass'
+    else:
+        text = _extract_cues(raw)
+        extraction_type = 'subtitle'
+
+    return text.strip()[:50000], extraction_type, {'_encoding': encoding}
+
+
 def extract_text_from_bytes(
         data: bytes,
         filename: str,
@@ -206,16 +532,41 @@ def extract_text_from_bytes(
         whisper_gpu: bool = True) -> tuple:
     """
     Extracts text from file bytes.
-    Returns (extracted_text, extraction_type)
-    Writes to temp file for libraries
-    that need a file path.
+
+    ALWAYS returns exactly 3 values:
+        (extracted_text, extraction_type, metadata_dict)
+
+    The third element is the EXIF/metadata dict; it is an empty dict for every
+    branch that has none.
+
+    **The arity is deliberately uniform.** It used to vary by branch - the PDF,
+    SQLite, HTML and RTF/plist/subtitle paths returned 2-tuples while the text
+    and image paths returned 3 - so a caller's unpack had to be written to
+    tolerate both. `ingestion.py` was not written that way, and the result was
+    `ValueError: too many values to unpack (expected 2)` on every plain-text
+    upload. It went unnoticed because the only branches reachable through the
+    document pipeline's multimedia path were images and archives, which
+    returned 3; the moment `.json`/`.log`/`.csv` became uploadable they did too.
+
+    A return value whose *shape* depends on which branch handled the file is a
+    defect waiting for a caller. Every branch below returns 3, and the
+    regression test asserts the arity is 3 for every advertised format.
+
+    Writes to temp file for libraries that need a file path.
 
     run_ocr / whisper_model / whisper_gpu come from the ingestion mode.
     They are keyword-only-with-defaults so every existing caller keeps
     working unchanged, but the 'fastest' profile now genuinely skips OCR
     instead of paying for it and throwing the text away.
     """
-    ext = os.path.splitext(filename.lower())[1]
+    # normalize_extension rather than os.path.splitext, so the extractor
+    # classifies a file the same way the upload gate and the time estimator
+    # do. The difference is not cosmetic: splitext reports '' for a dotfile
+    # (".env" is a hidden file, not an extension) and ".1" for a rotated log
+    # ("app.log.1"), so a .env routed here as unrecognised and a rotated log
+    # routed here as an unknown type. Both then returned 'unsupported' and
+    # indexed nothing.
+    ext = normalize_extension(filename)
 
     # PDF files — check before text
     if ext in PDF_EXTENSIONS:
@@ -229,9 +580,9 @@ def extract_text_from_bytes(
                 os.remove(tmp_path)
             except Exception:
                 pass
-            return (text[:50000] if text else ""), 'pdf'
+            return (text[:50000] if text else ""), 'pdf', {}
         except Exception:
-            return "", 'pdf'
+            return "", 'pdf', {}
 
     # SQLite databases — check before text
     if ext in DB_EXTENSIONS:
@@ -241,7 +592,7 @@ def extract_text_from_bytes(
                 data, filename, temp_dir)
             if browser_history:
                 return (browser_history,
-                        'browser_history')
+                        'browser_history', {})
 
             tmp_path = os.path.join(
                 temp_dir, f"tmp_{filename}")
@@ -278,10 +629,11 @@ def extract_text_from_bytes(
                 pass
             return (
                 '\n'.join(text_parts)[:50000],
-                'sqlite'
+                'sqlite',
+                {}
             )
         except Exception:
-            return "", 'sqlite'
+            return "", 'sqlite', {}
 
     # HTML files — check before text (.html is in both sets)
     if ext in HTML_EXTENSIONS:
@@ -289,9 +641,9 @@ def extract_text_from_bytes(
             soup = BeautifulSoup(data, 'lxml')
             text = soup.get_text(
                 separator=' ', strip=True)
-            return text[:50000], 'html'
+            return text[:50000], 'html', {}
         except Exception:
-            return "", 'html'
+            return "", 'html', {}
 
     # Image files — try OCR first,
     # then fall through to EXIF below
@@ -362,15 +714,28 @@ def extract_text_from_bytes(
                 pass
         return "", 'exif', {}
 
+    # RTF — a Word export that decodes to control-word noise,
+    # so it gets a real stripper rather than a raw read.
+    if ext in RTF_EXTENSIONS:
+        return _extract_rtf(data)
+
+    # Apple property lists — binary or XML, parsed with plistlib
+    # (stdlib) and flattened to searchable key/value text.
+    if ext in PLIST_EXTENSIONS:
+        return _extract_plist(data)
+
+    # Subtitles / transcripts. Cue timings are kept because a transcript's
+    # value is very often in the timing.
+    if ext in SUBTITLE_EXTENSIONS:
+        return _extract_subtitle(data)
+
     # Plain text files
-    # (txt, log, csv, json, py, js, md…)
+    # (txt, log, csv, json, py, js, md, yaml, sql…)
     if ext in TEXT_EXTENSIONS:
-        try:
-            text = data.decode(
-                'utf-8', errors='ignore')
-            return text[:50000], 'text', {}
-        except Exception:
+        text, encoding = decode_text_bytes(data)
+        if not text.strip():
             return "", 'text', {}
+        return text[:50000], 'text', {'_encoding': encoding}
 
     # Office documents, audio, video, email
     # Route to media_extractor module
@@ -969,18 +1334,12 @@ def extract_file_content(
             else:
                 stored_path = None
 
-        # Extract text — now returns 3-tuple
-        # (text, extraction_type, exif_dict)
-        result = extract_text_from_bytes(
+        # Extract text. Uniform 3-tuple: (text, extraction_type, metadata).
+        text, extraction_type, exif_dict = extract_text_from_bytes(
             data,
             file_entry["filename"],
             temp_dir
         )
-        if len(result) == 3:
-            text, extraction_type, exif_dict = result
-        else:
-            text, extraction_type = result
-            exif_dict = {}
 
         # If very high entropy and no text extracted,
         # mark the type clearly so analysts know.

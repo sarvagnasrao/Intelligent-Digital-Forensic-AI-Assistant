@@ -1664,3 +1664,137 @@ writes — the same phantom path the health page used to cite in B22.
 
 
 
+
+---
+
+## 19. The chatbot answered "I can't assist with that." — the prompt was 20× the context window
+
+**Reported as:** the investigator asked the assistant a plain question about the case and
+got a refusal. Re-asking changed nothing. Reported as "the chatbot has errors".
+
+**It was not a chatbot error.** Retrieval, Ollama, the model and auth were all healthy and
+all answered `200`. The prompt was being silently thrown away.
+
+### What was actually happening
+
+`run_rag_query` retrieved `top_k=7` chunks and concatenated them in full. Ingestion chunks
+are sized in **characters** — 30,000 for the `fastest` profile, 20,000 for `normal` — so the
+prompt was **212,815 characters**. Ollama reports how much of it was consumed:
+
+```
+level=WARN source=runner.go:153 msg="truncating input prompt" limit=4096 prompt=80311 keep=5 new=4096
+```
+
+`prompt=80311` is a **token** count (calibrated: 20,000 chars → 4,025 tok, 40,000 → 8,025,
+80,000 → 16,025, i.e. ~5 chars/token on synthetic text). The window is **4,096**. So the
+prompt was **~20× the entire context window**.
+
+`keep=5` is the part that matters. Ollama kept the **first 5 tokens** and the **last 4,091**.
+The first 5 are the start of `"Evidence Excerpts:"`. The last 4,091 are the tail of the
+entity graph and the closing question. **Every one of the seven evidence excerpts was
+discarded.** The model was asked to be specific about a suspect's email and phone number
+with no evidence in front of it, so it declined to invent one. It was, in effect, correct.
+
+The sources footer was then appended underneath, so the exchange read as answered.
+
+Proven directly, same evidence, same model, same question:
+
+| | `prompt_eval_count` | Result |
+|---|---|---|
+| **Before** — assembled whole | **4096 / 4096** (saturated) | `I can't assist with that.` |
+| **After** — budgeted to fit | 2,894 / 4,096 | Named Yuki Tanaka's address, the `darknode.io` campaign date, the `$6,177,459` transfer |
+
+### ✅ FIXED B26. Nothing measured the prompt against the window
+
+**Four changes, in `ollama_client.py` and `rag_engine.py`.**
+
+**1. The runtime window, not the trained one.** Two different numbers exist and conflating
+them is the whole bug:
+
+| source | value | what it is |
+|---|---|---|
+| `/api/show` → `llama.context_length` | 131072 | the length the model was **trained** at |
+| `/api/ps` → `context_length` | **4096** | the length Ollama is **serving** it with |
+
+Only the second bounds a prompt. `effective_context_tokens()` reads `/api/ps`, caches 30 s,
+and falls back to a new `ollama_num_ctx` setting. Budgeting against `/api/show` over-estimates
+the real window by **32×**.
+
+**2. The prompt is built to a budget, spent per excerpt.** `build_prompt()` divides the
+allowance across all seven chunks rather than handing it to the first or trimming the
+assembled string from the end — `top_k` exists so different chunks cover different parts of
+the question, and either shortcut answers a narrower question than retrieval just answered.
+Every trimmed excerpt carries a visible `[… N characters …]` marker, because a silent slice
+leaves the model unable to distinguish omitted evidence from absent evidence.
+
+Three classes of text, treated differently:
+
+- **protected** — the question, the conversation memory, the closing instruction. Measured
+  first, never trimmed.
+- **yields** — the entity graph, capped at ¼ of the remainder. It is a ranked list, so a
+  truncated one is still a useful one.
+- **shared** — the excerpts, evenly.
+
+> **Trap, hit while writing this.** The first draft clamped the *assembled* prompt. But
+> `_elide()` keeps the **front**, and the question sits at the **back** — so the clamp
+> answered a different question than the one asked, which is the same failure as overflowing
+> it, only quieter. `verify_prompt_budget.py` G8/G9 guard it.
+
+**3. The estimate is checked against ground truth.** Ollama 0.17 has **no `/api/tokenize`**
+(404) and `/api/embed` caps at 4,095, so an exact count is not obtainable for a long text
+without generating. `CHARS_PER_TOKEN = 2.4` is therefore a *deliberately biased* estimate:
+
+| text | chars/token |
+|---|---|
+| `SYSTEM_PROMPT` prose | 4.52 |
+| dense log/dump evidence | 2.65 |
+| assembled 7-excerpt prompt | 2.53 |
+
+The estimate is `chars / C`, so it over-counts tokens only when `C` is **below** the real
+ratio. **2.4 is below the densest measurement, on purpose:** over-estimating wastes a little
+window, under-estimating overflows *silently*. Then `prompt_eval_count` — Ollama's own count,
+returned with every response — is checked against the window, and if it came back saturated
+the evidence allowance is halved and the call is retried once. A wrong ratio degrades into
+one extra fast retry, never into a discarded prompt.
+
+**4. A refusal is a missing answer, not a wrong one.** `is_refusal()` matches the opening of
+the reply and `process_response` replaces it with the real diagnosis instead of filing it as
+a response. The old "try rephrasing your question" advice stays gone — no rewording fixes a
+context window. The replacement names the capacity limit and tells the investigator to narrow
+to one entity or one artefact. It matches the **head** only: a model that declines and then
+waffles is still declining, while a legitimate answer that happens to contain the phrase later
+is not (guarded by E4).
+
+The API now returns `prompt_stats` and `refused`, and the transcript renders the caveat as a
+distinct block — a limit on the evidence behind a finding must not read in the same voice as
+the finding. `EVIDENCE_NOTE_MARKER` in `rag_engine.py` and `EVIDENCE_CAVEAT_MARKER` in
+`InvestigatePage.jsx` are the same string and **must be changed together**: the backend writes
+it, the frontend splits on it.
+
+### Verification — `tests/verify_prompt_budget.py` (52 assertions, pure, no network)
+
+A–H: runtime window is not the trained length · the 212k prompt no longer fits · the graph
+survives · all seven excerpts are represented and each marked as trimmed · shares are even ·
+elision is announced and inside its reserved allowance · the production refusal is caught and
+alternate phrasings too, while two realistic answers are **not** misread as refusals ·
+`CHARS_PER_TOKEN` is on the safe side of the densest measurement · zero-chunk, history and
+oversized-graph paths keep the question verbatim.
+
+**Full gate, servers stopped: 386 assertions across eleven scripts, 0 failures**
+(39 + 17 + 17 + 15 + 9 + 59 + 192 + 51 + 15 + 52). `npm run build` clean.
+`verify_gpu_telemetry` reports 14 failures on this box — every one is
+`NVML library not found`, an NVIDIA suite on an Apple M1. Pre-existing and unrelated; its 33
+null-vs-zero assertions pass.
+
+### Still open — the real quality ceiling
+
+The chunks are **30,000 characters ≈ 10,000 tokens**, roughly three times the entire usable
+prompt budget. Retrieval is finding the right passages and the budgeter is now showing a
+usable slice of each, but only ~370 characters of each 30,000 reach the model, so answers
+are visibly hedged and can miss a fact that sits just past the cut.
+
+Smaller chunks would fix that, and §13 already establishes that changing chunk size **does not**
+change dimensionality (384-dim, `VECTOR_SIZE`) so existing collections stay valid. It does
+mean a **re-index** to benefit, which is a decision, not a bug fix, and is deliberately not
+made here. `ingestion_modes.py` is the single source of truth for chunk size, so the change is
+one table edit plus a re-ingest.

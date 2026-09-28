@@ -128,6 +128,13 @@ export const uploadEvidence = (caseId, formData) =>
     { headers: { 'Content-Type': 'multipart/form-data' } }
   )
 
+export const uploadMultiEvidence = (caseId, formData) =>
+  api.post(
+    `/cases/${caseId}/evidence/upload_multi`,
+    formData,
+    { headers: { 'Content-Type': 'multipart/form-data' } }
+  )
+
 export const getEvidenceItem = (caseId, evidenceId) =>
   api.get(`/cases/${caseId}/evidence/${evidenceId}`)
 
@@ -136,6 +143,13 @@ export const archiveEvidence = (caseId, evidenceId) =>
 
 export const verifyEvidence = (caseId, evidenceId) =>
   api.post(`/cases/${caseId}/evidence/${evidenceId}/verify`)
+
+// Accepted evidence formats, served by the backend rather than restated here.
+// The upload dialog's `accept` attribute has to agree with the server's gate;
+// when both were hand-maintained they drifted, and a format the server
+// accepted was hidden by the native file picker.
+export const getEvidenceFormats = () =>
+  api.get('/evidence/formats')
 
 // Queries
 export const getQueries = (caseId, params = {}) =>

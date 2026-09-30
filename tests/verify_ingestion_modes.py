@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.database import SessionLocal, engine
 from backend import models
 from backend.modules.ingestion_modes import resolve_mode_for_device, MODES
+from backend.modules.text_parser import chunk_text
 from backend.modules.resource_governor import ResourceGovernor
 from backend.ingestion import run_ingestion_with_progress
 
@@ -228,12 +229,47 @@ def main():
     # The chunk counts must be consistent with the configured chunk sizes,
     # which is what proves the mode actually reached the pipeline rather than
     # being stored on the row and then ignored.
+    #
+    # `chunk_text` advances by `chunk_size - overlap`, not by `chunk_size`,
+    # so the count is ceil(len / stride) and NOT ceil(len / chunk_size). This
+    # assertion used to be the latter, and it was wrong the moment two profiles
+    # gained an overlap: `normal` correctly produced 11 chunks where the old
+    # formula demanded 10. Overlap is not a rounding artefact, it is what stops
+    # a fact spanning a boundary from being lost, so the product was right and
+    # the test was the thing that had to move.
+    #
+    # Deriving it from the real stride also makes it stricter than before, not
+    # looser. The old formula could not tell "chunk_size arrived but overlap
+    # was dropped" from success, because it ignored overlap completely.
     for key, mode_key in (("fastest", "fastest"), ("normal", "normal"),
                           ("accurate", "accurate")):
         cs = MODES[mode_key]["chunk_size"]
-        expect = -(-len(BODY) // cs)          # ceil
+        ov = MODES[mode_key].get("chunk_overlap", 0) or 0
+
+        # overlap >= chunk_size would make the stride non-positive, and
+        # `chunk_text` would then never advance and loop for ever. Asserted
+        # rather than divided by, so the failure names the cause.
+        check(f"{mode_key}: overlap is smaller than the chunk size",
+              0 <= ov < cs, f"chunk_size={cs} overlap={ov}")
+
+        stride = cs - ov
+        expect = -(-len(BODY) // stride)      # ceil
         got = results[key]["chunks"]
-        check(f"{mode_key}: chunk count matches chunk_size {cs}",
+
+        # chunk_text also drops any chunk whose stripped length is <= 20, which
+        # would make exact equality wrong for a reason that has nothing to do
+        # with the configured size. Measured rather than assumed: on this BODY
+        # the filter never fires, so the loop count really is the chunk count.
+        # If BODY is ever changed to end in whitespace this starts failing and
+        # says why, instead of the equality silently becoming a coincidence.
+        raw_loop = chunk_text(BODY, chunk_size=cs, overlap=ov)
+        check(f"{mode_key}: the >20-char trim is not what sets the count",
+              len(raw_loop) == expect,
+              f"chunker returned {len(raw_loop)}, stride arithmetic says "
+              f"{expect} — the assertion below is only exact while these agree")
+
+        check(f"{mode_key}: chunk count matches chunk_size {cs} "
+              f"stride {stride}",
               got == expect, f"expected {expect}, got {got}")
 
     # ── A failed index must never read as a successful one ────────────────

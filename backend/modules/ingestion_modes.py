@@ -45,6 +45,17 @@ from backend.modules.hardware_probe import get_hardware_spec
 #
 #   chunk_size      characters per chunk fed to the vector store. Larger =
 #                  fewer chunks to embed (faster) but coarser retrieval.
+#                  THIS IS THE DOMINANT ACCURACY LEVER, and it was set far
+#                  too high for a long time. A query retrieves whole chunks
+#                  and then trims them to the prompt budget, so what reaches
+#                  the model is the budget divided by chunk_size - not the
+#                  chunk. At 20,000 chars against a 16,384-token window only
+#                  ~26% of each retrieved chunk survives the trim (measured
+#                  for 468c78f3: 299 chunks). Halving chunk_size roughly
+#                  doubles the evidence per answer; it costs only embedding
+#                  time, because dimensionality is fixed at 384-dim and
+#                  therefore existing collections stay VALID. Benefit still
+#                  requires a re-ingest, so sizes were cut once, together.
 #   chunk_overlap   characters repeated between adjacent chunks so a
 #                  sentence spanning a boundary is still retrievable.
 #   embed_batch     chunks per embedding round-trip. Larger = better
@@ -71,7 +82,7 @@ MODES: Dict[str, Dict[str, Any]] = {
         ),
         "accuracy": "Lowest",
         "speed": "Fastest",
-        "chunk_size": 30000,
+        "chunk_size": 12000,
         "chunk_overlap": 0,
         "embed_batch": 256,
         "ocr": False,
@@ -91,8 +102,8 @@ MODES: Dict[str, Dict[str, Any]] = {
         ),
         "accuracy": "Balanced",
         "speed": "Balanced",
-        "chunk_size": 20000,
-        "chunk_overlap": 0,
+        "chunk_size": 6000,
+        "chunk_overlap": 200,
         "embed_batch": 128,
         "ocr": True,
         "whisper_model": "base",
@@ -112,8 +123,8 @@ MODES: Dict[str, Dict[str, Any]] = {
         ),
         "accuracy": "Highest",
         "speed": "Slowest",
-        "chunk_size": 8000,
-        "chunk_overlap": 400,
+        "chunk_size": 3000,
+        "chunk_overlap": 300,
         "embed_batch": 64,
         "ocr": True,
         "whisper_model": "small",
@@ -128,10 +139,14 @@ DEFAULT_MODE = "normal"
 # Rough multipliers against the per-megabyte baseline in time_estimator.
 # These are calibrated against the bundled model sizes rather than measured
 # per-device, so they stay stable when the machine changes.
+# Scaled when the chunk sizes were cut (§ see the chunk_size note above):
+# a 3.3x smaller chunk means ~3.3x more chunks to embed, so the prior has to
+# admit it or the queue quotes a duration it cannot deliver. Ordering and the
+# fastest<1.0 / accurate>1.0 shape are preserved.
 MODE_TIME_FACTOR: Dict[str, float] = {
-    "fastest": 0.55,
-    "normal": 1.0,
-    "accurate": 2.6,
+    "fastest": 0.85,
+    "normal": 1.5,
+    "accurate": 3.6,
 }
 
 

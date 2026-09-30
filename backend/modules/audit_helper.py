@@ -28,6 +28,7 @@ SEVERITY_MAP = {
     "PASSWORD_CHANGED":    "warning",
     "PASSWORD_RESET_BY_ADMIN": "warning",
     "EVIDENCE_ARCHIVED":   "warning",
+    "EVIDENCE_RESTORED":   "info",
     "CASE_CLOSED":         "warning",
     "ENTITY_FLAGGED":      "warning",
     "QUERY_FLAGGED":       "warning",

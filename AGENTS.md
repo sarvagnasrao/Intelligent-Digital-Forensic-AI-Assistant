@@ -4,13 +4,38 @@
 > **Rule:** read this file *before* changing code. It records verified state, known bugs, and traps that are not
 > derivable from the code itself.
 >
-> Last verified against: `main3` @ the §18 commit (2026-09-27) —
+> Last verified against: `main3` @ the §23 commit (2026-09-30) —
 > §13 covers the ingestion rework, §14 the live end-to-end run and the three
 > further bugs it found (B10/B11/B12), **§15 the stop button, per-case
 > Qdrant isolation and the optional-dependency trap (B13/B14/B15)**,
-> §16/§17 the telemetry and per-job controls, and **§18 the honesty pass
-> (B20–B23): the silent AI, real system health, live ETA and durable prompts**.
+> §16/§17 the telemetry and per-job controls, **§18 the honesty pass
+> (B20–B25)**, **§19 the RAG prompt budget (B26)**, **§20 the context
+> window, which was a reporting-only knob and never a control (B27)**, and
+> **§21 a health probe that reported 0 indexes for indexed cases (B28)**, and
+> **§23 an Archive button that worked perfectly and did nothing (B29)**.
 > See §6 and §12 for the forensic-image fixes.
+>
+> **Read §20 before touching `ollama_client`.** The window is now *sent* on every request.
+> `ollama_num_ctx` was a number that only fed the budget arithmetic, so raising it in `.env`
+> made the app budget against a window Ollama had never agreed to — the B26 failure,
+> re-armed by the obvious remedy. Two independent guards now watch the result.
+>
+> **Read §23 before writing an assertion that observes a request, and before
+> adding a cache.** Two traps there are about the *checking* and the *caching*
+> rather than the product: a capture that kept only the **last** request, so the
+> guard read a `/api/show` probe instead of the `/api/generate` under test and
+> passed only while a cache was warm; and a cache sentinel of `0.0` compared
+> against `time.monotonic()`, whose origin is arbitrary and small on some
+> platforms. Both were correct code with a wrong witness.
+>
+> **Read §21 before trusting any test gate, and before adding a `reason` string to
+> `service_health.py`.** Two traps there are about *the checking*, not the checked: a summary
+> parser that reported 0 failures for a suite with 15, and a field and its sentence
+> disagreeing because they read different variables. A gate that reads "0" for a script which
+> did not pass converts a red suite green — which is the one outcome this file exists to stop.
+>
+> **§22 is three habits, and it is the shortest useful section here.** Every bug in the list
+> above shares one cause: verification that reported success without measuring anything.
 
 ---
 
@@ -457,22 +482,27 @@ mocks. Each prints `PASS`/`FAIL` per assertion and exits non-zero on failure.
 See `tests/README.md` for details.
 
 ```bash
-PYTHONPATH=. python tests/verify_ingestion_modes.py   # 39 assertions, ~15 s
-PYTHONPATH=. python tests/verify_ws_progress.py       # 15 assertions, ~10 s
+PYTHONPATH=. python tests/verify_ingestion_modes.py    #  39 assertions, ~15 s
+PYTHONPATH=. python tests/verify_ws_progress.py        #  15 assertions, ~10 s
 PYTHONPATH=. python -W error::RuntimeWarning \
                     tests/verify_ws_progress.py       # also catches coroutine leaks
-PYTHONPATH=. python tests/verify_queue_api.py         # 51 assertions, ~5 s
-PYTHONPATH=. python tests/verify_job_stop.py          # 17 assertions, ~20 s
-PYTHONPATH=. python tests/verify_forensic_failure.py  # 15 assertions, ~30 s
-PYTHONPATH=. python tests/verify_vector_store.py      # 17 assertions, ~10 s
-PYTHONPATH=. python tests/verify_cpu_sampler.py       #  9 assertions, ~10 s
-PYTHONPATH=. python tests/verify_gpu_telemetry.py     # 171 assertions, ~20 s
-PYTHONPATH=. python tests/verify_live_stack.py        # 26 assertions, ~90 s
+PYTHONPATH=. python tests/verify_queue_api.py          #  51 assertions, ~5 s
+PYTHONPATH=. python tests/verify_job_stop.py           #  17 assertions, ~20 s
+PYTHONPATH=. python tests/verify_forensic_failure.py   #  15 assertions, ~30 s
+PYTHONPATH=. python tests/verify_vector_store.py       #  17 assertions, ~10 s
+PYTHONPATH=. python tests/verify_cpu_sampler.py        #   9 assertions, ~10 s
+PYTHONPATH=. python tests/verify_gpu_telemetry.py      # 171 assertions, ~20 s
+PYTHONPATH=. python tests/verify_eta.py                #  59 assertions, ~10 s
+PYTHONPATH=. python tests/verify_file_formats.py       # 153 assertions, ~15 s
+PYTHONPATH=. python tests/verify_prompt_budget.py      #  85 assertions, ~30 s
+PYTHONPATH=. python tests/verify_service_health.py     # 209 assertions, ~40 s
+PYTHONPATH=. python tests/verify_evidence_archive.py   #  38 assertions, ~15 s
+PYTHONPATH=. python tests/verify_live_stack.py         #  26 assertions, ~90 s
 ```
 
 Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
 
-The first **eight** are self-contained; **334 assertions total**. `verify_live_stack.py`
+The first **fourteen** are self-contained; **878 assertions total**. `verify_live_stack.py`
 is the exception — it needs `ollama serve`, uvicorn on `:8000` and Vite on
 `:3000` already running, and it is the only one that crosses a real socket
 (see §14). All of them clean up every row and per-case Qdrant directory they
@@ -1771,7 +1801,7 @@ the finding. `EVIDENCE_NOTE_MARKER` in `rag_engine.py` and `EVIDENCE_CAVEAT_MARK
 `InvestigatePage.jsx` are the same string and **must be changed together**: the backend writes
 it, the frontend splits on it.
 
-### Verification — `tests/verify_prompt_budget.py` (52 assertions, pure, no network)
+### Verification — `tests/verify_prompt_budget.py` (84 assertions)
 
 A–H: runtime window is not the trained length · the 212k prompt no longer fits · the graph
 survives · all seven excerpts are represented and each marked as trimmed · shares are even ·
@@ -1780,11 +1810,19 @@ alternate phrasings too, while two realistic answers are **not** misread as refu
 `CHARS_PER_TOKEN` is on the safe side of the densest measurement · zero-chunk, history and
 oversized-graph paths keep the question verbatim.
 
-**Full gate, servers stopped: 386 assertions across eleven scripts, 0 failures**
-(39 + 17 + 17 + 15 + 9 + 59 + 192 + 51 + 15 + 52). `npm run build` clean.
-`verify_gpu_telemetry` reports 14 failures on this box — every one is
-`NVML library not found`, an NVIDIA suite on an Apple M1. Pre-existing and unrelated; its 33
-null-vs-zero assertions pass.
+I: the transport clamp for the four call sites that assemble a prompt by hand. **J, K added in
+§20**: the window is on the wire and the diagnostic reports it. Section J is the only place
+the transport contract is observable, and **K is the one section that touches the network** —
+`ollama_diagnostic()` reads `/api/tags`, `/api/show` and `/api/ps` for real, because the claim
+under test is what an *operator* can see, and asserting that against a stub would only prove
+the stub was called.
+
+**Full gate, servers stopped: see §20 for the current total.** `npm run build` clean.
+`verify_gpu_telemetry` reports 14 failures on an Apple M1 — every one is
+`NVML library not found`, an NVIDIA suite on a machine with no NVIDIA driver. Pre-existing and
+unrelated; its null-vs-zero assertions pass. **Do not port that claim to a box that has an
+NVIDIA card** — this repository's dev machine is a Windows host with a GTX 1050 Ti, where the
+NVML path is live and those 14 assertions pass.
 
 ### Still open — the real quality ceiling
 
@@ -1798,3 +1836,555 @@ change dimensionality (384-dim, `VECTOR_SIZE`) so existing collections stay vali
 mean a **re-index** to benefit, which is a decision, not a bug fix, and is deliberately not
 made here. `ingestion_modes.py` is the single source of truth for chunk size, so the change is
 one table edit plus a re-ingest.
+
+**Partly resolved in §20** — raising the served window recovered 5.4× of that headroom without
+the re-index. The chunk-size half remains open.
+
+---
+
+## 20. The context window was a reporting-only knob (B27)
+
+§19 fixed the *symptom* — a 212,000-character prompt overflowing a 4,096-token model. It did
+not fix the **window**, which is what made the overflow inevitable. B27 is the same defect shape
+as B8 (a hardcoded 8 GB RAM floor that consulted nothing about the machine), one layer up and
+in the direction of a capability rather than a resource.
+
+**Reported as:** the chatbot is "not working properly". It was not broken. It was correct, and
+correctly unable to answer.
+
+### ✅ FIXED B27. `ollama_num_ctx` never reached Ollama
+
+```python
+"options": {"temperature": 0.1, "num_predict": settings.ollama_num_predict}
+```
+
+No `num_ctx`. So the window was **whatever Ollama's own default happened to be** — 4,096 for
+`llama3.2:3b`, a model **trained for 131,072**. Measured on this box:
+
+| request | `prompt_eval_count` |
+|---|---|
+| as the app sent it | **4,096** — clamped |
+| with `num_ctx: 16384` | **10,044** — window genuinely raised |
+
+`ollama_num_ctx: int = 4096` in `dependencies.py` fed the **budget arithmetic only**. It was
+never a control. That is the dangerous part, and the reason this was not fixed by editing
+`.env`:
+
+> **Setting `OLLAMA_NUM_CTX=32768` — the obvious remedy, and the natural first thing anyone
+> would try — would have made things *silently worse*.** The app would budget a 32k prompt,
+> Ollama would keep serving 4,096, and the evidence would be discarded exactly as in B26 — but
+> now the saturation check compared `prompt_eval_count` against a limit **the app had invented
+> rather than one Ollama had agreed to**, so the app would report no overflow. A knob that
+> only feeds the arithmetic is a lie dressed as a setting.
+
+**Fixed by making it a real control**, in four parts:
+
+- `model_context_limit()` — the model's trained capability, read from `/api/show`. Both
+  shapes are read (`llama.context_length` and `model_info.<arch>.context_length`) because
+  builds differ, and it returns **`None` when unreadable, never 0** (§16: a 0 limit would
+  clamp every request to nothing while looking like a working number).
+- `requested_context_tokens()` — `min(configured, capability)`, floored at 1,024. This is what
+  goes **on the wire** as `options.num_ctx`.
+- `effective_context_tokens()` — `/api/ps` still wins when it reports a real value; otherwise
+  the requested value, which is now the honest answer *because* the request is what governs.
+- `prompt_budget_tokens()` — unchanged, but now sized against a window Ollama has agreed to.
+  **2,816 → 15,104 tokens: 5.4× more evidence per answer, no re-index.**
+
+### 🔴 TRAP 6 — `/api/ps` does not report the window on this build, so the "live" path is dead
+
+```
+/api/ps details keys: ['families','family','format','parameter_size',
+                       'parent_model','quantization_level']
+```
+
+No `context_length`. §19's "prefers the live value" therefore **never fires here** and fell
+back to the hardcoded 4,096 on every query. The capability *is* readable — from `/api/show`,
+where it correctly returns **131,072**. So the measurement the code preferred was on the
+endpoint that does not carry it, and the endpoint that does carry it was not consulted.
+
+**Generalisable:** when two sources disagree about which one is authoritative, check that the
+authoritative one actually *has the field* before trusting it over the other. A probe that
+always returns `None` and a silent fallback look identical from the call site.
+
+### 🔴 TRAP 7 — a second, independent truncation guard, because the first one had a blind spot
+
+The existing check was `prompt_eval_count >= limit - 2` — *did we fill the window we asked
+for*. With `num_ctx` now sent, that is correct, since the served window equals the request.
+But had it stayed as the **only** guard, a window smaller than we believe we have would pass
+silently: `eval_count` hits the smaller real ceiling, which sits comfortably below `limit`, and
+saturation stays `False`. That is precisely B26's mechanism, so a second guard was added:
+
+> **Saturation asks "did we fill the window we asked for". Truncation asks "did Ollama read
+> most of what we sent".** They fail differently, which is the only reason both are needed.
+
+```python
+lost_most = eval_count < estimated_tokens * _TRUNCATION_LOSS_RATIO   # 0.5
+```
+
+**The ratio is deliberately insensitive, and the bias in §19 is why.** `CHARS_PER_TOKEN` is
+set *below* the densest measured ratio, so `estimated` over-states the true count on prose by
+up to ~1.9×. `eval_count < estimated` is therefore **normal and means nothing** — a naive
+`<` would flag every prose query as truncated. Only losing more than half the prompt is
+unambiguous, and half is the case that matters: B26 lost 95% and it arrived looking successful.
+
+> If this is ever "simplified" to `eval_count < estimated`, it will fire on essentially every
+> query, and the obvious response will be to delete it.
+
+### A test bug worth recording
+
+`verify_prompt_budget.py` H1 asserted `estimated_tokens < 4096`. That passed for the wrong
+reason the moment the window was corrected: the *property* (the prompt fits the window it will
+be served with) was still true, but the **literal** was now a statement about one machine on
+one day. Rewritten to assert `<= prompt_budget_tokens()` and given a second assertion that the
+window is genuinely above 4,096 — because a test that only checks the prompt fits will happily
+pass against a fictional window.
+
+Same lesson as §17's `ram_floor_max_mb` assertion: **a constant that encodes a device fact will
+either rot or pass for the wrong reason.** Assert the relationship, never the number.
+
+New section **J** (7 assertions) guards the transport contract — `num_ctx` on the wire, the
+wire value equals the clamped value, budget and request derived from the same number, and all
+three truncation cases. These are the assertions that fail on the old code; asserting the
+arithmetic alone would have passed throughout. §15's lesson: *Stop was correctly wired end to
+end and still useless* — the wire is the only place this is observable.
+
+**76 assertions, 0 failures** in `verify_prompt_budget.py` (up from 66).
+
+### Also found while diagnosing: the corpus was empty
+
+Worth recording because it cost more time than the bug did. The case being questioned held
+three synthetic benchmark files, a README and a **truncated** disk image (§6 B1) — no real
+evidence at all. The chatbot was asked for a suspect's email address that existed nowhere on
+disk and it correctly said so, then recommended examining the email logs.
+
+> **A refusal is only a bug when the evidence is there.** Check what is actually indexed before
+> concluding the model is at fault. `seed_demo.py` creates cases and entity rows but **no
+> evidence files**, so a fresh install has nothing for retrieval to find and every demo case
+> looks identical: empty.
+
+### Verification
+
+```bash
+PYTHONPATH=. python tests/verify_prompt_budget.py   # 84 assertions, ~30 s
+```
+
+Confirmed live over the API, against a case with **299 chunks / 978 entities** indexed (6.3 MB
+of generated evidence — the corpus was empty before, which is the other half of this bug):
+
+| | before | after |
+|---|---|---|
+| served window | 4,096 (Ollama's own default) | **16,384** (requested, honoured) |
+| prompt budget | 2,816 | **15,104** |
+| `prompt_eval_count` | 4,096 / 4,096 **saturated** | **13,322 / 16,384** |
+
+The same question — name the suspect behind the darknode.io campaign, their email and phone,
+who they spoke to, what moved — answered *"the evidence does not contain the suspect's email
+address or phone number"* before, and names the suspect, five contacts with phone numbers,
+seven transfers and a next step after. 165 s, since a 13k-token prefill on CPU is not free.
+
+> **A caution about oracles.** The first proof script had a column "did the model see the
+> fact?". It answered `no`, then `YES`, for the *same* clamped request across two runs — a 32
+> token completion is sampling noise, not a measurement. A column that flips on a rerun is not
+> evidence, and the fix would have been justified with it. Only `prompt_eval_count` carries
+> weight here, which is the same reason TRAP 7's ratio is coarse.
+
+---
+
+## 21. A health probe reported 0 indexes for cases that were indexed (B28)
+
+Found by running the §20 gate, and by a bug in the gate itself.
+
+### 🔴 TRAP 8 — the gate reported 0 failures for a suite with 15 failures
+
+`verify_service_health.py` prints `PASSED: 177    FAILED: 15`. The gate script matched
+`'\d+\s+(passed|assertions)'` first, fell through to `Select-Object -Last 1` on a loose
+`PASSED|FAILED` pattern, and therefore captured a **`FAILED: <description>` line** — the list of
+failures, not the summary. `[int]` on an empty match is `0`, so the suite printed:
+
+```
+ok    verify_service_health.py                  0 passed    0 failed
+```
+
+and the run came out **630 passed, 0 failed** while hiding 15 failures.
+
+> **A gate that reads 0 for a script which did not pass is worse than no gate: it converts a red
+> suite green.** Same defect class as everything else in this file, in the one tool whose entire
+> job is to not do that. The parser now matches both formats explicitly, and a script whose
+> counts are unreadable — or that exits non-zero having reported zero failures — **fails the
+> gate**. The `??` and `ERR` states are not cosmetic; they exist so a future format change is
+> loud.
+
+I had already written "0 failures" into a status report before noticing. The lesson is not
+"check the numbers", it is that a summariser is a program and has to be tested like one.
+
+### ✅ FIXED B28. The probe counted indexes in the wrong tree
+
+`probe_vector_store(cases_dir)` listed **the directory it was handed**, then asked
+`case_qdrant_path()` where each index was. But that function takes only a `case_id` and resolves
+against **global settings**, because that is where the writer looks:
+
+```python
+def case_qdrant_path(case_id): return os.path.join(resolve_qdrant_dir(), case_id, "qdrant")
+```
+
+and `resolve_qdrant_dir()` relocates the whole store when the cases directory is on a slow
+disk. On this box (D: 7200 RPM) it returns `C:\Users\Anon\AppData\Local\IDFA\qdrant` while the
+probe was walking `D:\...\data\cases`. **Two different trees, so zero matches**, and the
+detail string reported a measured zero:
+
+> `0 of 2 case directories hold a Qdrant index; 0.0 MB total`
+
+The consequence is not cosmetic — it is §15's failure mode rebuilt, from the filesystem side.
+Every **reader** resolves through `case_qdrant_path()`, and `get_client()` *creates* whatever
+directory it is handed:
+
+```python
+os.makedirs(key, exist_ok=True)
+client = QdrantClient(path=key)
+```
+
+So a case indexed only in-cases does not merely look untidy — on the next query it gets a
+**brand new, empty** collection and returns nothing at all. Fully indexed, yet searchable as
+though it were empty, and an investigator concludes the evidence was clean. That is why the
+probe's reason says those cases *will return no results* rather than calling the layout
+untidy, and why the state is `error` rather than a warning.
+
+### Verified live on this box, not assumed
+
+| | |
+|---|---|
+| relocation | **active** — `[QDRANT] cases dir is on a rotating disk (D:); putting the vector index on the faster C: disk` |
+| `migrate_qdrant_layout()` | runs at **startup** (`main.py:31`, import time) |
+| `data\cases` | 63 case dirs |
+| `C:\Users\Anon\AppData\Local\IDFA\qdrant` | 38 case dirs — a **split**, so the un-migrated state is live here, not hypothetical |
+
+**An index has two legitimate homes, and both are now checked:**
+
+| | location | when |
+|---|---|---|
+| in-cases | `<cases_dir>/<case_id>/qdrant` | all-SSD box, or pre-migration |
+| canonical | `resolve_qdrant_dir()/<case_id>/qdrant` | slow cases disk, post-migration |
+
+A case counts if **either** exists. Three states are named rather than summed into one number:
+
+- **un-migrated** — indexed beside its case. Measured, disclosed, and *degraded*, because the
+  index is real and the layout disagrees with the writer.
+- **duplicated** — indexed in **both**. `migrate_qdrant_layout()` explicitly refuses to
+  overwrite an existing destination, so this state can genuinely occur, and it is reported
+  rather than collapsed. The size counts the canonical copy only; summing two copies of one
+  index would double it.
+- **resolver fault** — if `case_qdrant_path()` raises, the in-cases location is still
+  checked, so a resolver fault cannot degrade into "no index here".
+
+### 🔴 TRAP 9 — "not applicable" must agree with the sentence that states it
+
+My first attempt reported the split as `None` for any directory that is not the configured
+root — correct reasoning, and it **still failed 4 assertions**, because the two halves read
+different variables:
+
+```python
+out["unmigrated_collections"] = None   # honest: this tree is not ours
+...
+if unmigrated:                          # the raw local: 1
+    reasons.append("1 case index/indices still sit inside ...")
+```
+
+So one response said `unmigrated_collections: None` and `"1 case index/indices still sit"`
+in the same breath, for the same tree. **A field and the sentence beside it must come from one
+decision, or the sentence is the field's worst version.** Fixed by clearing the locals in the
+same branch, and pinned by an assertion that reads both.
+
+> Generalisable to every `reason` string in `service_health.py`: a reason computed from
+> pre-normalisation state will eventually disagree with the normalised value it describes.
+
+Also: for a non-configured directory the split is **`None`, not `0`**. Zero would be a claim
+that this tree is fully migrated, and for a tree that is not the real one the claim means
+nothing (§16, fifth occurrence in this file).
+
+### The test bug, and the discriminating-fixture rule
+
+New section **E2**, twelve assertions. It has to pin **three** things — the directory probed,
+the configured root, and the resolver the writer consults — because patching only the first
+makes the migration split structurally unobservable, which is exactly how the first fix attempt
+passed its own tests while being wrong.
+
+**Verified discriminating, not merely accompanying:** with the probe reverted to its pre-fix
+logic the suite fails **22** assertions; restored, it passes **209**. A new guard that passes
+on the old code proves nothing.
+
+> A fixture must be able to *fail* if the fix is reverted. A test written alongside the fix,
+> never run against the broken version, is a description of the fix rather than a check on it.
+
+`verify_service_health.py` 177 → **209**.
+
+A second, unrelated test bug surfaced here and is worth keeping in mind: the suite's
+"the real database was never opened" check compared an `mtime_ns` fingerprint taken at
+**import time** against one taken at the end. Anything that touched `forensic.db` in between
+— a running backend, an editor — changed the stamp and the suite reported *its own* side
+effect. It was measuring the wrong interval. The fingerprint is now taken around the run,
+inside `main()`, and `mtime` is the load-bearing half: a write of identical content updates
+it, so a size-only comparison would let the suite write to the real database and pass.
+
+### Verification
+
+```bash
+PYTHONPATH=. python tests/verify_service_health.py   # 209 assertions, ~40 s
+```
+
+**Full gate, servers stopped: 839 assertions across twelve scripts, 0 failures**
+(9 + 59 + 153 + 15 + 171 + 39 + 17 + 84 + 51 + 209 + 17 + 15).
+
+Run the gate with **servers stopped** (§10), and read the totals rather than the exit code
+alone — a summary that cannot be parsed is a failed gate, not an absent one.
+
+---
+
+## 22. Standing advice for whoever picks this up next
+
+Six of the twenty-eight bugs in this file were **caught by the verification rather than found
+by reading**, and the pattern is consistent enough to be worth stating on its own:
+
+| found by | bug |
+|---|---|
+| running the live stack | B10, B11 |
+| reading the rendered DOM | B18 |
+| running the §20 gate | B28 |
+| asking "why doesn't Stop work?" instead of re-reading the stop path | B13 |
+| asking what is *actually* indexed before blaming the model | the empty corpus (§19/§20) |
+
+The common cause is not bad code. It is **verification that reports success without
+measuring anything**: `except: return 0`, a field read but never written, a knob that only fed
+arithmetic, a probe that asked a function about a different directory, a gate whose parser read
+0. Every one of those produces a true-shaped value carrying none of the information, which is
+why they survive review — the code reads correctly.
+
+Three habits that would have caught all of them:
+
+1. **Assert the relationship, never a number that encodes a device fact.** `ram_floor_max_mb`
+   (§17) and `estimated_tokens < 4096` (§20) both passed for the wrong reason. A literal is a
+   statement about one machine on one day.
+2. **Make every new guard able to fail when the fix is reverted.** §21's section E2 was
+   re-run against the pre-fix probe deliberately: 22 failures. A test written alongside a fix
+   and never run against the broken version is a description of the fix.
+3. **Never report a zero you did not measure.** `None` + a reason when unmeasurable; `0` only
+   when measured, because *zero models installed* is itself the most important fact on the
+   health page. Nine occurrences in this file.
+
+**And one that is not about code at all:** the chatbot "not working" for most of a session
+was, in the end, an empty corpus plus a context window nobody was sending. Neither was in the
+diff. When something is reported as not working, check what is actually in front of the system
+before changing the system.
+
+
+---
+
+## 23. The Archive button worked perfectly and did nothing (B29) — and a guard that passed for the wrong reason
+
+**Reported as:** "archive in evidence library is not working".
+
+### The database answered it before the code did
+
+```
+Indexed   4
+Failed    1
+Archived  1     ← 468c78f3  test_evidence_6mb.txt  case=b42cc8ce
+```
+
+Exactly one archived row, and it was the item that had just been archived. So
+the archive had **succeeded** — the write, the commit and the audit entry all
+happened. Nothing failed. The complaint was not that it failed.
+
+### Why it looked like nothing happened
+
+`GET /api/cases/{case_id}/evidence` filtered on `case_id` and nothing else.
+Archiving set `status='Archived'`, and the row was still returned and still
+rendered, badge and all. The confirm dialog had promised *"It will be removed
+from active investigations."* It was not removed from anything. It was
+**relabelled** — the toast said "Evidence archived" and the row stayed put.
+
+**Sixth occurrence of the §18 class, and the first where the write was right
+and the *read* lied.** §17 was the mirror image: a stopped job that left the
+queue entirely, so the operator lost the record of how far it had got.
+
+### Four faults, not one
+
+1. **The list had no status filter.** `include_archived` now excludes archived
+   by default, which is what makes the operation mean something.
+2. **The role gate was inverted.** Archiving required **Admin**, while
+   *uploading* evidence requires **Investigator** and so does archiving the
+   whole *case*. The broader action was gated **lower** than the narrower one,
+   so the gate could only have been a copy-paste — and a non-admin got a bare
+   `toast.error('Failed to archive')`, which is B20's shape: a permission
+   refusal reported as a failed click.
+3. **The Qdrant cleanup was `except Exception: print(...)` and marked
+   non-fatal.** The dialog promises *"AI queries will no longer return its
+   content."* If that delete fails the chunks are still in the index, queries
+   **do** still return them, and the response says "archived successfully" —
+   so an investigator who archives a document to keep it out of an analysis
+   finds it in the answer, and has been misled about their own evidence. It is
+   now fatal to the archive, and the message says why. Nothing is lost by
+   refusing: the status change has not run, the file is untouched, and the item
+   is still active and intact.
+4. **There was no way back, and no way to even see what was hidden.** Restore
+   is a new `POST .../restore`, and the page gets a "Show archived (N)"
+   disclosure. An operation that cannot be undone should not be one click away
+   from a forensic record.
+
+### A trap in writing the inverse: restore must not claim the index came back
+
+Archiving **deletes the vectors**, so a restore that set `status='Indexed'`
+would produce §15/B14 exactly: a row that looks searchable and returns
+nothing. Restore sets **`Uploaded`** — literally "on disk, not yet ingested" —
+which is the state the Queue button already understands, so re-indexing is the
+ordinary path rather than a special case. The response message says so, and the
+UI renders that wording rather than a bare "restored".
+
+### 🔴 The consequence of making archive actually delete something
+
+`chunk_count` is read by **four** consumers that do not check status: the case
+export, the PDF report, `report_generator`, and the queue's evidence row. Once
+archiving really does delete vectors, a retained `chunk_count` counts chunks
+that no longer exist, so an archived case's export and report both over-count
+its index.
+
+The alternative was to keep the number as history and teach all four readers
+that `Archived` means the figure is historical — a value that is only correct
+in some states, read by code that does not know about the others. That is the
+§18 failure one layer down. So archive now **zeroes** `chunk_count`, and the
+invariant is the simple one: **`chunk_count` is what is in the index right
+now.** `entity_count` is untouched, because entities live in the database and
+archiving never removed them — it is still true. The removed count is recorded
+in the audit entry instead, where history belongs.
+
+### Also refused: archiving mid-ingestion
+
+The worker holds the evidence row and keeps writing chunks into the collection
+the archive is about to empty. Archiving during a `Queued`/`Running` job would
+drop the item out of the case and then write its vectors straight back into an
+index nobody is shown. Now a 409, naming the job status and telling the
+operator to stop it first.
+
+### A test bug worth recording: the guard that passed only while a cache was warm
+
+The gate — with its §21 parser, correctly — reported **2 failures** in
+`verify_prompt_budget.py` while Ollama was **not running**:
+
+```
+FAIL  J5 num_ctx is on the wire ...  options carried {}
+FAIL  J6 the wire value is the clamped one  wire None vs requested 16384
+```
+
+The product was correct. Instrumenting one `generate_response_detailed()` call
+showed the truth:
+
+```
+[0] /api/show      options = None
+[1] /api/show      options = None
+[2] /api/generate  options = {'temperature': 0.1, 'num_predict': 1024, 'num_ctx': 16384}
+[3] /api/show      options = None
+```
+
+`num_ctx: 16384` **was** on the wire. The capture kept a **single slot**, so the
+assertion read whichever request happened to be *most recent* — which is not
+the request under test. A `/api/show` capability probe is issued **after**
+generation, because the response analysis re-reads the window; while Ollama is
+up that probe is served from cache and never happens, so the slot still held
+`/api/generate` and the guard passed.
+
+> **The guard was passing for the wrong reason, and only a stopped daemon
+> revealed it.** With Ollama down, `model_context_limit()` re-probed on every
+> call — its cache short-circuited only on a **non-`None`** value — so the slot
+> held the probe, whose payload has no `options` key at all.
+
+The capture now records every request and selects by **URL**. Added `J5a`,
+which asserts that a `/api/generate` request was observed at all — otherwise
+"no `options`" and "no request" are indistinguishable, which is the same
+ambiguity that made `store_chunks` return `0` for both success and failure
+(B10). **85 assertions, 0 failures, with Ollama stopped.**
+
+### The same finding was a real product cost, not only a test artefact
+
+Three of those four requests were `/api/show`, because an unreadable
+capability was never cached at all. Against a daemon that accepts the
+connection and then hangs — a real state for Ollama, and the state this box
+was in — that is up to 5 s × 3 added to **every query** before the genuine
+error can surface.
+
+The cache now short-circuits on a **failure** too, with a deliberately short
+5 s TTL so a restarted Ollama is picked up almost immediately (§16's rule: a
+failed session must not be permanent). Measured, not assumed:
+
+| | before | after |
+|---|---|---|
+| requests per `generate_response_detailed()` | 4 | **1** |
+| `/api/show` probes over 4 sequential calls | 12 | **1** |
+| capability reported | `None` | `None` — unchanged, still honest |
+
+> **Trap, in the fix for that:** the cache's `at` initialised to `0.0`, and
+> `time.monotonic()` is measured from an arbitrary origin and is *small* on
+> some platforms — so a fresh process could report "unreadable" for the first
+> seconds of its life purely because the clock had not reached the sentinel.
+> `at is None` now means "never probed" and cannot satisfy the TTL. A cache
+> sentinel is an assumption about a clock, and this one was wrong.
+
+### Verification — `tests/verify_evidence_archive.py` (new, 38 assertions)
+
+Outcome assertions only: list contents, database status, HTTP codes. Qdrant is
+stubbed, because embedded Qdrant takes an exclusive lock per directory (§15) and
+the claims under test are about the archive's contract, not Qdrant's delete
+semantics. Sections **A** the regression · **B** hidden, not destroyed ·
+**C** restore is honest about the index · **D** the three refusals ·
+**E** a failed cleanup must not archive · **F** the delete is scoped to one
+item and one collection · **G** an Investigator may archive and a Viewer may
+not.
+
+**Verified discriminating:** with `evidence.py` reverted to its pre-fix logic the
+suite fails **22** assertions; restored, it passes **38**. One assertion is
+named `an Investigator archiving succeeds (pre-fix: 403)` so the old failure is
+visible in the failure list itself, not only in this file.
+
+#### Three test bugs of my own, each of which hid a real distinction
+
+- **`keep + [ev_ids[2]]` raised `TypeError`** — `keep` is a string. The suite
+  died mid-run, which is the good failure: it stopped rather than printing a
+  green summary it had not earned.
+- **I asserted `file_path` on the API response.** `EvidenceResponse`
+  deliberately does not expose it — a server-side path has no business in a
+  client payload — so the assertion was checking the wrong surface. Then my
+  replacement compared `_paths_of(...)` **to itself**, which is the vacuous
+  `x != 4096 or True` from §21 in a new costume. The honest version captures
+  the paths *before* the archive and compares after: "still on disk" is only a
+  claim against the prior state.
+- **Section F reused section A's recorder**, so it measured four calls of
+  accumulated history instead of its own behaviour. A shared accumulator is
+  never a witness for the current call.
+
+> Each is §22's habit 2 in reverse: a guard that cannot fail is worse than no
+> guard, because it is believed.
+
+### The gate caught a syntax error I introduced, in one pass
+
+While fixing the `chunk_count` invariant I left `evidence.py` with **two**
+`details=` arguments in one call — a duplicated block from a bad edit. Six
+suites could not even import the app.
+
+Worth recording for two reasons. First, **how**: `py_compile` had passed on that
+file minutes earlier, because I compiled after the *previous* edit and did not
+repeat it after the next one. Three edits to one file, one compile check,
+placed at the wrong point. **Compile after the last edit, not after the first.**
+
+Second, and more useful, **what the gate did with it**:
+
+```
+??   verify_service_health.py   counts unreadable (exit 1)
+  ...
+  GATE COULD NOT READ: verify_evidence_archive.py, verify_file_formats.py, ...
+  Treat this run as invalid - the totals above are not trustworthy.
+```
+
+It refused to total the run, and said in words that the numbers could not be
+trusted. A gate that had fallen back to `0 passed / 0 failed` for the five
+unreadable scripts would have printed **405 passed, 2 failed** and exited
+non-zero — technically a failure, but with a total that looks like a
+measurement. That is TRAP 8's fix (§21) earning its keep on a case nobody
+designed for it: not a summary-format change, but a genuinely broken tree.

@@ -87,10 +87,28 @@ def _create_audit(
 @router.get("", response_model=list[schemas.EvidenceResponse])
 def list_evidence(
     case_id: str,
+    include_archived: bool = False,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(require_viewer),
 ):
-    """Return all evidence items for a case."""
+    """
+    Return evidence items for a case.
+
+    Archived items are EXCLUDED by default, and that is the whole point of
+    them: archiving is how an investigator takes an item out of the active
+    investigation, and the confirm dialog promises exactly that ("It will be
+    removed from active investigations").
+
+    This filter was absent, so archiving set status='Archived' and the row was
+    still returned and still rendered. The action succeeded, the toast said
+    "Evidence archived", and nothing visibly happened -- a state change
+    indistinguishable from a failed click. Archived items were not removed
+    from the case; they were only relabelled.
+
+    `include_archived=true` brings them back. It is a parameter rather than a
+    second endpoint so that "how much is hidden" and "what is hidden" are
+    answered by the same query that lists them, and cannot disagree.
+    """
     try:
         db_case = db.query(models.Case).filter(models.Case.id == case_id).first()
         if not db_case:
@@ -102,11 +120,12 @@ def list_evidence(
                 ).model_dump(),
             )
 
-        evidence_list = (
-            db.query(models.Evidence)
-            .filter(models.Evidence.case_id == case_id)
-            .all()
-        )
+        query = db.query(models.Evidence).filter(
+            models.Evidence.case_id == case_id)
+        if not include_archived:
+            query = query.filter(models.Evidence.status != "Archived")
+        evidence_list = query.order_by(
+            models.Evidence.ingested_at.desc()).all()
         return evidence_list
     except HTTPException:
         raise
@@ -1023,11 +1042,18 @@ def archive_evidence(
     case_id: str,
     evidence_id: str,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(require_admin),
+    current_user: models.User = Depends(require_investigator),
 ):
     """
     Soft-archive evidence by setting status to 'Archived'.
     The file on disk is NOT deleted.
+
+    The role gate was `require_admin`, which was both wrong and the reason a
+    non-admin saw nothing happen: uploading evidence needs Investigator, and
+    archiving the whole CASE needs Investigator, but archiving one item inside
+    a case demanded Admin. The broader action was available to a lower role
+    than the narrower one, so the gate could only have been a copy-paste.
+    Reversible with POST .../restore.
     """
     try:
         db_evidence = (
@@ -1047,15 +1073,62 @@ def archive_evidence(
                 ).model_dump(),
             )
 
-        # Qdrant cleanup — remove this evidence's vectors before archiving
+        if db_evidence.status == "Archived":
+            raise HTTPException(
+                status_code=409,
+                detail=schemas.ErrorResponse(
+                    error="Already archived",
+                    detail=(f"Evidence {evidence_id} is already archived. "
+                            "Use restore to bring it back."),
+                ).model_dump(),
+            )
+
+        # Refuse while an ingestion job is live. The worker holds the evidence
+        # row and keeps writing chunks into the collection this call is about
+        # to empty, so archiving mid-run would drop the item out of the case
+        # and then write its vectors straight back into an index nobody is
+        # shown any more. Refusing is the honest answer; the job will be
+        # Queued or Failed in a moment and the archive will then work.
+        live_job = (
+            db.query(models.IngestionJob)
+            .filter(
+                models.IngestionJob.evidence_id == evidence_id,
+                models.IngestionJob.status.in_(["Queued", "Running"]),
+            )
+            .first()
+        )
+        if live_job:
+            raise HTTPException(
+                status_code=409,
+                detail=schemas.ErrorResponse(
+                    error="Ingestion in progress",
+                    detail=(f"Evidence {evidence_id} has a {live_job.status} "
+                            "ingestion job. Stop the job first, then archive."),
+                ).model_dump(),
+            )
+
+        # Qdrant cleanup — remove this evidence's vectors before archiving.
+        #
+        # This was wrapped in `except Exception: print(...)` and marked
+        # non-fatal, which made the archive a lie in the one direction that
+        # matters. The confirm dialog promises "AI queries will no longer
+        # return its content". If this delete fails, the chunks are still in
+        # the index, queries DO still return them, and the response says
+        # "archived successfully" while the investigator is relying on the
+        # opposite. An investigator who archives a document to keep it out of
+        # an analysis, and then finds it in the answer, has been misled about
+        # their own evidence.
+        #
+        # So a cleanup failure aborts the archive instead. Nothing is lost by
+        # refusing: the status change below has not run, the file is untouched
+        # on disk, and the item is still fully present and active. The
+        # operator can retry, or stop whatever is holding the index.
+        from backend.modules.vector_store import (
+            get_client, get_collection_name, case_qdrant_path)
+        from qdrant_client.models import (
+            Filter as QFilter,
+            FieldCondition, MatchValue)
         try:
-            from backend.modules.vector_store import (
-                get_client, get_collection_name, case_qdrant_path)
-            from backend.dependencies import get_settings as _get_settings
-            from qdrant_client.models import (
-                Filter as QFilter,
-                FieldCondition, MatchValue)
-            _settings = _get_settings()
             qdrant_path = case_qdrant_path(case_id)
             _client = get_client(qdrant_path)
             _collection = get_collection_name(case_id)
@@ -1070,18 +1143,62 @@ def archive_evidence(
             )
             print(f"[CLEANUP] Removed Qdrant chunks for {evidence_id}")
         except Exception as _e:
-            print(f"[CLEANUP] Qdrant cleanup error (non-fatal): {_e}")
+            print(f"[CLEANUP] Qdrant cleanup FAILED for {evidence_id}: {_e}")
+            raise HTTPException(
+                status_code=500,
+                detail=schemas.ErrorResponse(
+                    error="Archive aborted — search index not cleaned",
+                    detail=(
+                        f"The vectors for {db_evidence.original_filename} could "
+                        f"not be removed ({_e}), so its text would still be "
+                        "returned by AI queries. The evidence has NOT been "
+                        "archived and remains active and intact. Retry, or stop "
+                        "any job using this case first."
+                    ),
+                ).model_dump(),
+            )
+
+        # Captured before it is zeroed below, so the audit trail records how
+        # much was removed. The embedded client's delete() does not report how
+        # many points its filter matched on this version, so this is the
+        # pre-archive figure rather than a measured delete count — stated as
+        # such rather than presented as something the delete confirmed.
+        removed_chunks = db_evidence.chunk_count or 0
 
         db_evidence.status = "Archived"
+        # Zeroed, and deliberately so.
+        #
+        # Making archive actually delete vectors is what created this problem:
+        # from here on, chunk_count would count chunks that no longer exist.
+        # Four consumers read it without checking status — the case export
+        # (cases.py), the PDF report and its generator, and the queue's
+        # evidence row — so a stale value means a report and an export that
+        # over-count an archived case's index.
+        #
+        # The alternative was to keep the number as history and teach all four
+        # readers that "Archived" means the figure is historical. A value that
+        # is only correct in some states, read by code that does not know about
+        # the others, is the §18 failure one layer down; the count of how many
+        # chunks were removed is recorded in the audit entry below anyway.
+        #
+        # So the invariant is the simple one: chunk_count is the number of
+        # vectors this evidence currently has in the search index. entity_count
+        # is untouched because entities live in the database and archiving
+        # never removed them — it is still true.
+        db_evidence.chunk_count = 0
         db.commit()
 
         _create_audit(
             db=db,
             action_type="EVIDENCE_ARCHIVED",
-            performed_by="system",
+            performed_by=current_user.username,
             details={
                 "evidence_id": evidence_id,
                 "filename": db_evidence.original_filename,
+                # The pre-archive count, now zeroed on the row. See the note
+                # above: the delete() result does not report how many points
+                # its filter matched on this client version.
+                "chunks_removed": removed_chunks,
             },
             case_id=case_id,
         )
@@ -1097,6 +1214,131 @@ def archive_evidence(
             status_code=500,
             detail=schemas.ErrorResponse(
                 error="Failed to archive evidence",
+                detail=str(exc),
+            ).model_dump(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/cases/{case_id}/evidence/{evidence_id}/restore  — undo an archive
+# ---------------------------------------------------------------------------
+
+@router.post("/{evidence_id}/restore", response_model=schemas.SuccessResponse)
+def restore_evidence(
+    case_id: str,
+    evidence_id: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(require_investigator),
+):
+    """
+    Bring an archived evidence item back into the active investigation.
+
+    Archiving was one-way: it set a status, removed the item from the case
+    view, and there was no route back. A mis-click was therefore permanent and
+    invisible at the same time -- the worst combination for evidence, where
+    the record of what was examined is itself the product. Restore is added
+    because an operation that cannot be undone should not be one click away.
+
+    The restored status is 'Uploaded', NOT the status it had before. This is
+    deliberate and it is the only honest option:
+
+      * archiving DELETED this evidence's vectors from Qdrant, so it is no
+        longer indexed, and saying otherwise would be the §15/B14 failure --
+        a row that looks searchable and returns nothing
+      * 'Uploaded' is exactly the state of a file that is on disk and not yet
+        ingested, and it is the state the normal Queue button already
+        understands, so re-indexing is the ordinary path rather than a
+        special case
+
+    chunk_count is cleared for the same reason: it counted vectors that no
+    longer exist. entity_count is KEPT, because entities live in the database
+    and archiving never removed them -- clearing a true number to look tidy is
+    the same defect in the opposite direction.
+    """
+    try:
+        db_evidence = (
+            db.query(models.Evidence)
+            .filter(
+                models.Evidence.id == evidence_id,
+                models.Evidence.case_id == case_id,
+            )
+            .first()
+        )
+        if not db_evidence:
+            raise HTTPException(
+                status_code=404,
+                detail=schemas.ErrorResponse(
+                    error="Evidence not found",
+                    detail=f"No evidence with id={evidence_id} in case {case_id}",
+                ).model_dump(),
+            )
+        if db_evidence.status != "Archived":
+            raise HTTPException(
+                status_code=409,
+                detail=schemas.ErrorResponse(
+                    error="Not archived",
+                    detail=(f"Evidence {evidence_id} is already active "
+                            f"(status={db_evidence.status})."),
+                ).model_dump(),
+            )
+
+        live_job = (
+            db.query(models.IngestionJob)
+            .filter(
+                models.IngestionJob.evidence_id == evidence_id,
+                models.IngestionJob.status.in_(["Queued", "Running"]),
+            )
+            .first()
+        )
+        if live_job:
+            raise HTTPException(
+                status_code=409,
+                detail=schemas.ErrorResponse(
+                    error="Ingestion in progress",
+                    detail=f"Evidence {evidence_id} has a {live_job.status} job.",
+                ).model_dump(),
+            )
+
+        was = db_evidence.status
+        db_evidence.status = "Uploaded"
+        # Defensive, not corrective: archive_evidence already zeroed this, so
+        # for any row archived by this code the value is already 0. It is
+        # repeated because a row archived by an EARLIER version of the endpoint
+        # still carries its old count, and a restored item that claims chunks
+        # it does not have is the searchable-as-empty failure from §15/B14.
+        db_evidence.chunk_count = 0
+        db_evidence.ingestion_job_id = None  # the old job is not this item's
+        db_evidence.error_message = None
+        # entity_count intentionally untouched - see the docstring.
+        db.commit()
+
+        _create_audit(
+            db=db,
+            action_type="EVIDENCE_RESTORED",
+            performed_by=current_user.username,
+            details={
+                "evidence_id": evidence_id,
+                "filename": db_evidence.original_filename,
+                "previous_status": was,
+            },
+            case_id=case_id,
+        )
+
+        return schemas.SuccessResponse(
+            message=(
+                f"Evidence {evidence_id} restored. Its search index was "
+                "removed when it was archived, so it is now 'Uploaded' — "
+                "queue it again to re-index it."
+            )
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=schemas.ErrorResponse(
+                error="Failed to restore evidence",
                 detail=str(exc),
             ).model_dump(),
         )

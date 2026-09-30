@@ -69,25 +69,139 @@ CHARS_PER_TOKEN = 2.4
 _ctx_cache = {"value": None, "at": 0.0}
 _CTX_TTL = 30.0
 
+_cap_cache = {"value": None, "at": None, "ok": False}
+_CAP_TTL = 300.0
+# A capability that could not be read is cached for far less time than one that
+# could, so the cache still short-circuits the common case without pinning a
+# stale "unreadable" for five minutes after Ollama comes back. See the note in
+# model_context_limit().
+_CAP_FAIL_TTL = 5.0
+
+# If Ollama served FEWER tokens than this fraction of what we sent, the prompt
+# was cut. Deliberately insensitive, and the reason is the bias above: because
+# CHARS_PER_TOKEN under-counts characters-per-token, `estimated` over-states the
+# true count on prose by up to ~1.9x, so `eval_count < estimated` is normal and
+# means nothing. Only losing more than half the prompt is unambiguous, and half
+# is the case that matters -- B26 lost 95% of the evidence and it arrived
+# looking like a successful answer.
+_TRUNCATION_LOSS_RATIO = 0.5
+
+
+def model_context_limit() -> int | None:
+    """
+    The longest window the model was TRAINED for, or None if unreadable.
+
+    This is a capability, not a setting, so it is read rather than configured.
+    None means "not measured" and is never coerced to 0 -- a 0 limit would clamp
+    every request to nothing, which reads as a working number and is not one.
+    """
+    now = time.monotonic()
+    # The cache must short-circuit on a FAILURE too, not only on a success.
+    #
+    # It used to require value is not None, so an unreadable capability was
+    # never cached at all and every single call re-probed /api/show. Measured
+    # on one generate_response() call with Ollama unreachable: FOUR requests,
+    # three of them /api/show, against a 5-second timeout each. Against a
+    # daemon that accepts the connection and then hangs -- which is a real
+    # state for Ollama, and the state this box was in -- that is up to 15
+    # seconds added to every query before the genuine error can surface.
+    #
+    # The failure TTL is deliberately short. §16's rule for a failed telemetry
+    # session is that failure must not be permanent, so an eGPU plugged in
+    # mid-session gets picked up; the same applies here, and 5 s is short
+    # enough that a restarted Ollama is noticed almost immediately while still
+    # collapsing the burst of probes a single query makes.
+    ttl = _CAP_TTL if _cap_cache["ok"] else _CAP_FAIL_TTL
+    # `at is None` means "never probed", which must never satisfy the TTL. A
+    # 0.0 sentinel would not be safe: time.monotonic() is measured from an
+    # arbitrary origin and is small on some platforms, so a fresh process could
+    # report "unreadable" for the first seconds of its life purely because the
+    # clock had not reached the sentinel.
+    if _cap_cache["at"] is not None and (now - _cap_cache["at"]) < ttl:
+        return _cap_cache["value"]
+
+    settings = _settings()
+    value = None
+    try:
+        r = requests.post(
+            f"{settings.ollama_base_url}/api/show",
+            json={"model": settings.ollama_model},
+            timeout=5)
+        if r.status_code == 200:
+            body = r.json() or {}
+            # /api/show nests this differently across Ollama builds: some expose
+            # llama.context_length, most only model_info.<arch>.context_length.
+            # Read both rather than assume one, and report None if neither is
+            # there instead of guessing a number we would then budget against.
+            nested = ((body.get("llama") or {}).get("context_length"))
+            candidates = [nested] if isinstance(nested, int) else []
+            for k, v in (body.get("model_info") or {}).items():
+                if k.endswith("context_length") and isinstance(v, int):
+                    candidates.append(v)
+            positives = [c for c in candidates if isinstance(c, int) and c > 0]
+            if positives:
+                value = max(positives)
+    except Exception:
+        # Cannot measure. The configured value governs, and requesting a window
+        # the model cannot honour is caught by the saturation check at the
+        # response rather than by a guess made here.
+        pass
+
+    _cap_cache["value"] = value
+    _cap_cache["at"] = now
+    _cap_cache["ok"] = value is not None
+    return value
+
+
+def requested_context_tokens() -> int:
+    """
+    The window we ASK Ollama to serve, clamped to what the model can do.
+
+    This is the fix for the setting that was not a setting. ollama_num_ctx used
+    to feed only the *reporting* path, so raising it made the app budget as if
+    it had room while Ollama kept serving its own 4,096 default and truncated
+    the evidence in silence -- B26's exact mechanism, re-armed by the obvious
+    "fix". Passing num_ctx on the request is what makes the number a control,
+    and clamping to the model's real capability is what stops that control from
+    asking for a window that does not exist.
+    """
+    settings = _settings()
+    configured = int(settings.ollama_num_ctx)
+    if configured <= 0:
+        configured = 4096
+    cap = model_context_limit()
+    if cap:
+        return max(1024, min(configured, cap))
+    return max(1024, configured)
+
 
 def effective_context_tokens() -> int:
     """
     The context window the model is being served with, not the one it was
     trained for.
 
-    Read from /api/ps, which only lists a model once it is loaded. Cached for
-    CTX_TTL so a burst of queries does not add a probe to every one, and
-    falling back to the configured ollama_num_ctx when the model is not
-    currently resident -- in which case there is nothing to measure and the
-    configured value is the honest answer.
+    Two sources, in order of authority:
+
+    1. /api/ps, which only lists a model once it is loaded. This is a genuine
+       measurement, so it wins when it exists.
+    2. otherwise, the window we requested -- which is the honest answer, because
+       we now send num_ctx on every request and Ollama honours it (verified:
+       a 4,096-clamped request returned prompt_eval_count 10,044 once
+       num_ctx: 16384 was asked for).
+
+    The caveat, stated rather than implied: this Ollama build's /api/ps carries
+    no context_length at all -- its details are families/family/format/
+    parameter_size/parent_model/quantization_level -- so path 1 never fires
+    here and the requested value always governs. That is why the request, not
+    the probe, is the load-bearing half. If a future build does report it, the
+    measurement takes over automatically and nothing else changes.
     """
     now = time.monotonic()
     if _ctx_cache["value"] and (now - _ctx_cache["at"]) < _CTX_TTL:
         return _ctx_cache["value"]
 
     settings = _settings()
-    configured = int(settings.ollama_num_ctx)
-    value = configured
+    value = requested_context_tokens()
 
     try:
         r = requests.get(
@@ -102,8 +216,9 @@ def effective_context_tokens() -> int:
                         value = live
                     break
     except Exception:
-        # Cannot measure. The configured value stands, and the prompt
-        # verifier below is what stops a wrong guess from going unnoticed.
+        # Cannot measure. The requested value stands, and the saturation and
+        # truncation checks at the response are what stop a wrong guess from
+        # going unnoticed.
         pass
 
     _ctx_cache["value"] = value
@@ -151,6 +266,19 @@ def ollama_diagnostic() -> dict:
         "model_ready": None,
         "installed_models": None,
         "reason": None,
+        # The context window is the single biggest lever on answer quality and
+        # nothing reported it, so a 4,096-token model and a 16,384-token one
+        # looked identical from the outside. Both are reported because they are
+        # different facts and only the second one bounds a prompt: the model is
+        # *trained* for one length and *served* with another, and conflating
+        # them is what made B26's overflow inevitable.
+        #
+        # `model_context_tokens` is None when /api/show cannot be read. That is
+        # a capability that could not be measured, not a model with no context.
+        "model_context_tokens": model_context_limit(),
+        "requested_context_tokens": requested_context_tokens(),
+        "effective_context_tokens": effective_context_tokens(),
+        "prompt_budget_tokens": prompt_budget_tokens(),
     }
 
     try:
@@ -270,7 +398,13 @@ def generate_response_detailed(prompt: str,
         "stream": False,
         "options": {
             "temperature": 0.1,
-            "num_predict": settings.ollama_num_predict
+            "num_predict": settings.ollama_num_predict,
+            # Without this, Ollama applies its own default (4,096 for this
+            # model) and the app has no way to widen it -- the prompt is
+            # accepted, silently truncated, and answered from its tail. Sending
+            # it is what makes ollama_num_ctx a control rather than a number
+            # that only ever appears in the budget arithmetic.
+            "num_ctx": requested_context_tokens(),
         }
     }
 
@@ -326,6 +460,20 @@ def generate_response_detailed(prompt: str,
     prompt_stats["context_tokens"] = limit
     prompt_stats["overflowed"] = (
         isinstance(eval_count, int) and eval_count >= limit - 2)
+
+    # Second, independent guard. Saturation asks "did we fill the window we
+    # asked for"; this asks "did Ollama read most of what we sent". They fail
+    # differently, and the case they cover is the one that produced B26: a
+    # window smaller than we believe we have, so the prompt is cut while
+    # eval_count stays comfortably below `limit` and saturation stays False.
+    estimated = prompt_stats.get("estimated_tokens")
+    lost_most = (
+        isinstance(estimated, int) and isinstance(eval_count, int)
+        and estimated > 0
+        and eval_count < estimated * _TRUNCATION_LOSS_RATIO)
+    prompt_stats["evidence_lost"] = lost_most
+    prompt_stats["requested_context_tokens"] = requested_context_tokens()
+
     return {
         "text": text,
         "prompt_eval_count": eval_count,
@@ -334,7 +482,7 @@ def generate_response_detailed(prompt: str,
         # A prompt that filled the window to the last token is a prompt
         # Ollama truncated. It is not a slow answer, it is a different
         # answer, and it arrives looking exactly like a successful one.
-        "saturated": prompt_stats["overflowed"],
+        "saturated": prompt_stats["overflowed"] or lost_most,
         "prompt_stats": prompt_stats,
     }
 

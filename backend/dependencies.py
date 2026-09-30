@@ -29,9 +29,21 @@ class Settings(BaseSettings):
     # otherwise. Budgeting against the trained figure over-estimates the real
     # window by 32x, which is how a 212,000-character RAG prompt reached a
     # 4,096-token model intact enough to look fine and was actually discarded.
-    # ollama_client.effective_context_tokens() prefers the live value from
-    # /api/ps and falls back to this.
-    ollama_num_ctx: int = 4096
+    #
+    # This is now SENT on every request as options.num_ctx, which is what makes
+    # it a control rather than a number that only ever fed the budget
+    # arithmetic. Previously it did the arithmetic alone: setting
+    # OLLAMA_NUM_CTX=32768 would have made the app build a 32k prompt that
+    # Ollama truncated at 4,096 in silence -- the B26 failure, re-armed by the
+    # obvious fix, and worse because the app would believe it had room.
+    #
+    # 16,384 is a measured choice, not a round one: on this box it returns
+    # prompt_eval_count 10,044 where the un-asked request returned 4,096. It is
+    # clamped down to the model's real capability at request time
+    # (ollama_client.model_context_limit), so a smaller model gets a smaller
+    # window rather than an error. Lower it in .env if RAM is tight; the cost
+    # of a smaller window is bounded evidence, never a silently wrong answer.
+    ollama_num_ctx: int = 16384
 
     # Generation ceiling, subtracted from the context window because Ollama's
     # n_ctx is shared between prompt and completion.

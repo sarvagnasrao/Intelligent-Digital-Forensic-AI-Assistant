@@ -6,7 +6,7 @@ import {
   Image, Mail, Table, MessageSquare,
   CheckCircle, Clock,
   AlertCircle, RefreshCw,
-  Info, Shield, Archive,
+  Info, Shield, Archive, ArchiveRestore, Eye, EyeOff,
   Play, Loader, X, Cpu,
   ChevronDown, ChevronUp,
   Zap, Activity, ChevronRight, Square,
@@ -15,12 +15,13 @@ import {
 } from "lucide-react"
 import {
   getEvidence, uploadEvidence, uploadMultiEvidence,
-  getEvidenceItem, archiveEvidence,
+  getEvidenceItem, archiveEvidence, restoreEvidence,
   verifyEvidence, getEvidenceFormats,
   addToQueue, estimateTime,
   getStorageStats,
   getQueue, getQueueHistory, cancelJob,
-  forceStartJob, stopJob, updateJobSettings
+  forceStartJob, stopJob, updateJobSettings,
+  apiErrorMessage
 } from "../api/client"
 import Badge from "../components/Badge"
 import ConfirmDialog from "../components/ConfirmDialog"
@@ -99,7 +100,11 @@ const statusIcon = {
   'Running': <Loader size={14} className="text-accent animate-spin" />,
   'Indexed': <CheckCircle size={14} className="text-success" />,
   'Completed': <CheckCircle size={14} className="text-success" />,
-  'Failed': <AlertCircle size={14} className="text-danger" />
+  'Failed': <AlertCircle size={14} className="text-danger" />,
+  // Without this, an archived item fell through to the pending Clock above.
+  // Archived is neither pending nor done — it is a deliberate removal, and the
+  // icon should say so rather than implying work is outstanding.
+  'Archived': <Archive size={14} className="text-ink-2" />,
 }
 
 // Mirrors normalize_extension() in backend/modules/file_formats.py, so the
@@ -697,12 +702,19 @@ function EditSettingsModal({ job, onClose, onSaved }) {
 export default function EvidencePage() {
   const { caseId } = useParams()
   const [evidence, setEvidence] = useState([])
+  // Kept separate from `evidence` rather than filtered at render time, so the
+  // two lists are exactly what the server returned and the archived count on
+  // the toggle cannot drift from what the toggle reveals.
+  const [archived, setArchived] = useState([])
+  const [showArchived, setShowArchived] = useState(false)
+  const [restoring, setRestoring] = useState({})
   const [uploading, setUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const [investigator, setInvestigator] = useState('Investigator')
   const [includeDeleted, setIncludeDeleted] = useState(false)
   const [showFormats, setShowFormats] = useState(false)
   const [confirmArchive, setConfirmArchive] = useState(null)
+  const [confirmRestore, setConfirmRestore] = useState(null)
   const [verifyResult, setVerifyResult] = useState({})
   const [verifying, setVerifying] = useState({})
   const fileRef = useRef()
@@ -736,10 +748,16 @@ export default function EvidencePage() {
 
   const loadEvidence = async () => {
     try {
-      const res = await getEvidence(caseId)
-      setEvidence(Array.isArray(res.data) ? res.data : [])
+      // Both lists in one request. The server hides archived items by
+      // default; asking for them here means the toggle can state an exact
+      // count, and that count is derived from the same rows the list renders
+      // rather than from a second query that could disagree with it.
+      const res = await getEvidence(caseId, true)
+      const all = Array.isArray(res.data) ? res.data : []
+      setEvidence(all.filter(ev => ev.status !== 'Archived'))
+      setArchived(all.filter(ev => ev.status === 'Archived'))
     } catch (e) {
-      toast.error('Failed to load evidence')
+      toast.error(apiErrorMessage(e, 'Failed to load evidence'))
     }
   }
 
@@ -783,7 +801,32 @@ export default function EvidencePage() {
       setConfirmArchive(null)
       loadEvidence()
     } catch (e) {
-      toast.error('Failed to archive')
+      // A bare 'Failed to archive' turns three different outcomes into the
+      // same four words: no permission, an ingestion job still running, and
+      // an aborted search-index cleanup all read as a failed click. The
+      // server explains each of them, so the reason is shown.
+      toast.error(apiErrorMessage(e, 'Failed to archive'), { duration: 6000 })
+      setConfirmArchive(null)
+    }
+  }
+
+  const handleRestore = async (ev) => {
+    setRestoring(prev => ({ ...prev, [ev.id]: true }))
+    try {
+      const res = await restoreEvidence(caseId, ev.id)
+      // Use the server's wording. The restore deliberately does NOT bring the
+      // search index back, and saying "restored" on its own would imply it did.
+      toast.success(res?.data?.message || 'Evidence restored', { duration: 7000 })
+      setConfirmRestore(null)
+      loadEvidence()
+    } catch (e) {
+      toast.error(apiErrorMessage(e, 'Failed to restore'), { duration: 6000 })
+    } finally {
+      setRestoring(prev => {
+        const next = { ...prev }
+        delete next[ev.id]
+        return next
+      })
     }
   }
 
@@ -1082,7 +1125,23 @@ export default function EvidencePage() {
 
           {/* 3. Uploaded Evidence List (Bottom) */}
           <div>
-            <h2 className="text-lg font-bold text-ink-0 mb-4 flex items-center gap-2"><Database size={20} className="text-accent" /> Evidence Library</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-bold text-ink-0 flex items-center gap-2">
+                <Database size={20} className="text-accent" /> Evidence Library
+              </h2>
+              {/* Archiving used to remove nothing, so this count is what tells
+                  an investigator their click landed. It is derived from the
+                  same response the lists render from, so it cannot disagree. */}
+              {archived.length > 0 && (
+                <button
+                  onClick={() => setShowArchived(s => !s)}
+                  className="text-xs font-semibold text-ink-2 hover:text-accent flex items-center gap-1.5 px-2 py-1 rounded-lg hover:bg-surface-2 transition-colors"
+                >
+                  {showArchived ? <EyeOff size={13} /> : <Eye size={13} />}
+                  {showArchived ? 'Hide' : 'Show'} archived ({archived.length})
+                </button>
+              )}
+            </div>
             <div className="space-y-4">
               {evidence.map(ev => {
                 const Icon = getFileIcon(ev.original_filename);
@@ -1155,6 +1214,54 @@ export default function EvidencePage() {
                 </div>
               )}
             </div>
+
+            {/* ARCHIVED. Not a history log and not a recycle bin: these rows
+                are the same evidence, excluded from the active investigation.
+                They are reachable and reversible, because an operation that
+                cannot be undone should not be one click away on a forensic
+                record. */}
+            {showArchived && archived.length > 0 && (
+              <div className="mt-6 pt-6 border-t border-line">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-ink-2 mb-3 flex items-center gap-2">
+                  <Archive size={13} /> Archived ({archived.length})
+                </h3>
+                <div className="space-y-3">
+                  {archived.map(ev => (
+                    <div
+                      key={ev.id}
+                      className="bg-surface-2/50 border border-line rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-semibold text-ink-1 text-sm truncate">
+                          {ev.original_filename}
+                        </p>
+                        <p className="text-xs text-ink-2 mt-0.5">
+                          {formatBytes(ev.file_size_bytes)} · uploaded by {ev.ingested_by}
+                          {' · '}
+                          out of the active investigation
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setConfirmRestore(ev)}
+                        disabled={restoring[ev.id]}
+                        className="text-xs font-bold bg-accent text-white px-3 py-1.5 rounded flex items-center gap-1.5 hover:bg-accent-hover transition-colors disabled:opacity-50 shrink-0"
+                      >
+                        {restoring[ev.id]
+                          ? <Loader size={12} className="animate-spin" />
+                          : <ArchiveRestore size={12} />}
+                        Restore
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-xs text-ink-2 mt-3">
+                  The file is still on disk. Restoring returns it as
+                  <span className="text-ink-1 font-semibold"> Uploaded</span> —
+                  its search index was deleted when it was archived, so queue
+                  it again to make it searchable.
+                </p>
+              </div>
+            )}
           </div>
         </div>
         {/* RIGHT SIDEBAR: INGESTION QUEUE */}
@@ -1320,7 +1427,16 @@ export default function EvidencePage() {
         onConfirm={() => handleArchive(confirmArchive)}
         onCancel={() => setConfirmArchive(null)}
       />
-      
+
+      <ConfirmDialog
+        isOpen={!!confirmRestore}
+        title="Restore Evidence"
+        message={`Restore "${confirmRestore?.original_filename}" to the active investigation? Its search index was deleted when it was archived, so it will come back as "Uploaded" and need queueing again to be searchable.`}
+        confirmLabel="Restore"
+        onConfirm={() => handleRestore(confirmRestore)}
+        onCancel={() => setConfirmRestore(null)}
+      />
+
       {queuingEv && (
         <QueueModal
           ev={queuingEv}

@@ -118,8 +118,14 @@ export const archiveCase = (id) =>
   api.delete(`/cases/${id}`)
 
 // Evidence
-export const getEvidence = (caseId) =>
-  api.get(`/cases/${caseId}/evidence`)
+// `includeArchived` defaults to false server-side, which is the behaviour that
+// makes archiving mean something. The Evidence page asks for BOTH lists in one
+// request so it can show how many items are hidden without a second round trip
+// — and so the count on the toggle and the list behind it cannot disagree.
+export const getEvidence = (caseId, includeArchived = false) =>
+  api.get(`/cases/${caseId}/evidence`, {
+    params: { include_archived: includeArchived },
+  })
 
 export const uploadEvidence = (caseId, formData) =>
   api.post(
@@ -140,6 +146,13 @@ export const getEvidenceItem = (caseId, evidenceId) =>
 
 export const archiveEvidence = (caseId, evidenceId) =>
   api.delete(`/cases/${caseId}/evidence/${evidenceId}`)
+
+// The inverse. Archiving was one-way, which made a mis-click permanent and
+// invisible at once. Note the response message is load-bearing: restoring
+// leaves the item 'Uploaded', not 'Indexed', because archiving deleted its
+// vectors. The UI surfaces that instead of implying the index came back.
+export const restoreEvidence = (caseId, evidenceId) =>
+  api.post(`/cases/${caseId}/evidence/${evidenceId}/restore`)
 
 export const verifyEvidence = (caseId, evidenceId) =>
   api.post(`/cases/${caseId}/evidence/${evidenceId}/verify`)

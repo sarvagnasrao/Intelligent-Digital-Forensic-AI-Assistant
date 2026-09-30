@@ -116,6 +116,21 @@ def _abspath(path: str) -> str:
     return os.path.abspath(path)
 
 
+def _canonical_base() -> str:
+    """
+    Where the vector store is written to now, for display in a reason string.
+
+    Never raises. This only ever builds a human-readable sentence, and a probe
+    that raises while explaining itself would replace an honest measurement
+    with an exception -- strictly worse than naming no path.
+    """
+    try:
+        from backend.modules.vector_store import resolve_qdrant_dir
+        return _abspath(resolve_qdrant_dir())
+    except Exception:
+        return "the configured Qdrant directory"
+
+
 def _probe_writable(path: str):
     """
     Real writability test: create a file in `path`, write to it, remove it.
@@ -362,6 +377,8 @@ def probe_vector_store(cases_dir: str) -> dict:
         "cases_in_db": None,
         "writable": None,
         "size_walk_ms": None,
+        "unmigrated_collections": None,
+        "duplicate_collections": None,
     }
 
     if not cases_dir:
@@ -400,20 +417,118 @@ def probe_vector_store(cases_dir: str) -> dict:
     # and the card reported `unavailable` on every machine.
     from backend.modules.vector_store import case_qdrant_path
 
-    qdrant_dirs = [
-        d for d in case_dirs
-        if os.path.isdir(case_qdrant_path(d))
-    ]
+    # A case's index has TWO legitimate homes, and this probe has to know
+    # about both or it reports a fabricated zero.
+    #
+    # `case_qdrant_path()` is the single source of truth for where an index
+    # lives, but it deliberately takes only a case_id: it resolves against the
+    # global settings, because that is where the *writer* looks. When the cases
+    # directory sits on a slow disk, resolve_qdrant_dir() relocates the whole
+    # store elsewhere, so `case_qdrant_path(case_id)` can point at a completely
+    # different tree from the directory this function was just handed.
+    #
+    # That is not hypothetical. This probe used to call case_qdrant_path() and
+    # nothing else, so given any directory other than settings.cases_dir it
+    # found zero indexes and reported "0 of N case directories hold a Qdrant
+    # index" while the indexes sat right there. Fifteen assertions in
+    # verify_service_health.py caught it.
+    #
+    # So: the in-cases location is derived from the directory actually being
+    # probed, the canonical location from the writer, and a case counts as
+    # indexed if EITHER exists. The second case -- an index in both places --
+    # is a real defect that migrate_qdrant_layout() refuses to paper over by
+    # overwriting, so it is named rather than silently collapsed.
+    unmigrated = 0
+    duplicated = 0
+    qdrant_dirs = []
+    for case_dir in case_dirs:
+        legacy = os.path.join(cases_dir, case_dir, "qdrant")
+        try:
+            canonical = case_qdrant_path(case_dir)
+        except Exception:
+            # Cannot ask the writer where it would put this one. The in-cases
+            # location is still checkable, so a resolver fault must not
+            # downgrade to "no index here".
+            canonical = None
+
+        has_legacy = os.path.isdir(legacy)
+        has_canonical = bool(canonical) and os.path.isdir(canonical)
+        if has_legacy and has_canonical:
+            duplicated += 1
+        elif has_legacy:
+            unmigrated += 1
+        elif has_canonical:
+            pass
+        else:
+            continue
+
+        # Only the canonical path is walked when both exist: they are two
+        # copies of one index, and summing both would double-count it. The
+        # duplication is reported separately instead.
+        qdrant_dirs.append(canonical if has_canonical else legacy)
+
     out["case_collections"] = len(qdrant_dirs)
+
+    # Whether an index is in the "wrong" place is only a question about *this
+    # machine's* configured layout. The probe accepts any directory -- a test
+    # hands it a temporary tree -- and comparing a caller's directory against
+    # the global resolver would publish a migration verdict about a location
+    # this machine does not use. That is the same fabrication as reporting a
+    # count for a directory that was never measured, one level up.
+    #
+    # So on a directory that is not the configured root, the split is reported
+    # as None -- "not applicable" -- rather than as 0. Zero would be a claim
+    # that this tree is fully migrated, and for a tree that is not the real one
+    # that claim means nothing.
+    try:
+        from backend.dependencies import get_settings
+        _configured = get_settings().cases_dir or "."
+    except Exception:
+        _configured = "."
+    is_configured_root = os.path.normcase(os.path.abspath(cases_dir)) == \
+        os.path.normcase(os.path.abspath(_configured))
+
+    # A warning appended here is an ERROR (`reason` is set -> the service is
+    # degraded). On a tree that is not this machine's there is nothing wrong to
+    # report, so `apply` is what keeps the prose out of the degraded path.
+    # Decided once, here, and consumed once, in the reason block -- see below.
+    notes = []
+    if is_configured_root:
+        out["unmigrated_collections"] = unmigrated
+        out["duplicate_collections"] = duplicated
+        if unmigrated:
+            # Not a tidiness note. Every reader resolves through
+            # case_qdrant_path(), and get_client() *creates* the directory it
+            # is handed -- so a case indexed only in-cases gets a brand new,
+            # empty collection on the next query and returns nothing at all.
+            # That is the B14/§15 silent-empty failure, arrived at from the
+            # filesystem side, and it is worth saying in those terms.
+            notes.append(
+                f"{unmigrated} case index/indices sit inside the cases "
+                f"directory rather than at {_canonical_base()}. Searches read "
+                "only the latter, so those cases will return no results until "
+                "migrate_qdrant_layout() runs"
+            )
+        if duplicated:
+            notes.append(
+                f"{duplicated} case(s) have an index in BOTH locations; the "
+                "total counts the canonical copy only"
+            )
+    else:
+        out["unmigrated_collections"] = None
+        out["duplicate_collections"] = None
+        # Both the numbers and the prose come from the branch above, never from
+        # the raw locals. The first attempt gated only the dict and left
+        # `if unmigrated:` reading the raw local, so one response said
+        # "not applicable" in the field and "1 un-migrated index" in the
+        # sentence, for the same tree.
 
     budget = [_MAX_WALK_FILES]
     total = 0
     exhausted = False
     skipped = 0
-    for case_dir in qdrant_dirs:
-        size, hit_cap, missed = _sum_dir_bytes(
-            case_qdrant_path(case_dir), budget
-        )
+    for path in qdrant_dirs:
+        size, hit_cap, missed = _sum_dir_bytes(path, budget)
         total += size
         skipped += missed
         if hit_cap:
@@ -438,6 +553,16 @@ def probe_vector_store(cases_dir: str) -> dict:
         reasons.append(
             f"{skipped} file(s) could not be measured, so the total is "
             "a lower bound"
+        )
+    # The migration notes, built above where the verdict was actually decided,
+    # plus a legibility hint when one exists and the size below is a lower
+    # bound. Silent under-reporting is what made this probe untrustworthy in
+    # the first place.
+    reasons.extend(notes)
+    if skipped and notes:
+        reasons.append(
+            "the size above is a lower bound, and does not include an "
+            "un-migrated index when the canonical copy was the one walked"
         )
     if not writable:
         reasons.append(f"the directory is not writable ({why})")

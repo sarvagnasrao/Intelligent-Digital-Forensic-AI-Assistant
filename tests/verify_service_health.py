@@ -351,7 +351,10 @@ def _db_fingerprint():
         return None
 
 
-_DB_FINGERPRINT = _db_fingerprint()
+# Read at the start of the run, in main(), and re-read at the end. A value
+# captured here at import time is measured before the first assertion and
+# therefore reports anyone else's writes as this suite's side effects.
+_DB_FINGERPRINT = _db_fingerprint()   # diagnostic only; not asserted on
 
 
 # ── sections ───────────────────────────────────────────────────────────────
@@ -786,6 +789,180 @@ def section_vector_store():
           (r["case_collections"], r_a2["case_collections"]))
 
 
+@contextlib.contextmanager
+def qdrant_layout(cases_dir, canonical_base):
+    """
+    Pin BOTH the configured cases directory and where the writer puts indexes.
+
+    Three things have to agree before the probe can reach a verdict about
+    migration: the directory it is handed, the configured root it compares
+    against, and the resolver ``case_qdrant_path`` consults. Patching only the
+    first is what made the split unobservable from a test -- the probe then
+    always saw a tree it had no authority to judge, and correctly said
+    "not applicable" to everything.
+    """
+    import backend.dependencies as deps
+    import backend.modules.vector_store as vs
+
+    class _S:
+        def __init__(self, real, cd):
+            self._real = real
+            self.cases_dir = cd
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    real_get = deps.get_settings
+    real_resolve = vs.resolve_qdrant_dir
+    deps.get_settings = lambda: _S(real_get(), cases_dir)
+    vs.resolve_qdrant_dir = lambda: canonical_base
+    try:
+        yield
+    finally:
+        deps.get_settings = real_get
+        vs.resolve_qdrant_dir = real_resolve
+
+
+def _make_index(path, files=2, size=64 * 1024):
+    """Create a directory that looks like a per-case index. Not real Qdrant."""
+    os.makedirs(path, exist_ok=True)
+    for i in range(files):
+        with open(os.path.join(path, f"seg{i}.dat"), "wb") as fh:
+            # A filler byte, not a NUL escape. The content is irrelevant to a
+            # size fixture, and a backslash-escaped NUL literal in a fixture is
+            # one more thing that can be wrong in a way that quietly doubles
+            # every measurement the suite makes.
+            fh.write(b"x" * size)
+    return path
+
+
+def section_qdrant_layout():
+    """
+    An index has two legitimate homes, and the probe has to know about both.
+
+    This section is the guard for a real regression. The probe used to list
+    the directory it was handed and then ask ``case_qdrant_path()`` where the
+    index was -- a function that resolves against global settings and takes no
+    directory argument. Whenever those two disagreed, it counted zero indexes
+    and reported "0 of N case directories hold a Qdrant index" while they sat
+    right there. Fifteen assertions in section E caught it, but only because
+    section E probes directories that are not the configured root.
+    """
+    print("\n=== E2. the two legal homes for a case index ===")
+
+    # The regression itself: index in the cases directory, the writer's base
+    # pointing somewhere else entirely, and the probed tree IS the configured
+    # root. Old code reported 0 here.
+    tree = build_cases_tree("lay_legacy", ["c1", "c2"], qdrant_cases=["c1"],
+                            bytes_per_file=64 * 1024, files_per_index=2)
+    other = _p("lay_elsewhere")
+    with qdrant_layout(tree, other):
+        r = sh.probe_vector_store(tree)
+    check("an index beside its case is counted, even when the writer "
+          "stores them elsewhere",
+          r["case_collections"] == 1, r["case_collections"])
+    check("it is reported as un-migrated, by count",
+          r["unmigrated_collections"] == 1, r["unmigrated_collections"])
+    check("and the reason names the location it should be at",
+          "lay_elsewhere" in (r["reason"] or "").lower(), r["reason"])
+    # The consequence, not just the layout. get_client() creates whatever
+    # directory it is handed, so a case indexed only in-cases gets a fresh
+    # empty collection on the next query and searches it for nothing. A health
+    # page that only says "the layout is untidy" would let an investigator
+    # read a fully indexed case as an empty one -- the exact conclusion this
+    # page exists to prevent.
+    check("and the reason says those cases will return NO RESULTS, "
+          "because that is the actual consequence",
+          "no results" in (r["reason"] or "").lower()
+          and "migrate" in (r["reason"] or "").lower(), r["reason"])
+    check("a measured un-migrated index is degraded, not ok",
+          r["state"] != "ok", r["state"])
+
+    # A skipped file makes the total a lower bound rather than removing it, so
+    # the two failure shapes are distinct and each has its own wording.
+    _tree_skipped = build_cases_tree("lay_skip", ["s1"], qdrant_cases=["s1"],
+                                     bytes_per_file=16, files_per_index=4)
+    _base_skipped = _p("lay_skip_store")
+    _real_cap2 = sh._MAX_WALK_FILES
+    try:
+        sh._MAX_WALK_FILES = 2
+        with qdrant_layout(_tree_skipped, _base_skipped):
+            r_skip = sh.probe_vector_store(_tree_skipped)
+    finally:
+        sh._MAX_WALK_FILES = _real_cap2
+    # Exceeding the cap yields NO size at all (an existing, correct rule), so
+    # there is no total to call a lower bound -- the cap note already says the
+    # on-disk size was not measured. The hint earns its keep in the *partial*
+    # case: a file that cannot be stat'ed makes the total a lower bound, and
+    # when an un-migrated index was the one walked the number omits a real
+    # index without saying so.
+    check("hitting the cap reports no size AND names the un-migrated index",
+          r_skip["total_size_mb"] is None
+          and "no results" in (r_skip["reason"] or "").lower(),
+          (r_skip["total_size_mb"], r_skip["reason"]))
+    check("and the cap is restored", sh._MAX_WALK_FILES == _real_cap2,
+          sh._MAX_WALK_FILES)
+
+    # The other home: the writer's canonical location. This is what a healthy
+    # relocated deployment looks like, and the old code handled it -- so this
+    # assertion cannot fail on the old code, and is here to stop the FIX from
+    # breaking the path that used to work.
+    # No qdrant_cases here: this case is indexed ONLY at the canonical
+    # location. Creating the in-cases copy as well would make it a duplicate,
+    # which is the next assertion's job to check.
+    tree2 = build_cases_tree("lay_canon", ["k1", "k2"])
+    base = _p("lay_canon_store")
+    _make_index(os.path.join(base, "k2", "qdrant"))
+    with qdrant_layout(tree2, base):
+        r2 = sh.probe_vector_store(tree2)
+    check("an index at the canonical location is still counted",
+          r2["case_collections"] == 1, r2["case_collections"])
+    check("a canonically-stored index is not called un-migrated",
+          r2["unmigrated_collections"] == 0, r2["unmigrated_collections"])
+    check("and the canonical case is clean",
+          r2["state"] == "ok", r2.get("reason"))
+
+    # Both homes. Two copies of one index is a real defect that
+    # migrate_qdrant_layout() refuses to paper over by overwriting, so it is
+    # named rather than silently collapsed into one number.
+    tree3 = build_cases_tree("lay_both", ["d1", "d2"], qdrant_cases=["d1"],
+                             bytes_per_file=64 * 1024, files_per_index=2)
+    base3 = _p("lay_both_store")
+    _make_index(os.path.join(base3, "d1", "qdrant"))
+    with qdrant_layout(tree3, base3):
+        r3 = sh.probe_vector_store(tree3)
+    check("a case indexed in BOTH places counts once, not twice",
+          r3["case_collections"] == 1, r3["case_collections"])
+    check("the duplication is counted", r3["duplicate_collections"] == 1,
+          r3["duplicate_collections"])
+    one_index = round(2 * 64 * 1024 / (1024 * 1024), 2)
+    check("and the size counts the canonical copy only, not both",
+          r3["total_size_mb"] == one_index,
+          (r3["total_size_mb"], one_index))
+    check("duplication is degraded with a reason saying so",
+          r3["state"] != "ok" and "both" in (r3["reason"] or "").lower(),
+          (r3["state"], r3["reason"]))
+
+    # A tree that is NOT this machine's configured root. Publishing a
+    # migration verdict about a directory the app does not use is the same
+    # fabrication as publishing a count for one it never measured -- and it is
+    # what made the first attempt at this fix fail section A.
+    plain = build_cases_tree("lay_plain", ["q1"], qdrant_cases=["q1"],
+                             bytes_per_file=1024, files_per_index=1)
+    elsewhere = sh.probe_vector_store(plain)   # no qdrant_layout wrapper
+    check("a directory that is not the configured root reports the split as "
+          "None, not 0",
+          elsewhere["unmigrated_collections"] is None
+          and elsewhere["duplicate_collections"] is None,
+          (elsewhere["unmigrated_collections"],
+           elsewhere["duplicate_collections"]))
+    check("and such a directory carries no migration reason",
+          "migrat" not in (elsewhere.get("reason") or "").lower(),
+          elsewhere.get("reason"))
+    check("but the count for it is still real",
+          elsewhere["case_collections"] == 1, elsewhere["case_collections"])
+
+
 def section_cases_dir():
     """
     Existence is not writability, and on this platform a read-only
@@ -1127,11 +1304,14 @@ def section_route():
                                          "cases_dir")))
 
 
-def section_no_side_effects():
+def section_no_side_effects(fingerprint_before):
     print("\n=== K. this script left nothing behind ===")
     after = _db_fingerprint()
-    check(f"the real database was never opened ({_DB_FINGERPRINT} -> {after})",
-          after == _DB_FINGERPRINT, ( _DB_FINGERPRINT, after))
+    # Size unchanged AND mtime unchanged. mtime is the part that matters: a
+    # write of identical content still updates it, so a suite that only
+    # compared sizes could write to the real database and pass.
+    check(f"the real database was never opened ({fingerprint_before} -> {after})",
+          after == fingerprint_before, (fingerprint_before, after))
     check("the module's real engine is restored",
           backend.database.engine is not None
           and backend.database.engine.url.database != "None",
@@ -1153,17 +1333,26 @@ def main():
     print("Service health verification — GET /api/status")
     print("=" * 66)
 
+    # Re-taken here, not reused from import time. The import-time fingerprint
+    # was captured before a single assertion ran, so anything that touched the
+    # real database in the interim -- another process, an editor, the app's own
+    # worker -- changed mtime and the closing check reported it as this suite's
+    # side effect. The check is "this script did not write to it", and only a
+    # reading taken around the run can answer that.
+    fingerprint_before = _db_fingerprint()
+
     section_happy_path()
     section_database()
     section_ollama_and_legacy()
     section_worker()
     section_vector_store()
+    section_qdrant_layout()
     section_cases_dir()
     section_embeddings()
     section_degradation()
     section_no_caching()
     section_route()
-    section_no_side_effects()
+    section_no_side_effects(fingerprint_before)
 
     print(f"\n{'=' * 66}")
     print(f"PASSED: {len(PASS)}    FAILED: {len(FAIL)}"

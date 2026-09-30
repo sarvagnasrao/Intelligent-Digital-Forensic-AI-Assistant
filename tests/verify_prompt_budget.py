@@ -315,10 +315,23 @@ print("\n--- H. the original symptom cannot come back ---")
 
 _, tight = build_prompt("q", big_chunks(), graph, "", budget)
 # The pre-fix pipeline had no budget at all: chars_elided was undefined and
-# 210,795 characters went out. Guard the specific number that overflowed.
-check("H1 the prompt is well under the overflow point",
-      int(tight["estimated_tokens"]) < 4096,
-      f"est {tight['estimated_tokens']} vs a 4096 window")
+# 210,795 characters went out, which is how a 212,000-character prompt reached a
+# 4,096-token model looking intact and was actually discarded.
+#
+# This asserts the *property* -- the assembled prompt fits the window it will
+# be served with -- and deliberately does NOT pin the window size. A previous
+# version hardcoded `< 4096`, which was a statement about one machine on one
+# day: it passed for the wrong reason the moment the window was corrected, and
+# would have kept "passing" against a stale number while the real window moved.
+# A literal here is the same class of hardcode as the one it was guarding.
+check("H1 the prompt fits the window it will be served with",
+      int(tight["estimated_tokens"]) <= budget,
+      f"est {tight['estimated_tokens']} vs a {budget}-token budget "
+      f"({effective_context_tokens()}-token window)")
+check("H1b the window is not the 4,096 default the model used to be served at",
+      effective_context_tokens() > 4096,
+      f"window is {effective_context_tokens()}; if this is 4096 the request "
+      f"is not carrying num_ctx and the budget is a lie")
 check("H2 the elision total is reported so the UI can disclose it",
       isinstance(tight["chars_elided"], int)
       and tight["chars_elided"] > 0)
@@ -366,6 +379,7 @@ sent = {}
 def _fake_post(url, json=None, timeout=None):
     sent["prompt"] = json["prompt"]
     sent["num_predict"] = json["options"]["num_predict"]
+    sent["options"] = json["options"]
     return _Resp({
         "response": "ok",
         "prompt_eval_count": 120,
@@ -425,6 +439,168 @@ try:
 
 finally:
     ollama_client.requests.post = _real_post
+
+
+# ---------------------------------------------------------------------------
+# J. The window is a control, not a number that only feeds the arithmetic
+# ---------------------------------------------------------------------------
+# ollama_num_ctx used to reach ONLY the budget arithmetic. Nothing sent it to
+# Ollama, so Ollama served its own 4,096 default, truncated the prompt in
+# silence, and returned a confident answer built from the tail. The dangerous
+# property of that bug: raising OLLAMA_NUM_CTX in .env -- the obvious remedy --
+# made the app budget as if it had room while the truncation got worse, because
+# the saturation check compared eval_count against a limit the app had invented
+# rather than one Ollama had agreed to.
+#
+# So these assert the transport contract, not the arithmetic. They are the
+# assertions that would have failed on the old code.
+
+print("\n--- J. the window is actually requested ---")
+
+from backend.modules.ollama_client import (
+    model_context_limit, requested_context_tokens)
+
+_limit = model_context_limit()
+_requested = requested_context_tokens()
+
+check("J1 the model's own capability is readable, or None",
+      _limit is None or (isinstance(_limit, int) and _limit > 0),
+      f"model_context_limit() returned {_limit!r}; None is honest, 0 is not")
+check("J2 the request never exceeds what the model can serve",
+      _limit is None or _requested <= _limit,
+      f"asked {_requested} of a model that does {_limit}")
+check("J3 the request is larger than the 4,096 the model defaults to",
+      _requested > 4096,
+      f"requested {_requested}; at 4096 the app is budgeting against a "
+      f"window nobody agreed to")
+check("J4 budget and request are derived from the same number",
+      abs(prompt_budget_tokens()
+          - (_requested - get_settings().ollama_num_predict - 256)) <= 1,
+      f"budget {prompt_budget_tokens()} vs request {_requested} -- if these "
+      f"diverge the prompt is sized against a window that is not being served")
+
+# The payload itself, observed at the boundary that changed.
+#
+# EVERY request is recorded, not just the last one. The first version of this
+# kept a single slot, and the assertion therefore read whichever request
+# happened to be most recent -- which is not the request under test. A
+# /api/show capability probe is issued *after* generation (the response
+# analysis re-reads the window), and while Ollama is up that probe is served
+# from cache and never happens, so the slot still held /api/generate and the
+# guard passed. With Ollama down, model_context_limit() re-probes on every
+# call -- its cache only short-circuits on a non-None value -- so the slot held
+# the probe, whose payload has no "options" key, and J5/J6 reported
+# "num_ctx is not on the wire" when it was on the wire and had been all along.
+#
+# A guard that passes only while a cache is warm is a description of the fix,
+# not a check on it. The subject here is the /api/generate request, so the
+# capture selects by URL instead of by recency.
+_captured = []
+
+
+def _capture_post(url, json=None, timeout=None, **kw):
+    _captured.append({"url": url, "payload": json})
+    return _Resp({"response": "ok", "prompt_eval_count": 10, "eval_count": 2})
+
+
+ollama_client.requests.post = _capture_post
+try:
+    generate_response_detailed("q", "sys")
+finally:
+    ollama_client.requests.post = _real_post
+
+_generate = [c for c in _captured
+             if str(c.get("url", "")).endswith("/api/generate")]
+check("J5a a /api/generate request was actually observed",
+      len(_generate) == 1,
+      f"captured {len(_captured)} request(s): "
+      f"{[str(c.get('url')) for c in _captured]}")
+
+_wire = (_generate[0].get("payload") or {}).get("options") if _generate else {}
+check("J5 num_ctx is on the wire, not just in the budget",
+      isinstance(_wire.get("num_ctx"), int),
+      f"the /api/generate options carried {_wire} -- without num_ctx Ollama "
+      f"picks its own default and the budget is fiction")
+check("J6 the wire value is the clamped one",
+      _wire.get("num_ctx") == _requested,
+      f"wire {_wire.get('num_ctx')} vs requested {_requested}")
+
+# And the second guard: a window smaller than we think we have must still be
+# caught, which is the exact failure the old saturation check could not see.
+def _saturating_post(prompt_eval_count, estimated_tokens):
+    def _p(url, json=None, timeout=None):
+        return _Resp({"response": "ok", "prompt_eval_count": prompt_eval_count,
+                      "eval_count": 2})
+    return _p
+
+
+for _label, _eval, _est, _want in (
+    # eval below the believed limit but far below what we sent -> truncated
+    ("a window smaller than we believe we have", 1200, 14000, True),
+    # the whole prompt was read -> not truncated
+    ("a prompt that fit", 12000, 12500, False),
+    # saturated to the token -> truncated (the original B26 signature)
+    ("saturation to the last token", 16384, 16384, True),
+):
+    ollama_client.requests.post = _saturating_post(_eval, _est)
+    try:
+        _o = generate_response_detailed("filler " * (_est // 2), "sys")
+    finally:
+        ollama_client.requests.post = _real_post
+    check(f"J7 {_label} is detected",
+          _o["saturated"] is _want,
+          f"eval {_eval} of est {_est} -> saturated {_o['saturated']}, "
+          f"wanted {_want}")
+
+
+# ---------------------------------------------------------------------------
+# K. The window is reported, so the fix is visible from outside the process
+# ---------------------------------------------------------------------------
+# Nothing surfaced the served window, so a 4,096-token model and a 16,384-token
+# one were indistinguishable from the System Health page. An operator who could
+# not see it could not confirm the fix had taken effect -- and could not notice
+# it silently regressing.
+#
+# Unlike every other section here this one does touch the network, because
+# ollama_diagnostic() reads /api/tags, /api/show and /api/ps for real. That is
+# the point: the claim under test is about what an operator can observe, and
+# asserting it against a stub would only prove the stub was called. It is safe
+# when Ollama is down -- every probe is wrapped and the unmeasurable values
+# come back None rather than raising.
+
+print("\n--- K. the window is visible from outside ---")
+
+_diag = ollama_client.ollama_diagnostic()
+
+for _k in ("model_context_tokens", "requested_context_tokens",
+           "effective_context_tokens", "prompt_budget_tokens"):
+    check(f"K1 the diagnostic reports {_k}", _k in _diag,
+          f"ollama_diagnostic() has no {_k}; the window is invisible to an "
+          f"operator and can regress unnoticed")
+
+# A capability that could not be read is None. 0 would read as "this model has
+# no context window", which is a different and much more alarming claim.
+_cap = _diag.get("model_context_tokens")
+check("K2 an unreadable capability is None, never 0",
+      _cap is None or (isinstance(_cap, int) and _cap > 0),
+      f"model_context_tokens is {_cap!r}")
+
+_req = _diag.get("requested_context_tokens")
+_eff = _diag.get("effective_context_tokens")
+_budget = _diag.get("prompt_budget_tokens")
+
+check("K3 the reported request is the same number the transport sends",
+      _req == _requested,
+      f"diagnostic says {_req}, the wire says {_requested} -- two numbers "
+      f"for one fact is how the reporting-only bug came back")
+check("K4 the reported budget leaves room for the completion",
+      isinstance(_budget, int) and 0 < _budget < _eff,
+      f"budget {_budget} against a {_eff} window; n_ctx is shared between "
+      f"prompt and completion so the budget must be the smaller number")
+check("K5 the budget is materially above the 4,096 default",
+      isinstance(_budget, int) and _budget > 2816,
+      f"budget {_budget}; 2,816 is what this was before the window was "
+      f"actually requested")
 
 
 print(f"\n{'=' * 56}")

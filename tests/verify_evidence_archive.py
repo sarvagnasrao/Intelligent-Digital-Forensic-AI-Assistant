@@ -29,6 +29,7 @@ import sys
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -38,6 +39,9 @@ except Exception:
 from fastapi.testclient import TestClient
 
 PASS, FAIL = [], []
+
+from _purge import Purge                                     # noqa: E402
+_PURGE = Purge("verify_evidence_archive")
 
 
 def check(label, cond, detail=""):
@@ -80,6 +84,9 @@ def _make_case_and_evidence(SessionLocal, models, n_evidence=2,
     db = SessionLocal()
     try:
         case_id = str(uuid.uuid4())
+        # Tracked as soon as it exists, so the atexit hook is a real safety net
+        # for a run that dies before `_cleanup` at the end of main().
+        _PURGE.ids(case_id)
         db.add(models.Case(
             id=case_id,
             case_name=f"archive-guard-{case_id[:8]}",
@@ -169,10 +176,18 @@ def main():
         # ── Auth ───────────────────────────────────────────────────────────
         # /login takes an OAuth2 form, not JSON.
         email = f"arch_{uuid.uuid4().hex[:8]}@idfai.test"
-        r = client.post("/api/auth/register", json={
+        _reg = client.post("/api/auth/register", json={
             "username": email, "email": email, "password": "Verify@2026",
             "full_name": "Archive Guard", "role": "Investigator",
         })
+        # The account was never deleted, so data/forensic.db grew by one
+        # `arch_*` user per run -- see tests/_purge.py. Both the id and the
+        # username are needed: the audit row registration writes carries the
+        # username in `performed_by`, so deleting by id alone orphans it.
+        try:
+            _PURGE.user((_reg.json() or {}).get("id"), email)
+        except Exception:
+            _PURGE.user(None, email)
         r = client.post("/api/auth/login", data={
             "username": email, "password": "Verify@2026"})
         token = (r.json() or {}).get("access_token")

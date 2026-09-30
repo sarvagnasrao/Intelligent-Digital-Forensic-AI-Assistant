@@ -33,6 +33,7 @@ import tempfile
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # The Windows console defaults to cp1252 and chokes on the em-dash used in
 # the assertion labels. Force UTF-8 rather than silently dropping output.
@@ -42,6 +43,9 @@ except Exception:
     pass
 
 PASS, FAIL = [], []
+
+from _purge import Purge                                     # noqa: E402
+_PURGE = Purge("verify_job_stop")
 
 # A paragraph repeated enough times to produce roughly 100 chunks at the
 # "accurate" chunk size. The size matters: the document path embeds a batch of
@@ -127,6 +131,9 @@ def part_a():
 
     db = SessionLocal()
     case_id = str(uuid.uuid4())
+    # Tracked as soon as it exists so the atexit hook is a real safety net for
+    # a run that dies before `_cleanup` at the end of main().
+    _PURGE.ids(case_id)
     ev_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     tmp_dir = tempfile.mkdtemp(prefix="idfai_stop_test_")
@@ -288,9 +295,17 @@ def part_b():
 
     with TestClient(app) as client:
         email = f"stop_{uuid.uuid4().hex[:8]}@idfai.test"
-        client.post("/api/auth/register", json={
+        _reg = client.post("/api/auth/register", json={
             "username": email, "email": email, "password": "Verify@2026",
             "full_name": "Stop Verifier", "role": "Investigator"})
+        # The throwaway account was never deleted, so data/forensic.db grew by
+        # one `stop_*` user per run -- see tests/_purge.py. Tracked by id *and*
+        # username: the audit row registration writes carries the username in
+        # `performed_by`, so deleting by id alone would orphan it.
+        try:
+            _PURGE.user((_reg.json() or {}).get("id"), email)
+        except Exception:
+            _PURGE.user(None, email)
         r = client.post("/api/auth/login", data={
             "username": email, "password": "Verify@2026"})
         token = (r.json() or {}).get("access_token")
@@ -302,6 +317,25 @@ def part_b():
             print("  SKIP  could not authenticate")
             return case_id
         H = {"Authorization": f"Bearer {token}"}
+
+        # Promote to Investigator in the database, rather than asking for the
+        # role at registration. `/register` used to honour a client-supplied
+        # "role", which was a privilege-escalation hole (any anonymous caller
+        # could register as Admin); it now assigns Analyst to every user after
+        # the first and ignores the request. This suite was relying on that
+        # hole to get a privileged token — a test passing because of a
+        # vulnerability — so the role is obtained here the way an
+        # administrator would grant it. require_role() re-reads `user.role` on
+        # every request, so no re-login is needed.
+        _db = SessionLocal()
+        try:
+            _me = _db.query(models.User).filter(
+                models.User.username == email).first()
+            if _me:
+                _me.role = "Investigator"
+                _db.commit()
+        finally:
+            _db.close()
 
         # The fixture is created only now, on purpose. TestClient's startup
         # runs the real background worker, whose orphan sweep flips any

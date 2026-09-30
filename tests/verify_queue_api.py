@@ -21,6 +21,18 @@ from fastapi.testclient import TestClient
 
 PASS, FAIL = [], []
 
+# Cleanup that runs on every exit path -- see tests/_purge.py for why the
+# three original statements at the end of the happy path were not enough.
+# Measured: they left 92 test accounts and 249 orphaned audit rows in
+# data/forensic.db, because they never removed the registered user and never
+# ran at all on a failing one.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _purge import Purge                                     # noqa: E402
+
+_PURGE = Purge("verify_queue_api")
+_purge, _track = _PURGE.run, _PURGE.ids
+_track_user = _PURGE.user
+
 
 def check(label, cond, detail=""):
     (PASS if cond else FAIL).append(label)
@@ -30,15 +42,57 @@ def check(label, cond, detail=""):
 def main():
     from backend.main import app
     from backend.database import SessionLocal
+    from backend.modules import job_worker as jw
     from backend import models
 
     with TestClient(app) as client:
+        # ── Stop the ingestion worker before anything else ──────────────────
+        # Entering this block ran the FastAPI lifespan, and that lifespan
+        # calls `job_worker.start_worker()`. So this suite was racing a live
+        # worker thread for its whole run.
+        #
+        # It showed up as a gate failure that looked like a product
+        # regression:
+        #
+        #   FAIL  patch returns 200 - {"detail":"The ingestion profile is
+        #         fixed once a job starts ..."}
+        #
+        # `/api/queue/add` creates a `Queued` job, the worker's loop polls
+        # every 2 s, and it can start that job before the next request
+        # arrives. Once the row said `Running`, refusing a profile change is
+        # the *correct* product behaviour (B16) and the assertion failed
+        # against it. A day before a review that is the worst possible
+        # failure: a red suite that invites somebody to "fix" the product,
+        # when the product is right.
+        #
+        # The fix is to remove the race, not to weaken the assertion. Every
+        # status this suite asserts on is now one the suite itself chose.
+        #
+        # It has to happen *inside* the `with`, because the lifespan runs on
+        # entry and would start the worker again otherwise.
+        jw.stop_worker()
+        _t = jw._worker_thread
+        if _t is not None and _t.is_alive():
+            # The loop sleeps up to 2 s between polls and a job already in
+            # flight runs to completion, so this is not instant.
+            _t.join(timeout=30)
+        check("the ingestion worker is stopped, so job status is "
+              "deterministic rather than a race",
+              _t is None or not _t.is_alive(),
+              "STILL ALIVE - every status assertion below is a race"
+              if (_t is not None and _t.is_alive()) else "exited")
         # ── Auth ───────────────────────────────────────────────────────────
         email = f"modes_{uuid.uuid4().hex[:8]}@idfai.test"
         r = client.post("/api/auth/register", json={
             "username": email, "email": email, "password": "Verify@2026",
             "full_name": "Mode Verifier", "role": "Investigator",
         })
+        # Tracked the moment it exists, by id *and* by username, so the hook can
+        # remove both the account and the audit row registration wrote for it.
+        try:
+            _track_user((r.json() or {}).get("id"), email)
+        except Exception:
+            pass
         token = None
         if r.status_code < 400:
             # Register returns 201 without a token; sign in to get one.
@@ -55,6 +109,33 @@ def main():
             print(f"  SKIP  could not authenticate: {r.status_code} {r.text[:200]}")
             return 0
         H = {"Authorization": f"Bearer {token}"}
+
+        # ── Promote to Investigator, in the database ────────────────────────
+        # This used to ask for the role at registration:
+        #     "role": "Investigator"
+        # and it worked, because /register honoured whatever the client
+        # asked for. That was a privilege-escalation hole — any anonymous
+        # caller could register as Admin — and it has since been closed:
+        # the server now assigns Analyst to every user after the first and
+        # ignores any requested role.
+        #
+        # So this suite was passing *because of* the vulnerability, and
+        # closing it turned 12 assertions red. The honest repair is here
+        # rather than in the router: a test that needs a privileged account
+        # must say so out loud, and must obtain the role the way an
+        # administrator would, instead of relying on a hole.
+        #
+        # require_role() re-reads `user.role` off the row on every request,
+        # so no re-login is needed after the UPDATE.
+        db = SessionLocal()
+        try:
+            me = db.query(models.User).filter(
+                models.User.username == email).first()
+            if me:
+                me.role = "Investigator"
+                db.commit()
+        finally:
+            db.close()
 
         # ── GET /queue/modes ───────────────────────────────────────────────
         print("\n=== GET /api/queue/modes ===")
@@ -154,6 +235,7 @@ def main():
             db.add(models.Case(id=case_id, case_name="API modes",
                                created_by="verify"))
             db.commit()
+            _track(case_id)
             ev_id = str(uuid.uuid4())
             path = os.path.join(os.environ.get("TEMP", "."),
                                 f"apimode_{ev_id[:8]}.txt")
@@ -171,6 +253,7 @@ def main():
                 file_path=path, sha256_hash="2" * 64,
                 ingested_by="verify", status="Uploaded"))
             db.commit()
+            _track(ev_id)
         finally:
             db.close()
 
@@ -361,6 +444,7 @@ def main():
                 current_step="Stopped by user", created_by="verify",
                 ingestion_mode="accurate"))
             db.commit()
+            _track(ev2, stopped_job)
         finally:
             db.close()
 
@@ -398,16 +482,13 @@ def main():
               r.json().get("rescanned") is True, r.json().get("rescanned"))
 
         # ── Cleanup ────────────────────────────────────────────────────────
+        # The atexit hook does the row deletion on every path, including the
+        # failing and the interrupted ones. This explicit call keeps the happy
+        # path's behaviour visible and lets the temp file go now rather than at
+        # interpreter shutdown; it is idempotent.
         client.delete(f"/api/queue/{job_id}", headers=H)
-        db = SessionLocal()
-        try:
-            ids = [i for i in (job_id, ev_id, case_id, ev2, stopped_job) if i]
-            for m in (models.IngestionJob, models.Evidence, models.Case):
-                db.query(m).filter(m.id.in_(ids)).delete(
-                    synchronize_session=False)
-            db.commit()
-        finally:
-            db.close()
+        _track(job_id, ev_id)
+        _purge()
         try:
             os.remove(path)
         except OSError:

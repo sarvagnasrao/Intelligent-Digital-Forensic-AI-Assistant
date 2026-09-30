@@ -181,6 +181,33 @@ def main():
             print("  SKIP  no token")
             return 0
         H = {"Authorization": f"Bearer {token}"}
+
+        # Promote to Investigator in the database. `/register` used to honour
+        # a client-supplied "role" — a privilege-escalation hole, now closed,
+        # since it let any anonymous caller register as Admin. This suite
+        # asked for "Investigator" at signup and therefore depended on that
+        # hole; it now obtains the role the way an administrator would.
+        # require_role() re-reads `user.role` per request, so the token does
+        # not need to be reissued.
+        #
+        # Imported locally and aliased, because main() has no module-level
+        # database import and — more importantly — because the "ollama
+        # reachable" assertion above binds the name `models` to the LIST of
+        # installed Ollama models. Using that name here would have queried
+        # `models.User` on a list, which is the kind of mistake that only
+        # surfaces on the day someone reorders the file.
+        from backend.database import SessionLocal as _SessionLocal
+        from backend import models as _models
+        _db = _SessionLocal()
+        try:
+            _me = _db.query(_models.User).filter(
+                _models.User.username == email).first()
+            if _me:
+                _me.role = "Investigator"
+                _db.commit()
+        finally:
+            _db.close()
+
         me = c.get("/api/auth/me", headers=H)
         check("authenticated", me.status_code == 200,
               (me.json() or {}).get("username"))

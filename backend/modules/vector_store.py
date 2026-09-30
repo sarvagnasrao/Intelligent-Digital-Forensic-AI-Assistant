@@ -411,6 +411,20 @@ def search_chunks(query: str,
     """
     Searches for semantically similar chunks.
     Optionally filters by evidence_id.
+
+    Returns [] ONLY when the search genuinely matched nothing.
+
+    This used to end in `except Exception: print(...); return []`, which made
+    a broken index indistinguishable from a clean one — and those two states
+    produce opposite findings. "Nothing in this case matched that question"
+    is the answer that clears a suspect; if a locked Qdrant directory, a
+    missing collection or a dead embedder produces it, the tool is
+    reporting an absence of evidence that it never actually looked for. That
+    is this repo's defining defect (B1, B10, B11, B19, B23) in the one place
+    where the consequence is a person's freedom rather than a stale row.
+
+    So it raises instead, exactly as `store_chunks` does. A caller that
+    swallows this now has to work much harder to be wrong in the same way.
     """
     try:
         client = get_client(qdrant_path)
@@ -446,9 +460,17 @@ def search_chunks(query: str,
             "score": round(r.score, 3)
         } for r in results]
 
+    except StopIteration:
+        # Must precede the handler below: StopIteration is a subclass of
+        # Exception, so without this an operator's stop would be reported as
+        # an index fault.
+        raise
     except Exception as e:
-        print(f"QDRANT SEARCH ERROR: {e}")
-        return []
+        raise VectorStoreError(
+            f"Could not search case {case_id} for "
+            f"{'evidence ' + str(evidence_id) if evidence_id else 'the case'}"
+            f" (top_k={top_k}): {type(e).__name__}: {e}"
+        ) from e
 
 
 def delete_case_collection(case_id: str,

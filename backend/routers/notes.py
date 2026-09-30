@@ -113,7 +113,13 @@ def create_note(
             case_id=case_id,
             linked_to_type=body.linked_to_type,
             linked_to_id=body.linked_to_id,
-            author=body.author,
+            # Was `body.author` - the client's own claim about who wrote the
+            # note. A note is an assertion inside a case file, so a
+            # self-declared author is a falsifiable assertion: any analyst
+            # could plant a note in someone else's name. The authenticated
+            # identity is the only value the server chose, and it is
+            # already resolved by the route dependency.
+            author=current_user.username,
             content=body.content,
             created_at=now,
             updated_at=now,
@@ -126,7 +132,10 @@ def create_note(
         _create_audit(
             db=db,
             action_type="NOTE_ADDED",
-            performed_by=body.author,
+            # Same reasoning as `author` above: the audit log is the
+            # forensic chain of record, and an entry whose actor is
+            # self-declared cannot serve as one.
+            performed_by=current_user.username,
             details={
                 "note_id": note_id,
                 "linked_to_type": body.linked_to_type,

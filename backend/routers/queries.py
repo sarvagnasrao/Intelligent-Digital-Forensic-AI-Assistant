@@ -156,7 +156,9 @@ def ask_question(
             qdrant_path=qdrant_path,
             cases_dir=settings.cases_dir,
             evidence_id=body.evidence_id,
-            asked_by=body.asked_by,
+            # Also feeds the prompt, so the client was choosing how the
+            # model addressed the investigator. Same fix, same reason.
+            asked_by=current_user.username,
             conversation_history=body.conversation_history
         )
 
@@ -166,7 +168,18 @@ def ask_question(
             id=query_id,
             case_id=case_id,
             evidence_id=body.evidence_id,
-            asked_by=body.asked_by,
+            # Was `body.asked_by` - a field the client supplied, written
+            # verbatim into the case record AND into the audit log below.
+            #
+            # This is the same trust mistake as `Case.created_by` and
+            # `Note.author`, but the worst instance of the three, because
+            # an audit entry whose actor is chosen by the actor is not an
+            # audit entry: any authenticated user could put another
+            # user's name on a question and on the QUERY_MADE record of
+            # it, and both rows would agree with each other and disagree
+            # with the access log. The authenticated identity is already
+            # resolved by the route dependency.
+            asked_by=current_user.username,
             question_text=body.question_text,
             raw_llm_response=result[
                 "raw_llm_response"],
@@ -189,7 +202,8 @@ def ask_question(
             id=str(uuid.uuid4()),
             case_id=case_id,
             action_type="QUERY_MADE",
-            performed_by=body.asked_by,
+            # Same reasoning as `asked_by` above.
+            performed_by=current_user.username,
             details=json.dumps({
                 "question": body.question_text,
                 "model": result["model_used"],

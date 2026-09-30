@@ -101,18 +101,21 @@ def register(
             status_code=400,
             detail="Email already registered")
 
-    # First user becomes Admin
+    # First user becomes Admin; every later registration is Analyst until
+    # an existing Admin promotes it.
+    #
+    # This used to be `role = "Admin" if user_count == 0 else body.role`,
+    # which meant the first visitor to /register got Admin and *every
+    # visitor after that* got whatever role they selected in the form -
+    # including Admin. Public self-service privilege escalation, on a product
+    # whose whole purpose is a chain of custody. The role dropdown in the UI
+    # is removed as well, but the boundary that matters is this one: a
+    # client-supplied role is never trusted, and there is no request shape
+    # that reaches this line with a privileged role.
     user_count = db.query(
         models.User).count()
     role = "Admin" if user_count == 0 \
-        else body.role
-
-    # Validate role
-    valid_roles = [
-        "Admin", "Investigator",
-        "Analyst", "Viewer"]
-    if role not in valid_roles:
-        role = "Analyst"
+        else "Analyst"
 
     user = models.User(
         id=str(uuid.uuid4()),
@@ -147,7 +150,10 @@ def register(
             "Account created. "
             "You are the Admin."
             if role == "Admin"
-            else "Account created."
+            else "Account created with the "
+                 "Analyst role. An existing "
+                 "Admin can change it from "
+                 "User Management."
         )
     }
 

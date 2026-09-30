@@ -146,7 +146,6 @@ def list_evidence(
 @router.post("/upload", response_model=schemas.EvidenceResponse, status_code=201)
 async def upload_evidence(
     case_id: str,
-    ingested_by: str = Form(...),
     file: UploadFile = File(...),
     include_deleted: bool = Form(False),
     db: Session = Depends(get_db),
@@ -235,7 +234,16 @@ async def upload_evidence(
             file_path=file_path,
             sha256_hash=hash_value,
             ingested_at=datetime.utcnow(),
-            ingested_by=ingested_by,
+            # Was a required multipart form field (`ingested_by: str =
+            # Form(...)`), written into Evidence.ingested_by and into the
+            # FILE_UPLOADED audit entry. So the name recorded against an
+            # upload - which is a chain-of-custody fact, not a label - was
+            # a string typed into the request. It was removed from the
+            # signature entirely rather than ignored: a required field
+            # that decides nothing is a trap, and on the *chain of
+            # custody* record the whole point is that it decides
+            # something true.
+            ingested_by=current_user.username,
             status="Uploaded",
             chunk_count=0,
             entity_count=0,
@@ -248,7 +256,7 @@ async def upload_evidence(
         _create_audit(
             db=db,
             action_type="FILE_UPLOADED",
-            performed_by=ingested_by,
+            performed_by=current_user.username,
             details={
                 "filename": original_filename,
                 "file_size": file_size_bytes,
@@ -285,7 +293,6 @@ from typing import List
 @router.post("/upload_multi", response_model=schemas.EvidenceResponse, status_code=201)
 async def upload_multi_evidence(
     case_id: str,
-    ingested_by: str = Form(...),
     files: List[UploadFile] = File(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(require_investigator),
@@ -388,7 +395,7 @@ async def upload_multi_evidence(
                 file_path=file_path,
                 sha256_hash=sha256.hexdigest(),
                 ingested_at=datetime.utcnow(),
-                ingested_by=ingested_by,
+                ingested_by=current_user.username,
                 status="Uploaded",
                 notes=(
                     f"Combined from {len(sorted_images)} split files"
@@ -429,7 +436,7 @@ async def upload_multi_evidence(
                 file_path=path,
                 sha256_hash=digest.hexdigest(),
                 ingested_at=datetime.utcnow(),
-                ingested_by=ingested_by,
+                ingested_by=current_user.username,
                 status="Uploaded",
             )
             db.add(item)

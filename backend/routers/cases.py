@@ -153,7 +153,17 @@ def create_case(
             status="Open",
             priority=body.priority,
             description=body.description,
-            created_by=body.created_by,
+            # Was `body.created_by` - a field the client supplied, written
+            # straight into the case record. Any authenticated user could
+            # create a case attributed to anyone, including the Admin, and
+            # the lie would persist in the case header forever.
+            #
+            # The authenticated identity is already resolved by the route's
+            # dependency; it is the only value that can be trusted here,
+            # because it is the only one the server chose. The client field
+            # is still accepted (see schemas.CaseCreate) so existing callers
+            # do not break, but it no longer decides anything.
+            created_by=current_user.username,
             tags=json.dumps(body.tags),
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
@@ -172,7 +182,11 @@ def create_case(
         _create_audit(
             db=db,
             action_type="CASE_CREATED",
-            performed_by=body.created_by,
+            # Same reasoning as `created_by` above. The audit log is the
+            # forensic chain of record: a value the caller supplied is a
+            # value the caller can choose, and an audit entry is worthless
+            # the moment its actor is self-declared.
+            performed_by=current_user.username,
             details={"case_name": body.case_name, "case_id": case_id},
             case_id=case_id,
         )

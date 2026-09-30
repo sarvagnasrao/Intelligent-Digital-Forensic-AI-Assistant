@@ -12,7 +12,9 @@ class CaseCreate(BaseModel):
     case_number: Optional[str] = None
     priority: str = "Medium"
     description: Optional[str] = None
-    created_by: str
+    # Accepted for backward compatibility and IGNORED - see the note on
+    # QueryCreate.asked_by. The case's creator is the authenticated user.
+    created_by: Optional[str] = None
     tags: list[str] = []
 
 
@@ -70,7 +72,13 @@ class EvidenceResponse(BaseModel):
 
 class QueryCreate(BaseModel):
     question_text: str
-    asked_by: str
+    # Accepted for backward compatibility and IGNORED. The server records
+    # the authenticated user, so nothing sent here can change who a query
+    # is attributed to. It was previously REQUIRED, which meant every
+    # client had to assert an identity that was then written verbatim into
+    # both the query record and the audit log - a caller-chosen author on
+    # a forensic record. A field that is ignored should not be mandatory.
+    asked_by: Optional[str] = None
     evidence_id: Optional[str] = None
     conversation_history: list = []
 
@@ -119,7 +127,9 @@ class EntityResponse(BaseModel):
 class NoteCreate(BaseModel):
     linked_to_type: Optional[str] = None
     linked_to_id: Optional[str] = None
-    author: str
+    # Accepted for backward compatibility and IGNORED - see the note on
+    # QueryCreate.asked_by. A note's author is the authenticated user.
+    author: Optional[str] = None
     content: str
 
 
@@ -159,7 +169,9 @@ class AuditLogResponse(BaseModel):
 
 class ReportCreate(BaseModel):
     report_type: str
-    generated_by: str
+    # Accepted for backward compatibility and IGNORED — see the note on
+    # QueryCreate.asked_by. The report's author is the authenticated user.
+    generated_by: Optional[str] = None
     query_ids_included: list[str] = []
 
 

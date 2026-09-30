@@ -5,6 +5,108 @@
   import { getGraphData, getEntities } from '../api/client'
   import toast from 'react-hot-toast'
 
+  // ── Canvas palette ──────────────────────────────────────────
+  //
+  // A 2D canvas cannot resolve `var(--x)`. Per the HTML spec, assigning an
+  // unparseable value to fillStyle/strokeStyle is a silent no-op: the
+  // previous value survives. That made every `var(...)` in this file's draw
+  // callbacks a no-op, which had three separate visible consequences:
+  //
+  //   1. Node labels were drawn with the *node's own* fill colour, because
+  //      the only assignment that ever took effect on that context was the
+  //      circle fill a few lines earlier.
+  //   2. Where a background pill was drawn, the pill fill was valid and dark
+  //      (`rgba(4,5,11,0.75)`), and the text colour that followed it was
+  //      rejected - so the text stayed dark. Dark text on a dark pill:
+  //      the labels were drawn and were completely invisible.
+  //   3. Dimming had no effect at all. A non-highlighted edge asked for
+  //      `var(--color-white-06)` and inherited whatever the previously
+  //      drawn edge happened to be, so de-emphasising the graph by
+  //      highlighting a node did nothing to the edges.
+  //
+  // None of these raise an error, which is why it survived review: the code
+  // reads as though it themes correctly. It is the same defect class as
+  // everything else in this app - a true-shaped line of code that does not
+  // do what it says - one layer down in the renderer.
+  //
+  // So the variables are resolved for real, from the computed style, and
+  // re-read when the theme class on <html> changes. The theme is applied as
+  // a `light`/`dark` class rather than through ThemeContext, and `system`
+  // mode can flip it on an OS event, so a MutationObserver is both simpler
+  // and more reliable than threading the context value through here.
+  //
+  // Each entry has a concrete fallback. A missing variable must not resolve
+  // to `transparent`, which would be the same no-op in a slower form: the
+  // fallback is a colour that is legible against the pill, not a colour
+  // that merely parses.
+  const CANVAS_COLORS = {
+    text: {
+      varName: '--text-primary',
+      fallback: '#e2e4f0',
+    },
+    textDim: {
+      varName: '--color-white-4',
+      fallback: 'rgba(226, 228, 240, 0.4)',
+    },
+    selectedBorder: {
+      varName: '--color-white-full',
+      fallback: '#ffffff',
+    },
+    dimEdge: {
+      varName: '--color-white-06',
+      fallback: 'rgba(255, 255, 255, 0.06)',
+    },
+  }
+
+  function readCanvasPalette() {
+    const out = {}
+    let cs = null
+    try {
+      cs = getComputedStyle(document.documentElement)
+    } catch {
+      // No DOM (or a stubbed one in a test). The fallbacks below stand in.
+    }
+    for (const [key, spec] of Object.entries(CANVAS_COLORS)) {
+      let value = ''
+      if (cs) {
+        try {
+          value = (cs.getPropertyValue(spec.varName) || '').trim()
+        } catch {
+          value = ''
+        }
+      }
+      // A custom property that resolves to something the canvas cannot
+      // parse - a nested var(), an empty value, a calc() - is treated the
+      // same as an absent one, because the outcome is identical: the
+      // assignment is dropped and the previous colour survives.
+      out[key] = CANVAS_IS_USABLE_COLOR(value) ? value : spec.fallback
+    }
+    return out
+  }
+
+  function CANVAS_IS_USABLE_COLOR(value) {
+    if (!value) return false
+    // Deliberately narrow. Anything outside this set is a value a canvas
+    // 2D context would reject, and rejecting it is the failure mode this
+    // whole function exists to prevent.
+    return /^(#|rgba?\(|hsla?\()/i.test(value)
+  }
+
+  function useCanvasPalette() {
+    const [palette, setPalette] = useState(() => readCanvasPalette())
+    useEffect(() => {
+      const refresh = () => setPalette(readCanvasPalette())
+      const root = document.documentElement
+      const observer = new MutationObserver(refresh)
+      observer.observe(root, {
+        attributes: true,
+        attributeFilter: ['class', 'style'],
+      })
+      return () => observer.disconnect()
+    }, [])
+    return palette
+  }
+
   // Node type config
   const NODE_TYPES = {
     Person: {
@@ -267,6 +369,10 @@
     const [graphData, setGraphData] = useState({ nodes: [], links: [] })
     const [filteredData, setFilteredData] = useState({ nodes: [], links: [] })
     const [loading, setLoading] = useState(true)
+    // Resolved from the stylesheet, because a canvas 2D context cannot
+    // read var() itself - see CANVAS_COLORS above for what that silently
+    // cost this page before.
+    const palette = useCanvasPalette()
     const [search, setSearch] = useState('')
     const [selectedTypes, setSelectedTypes] = useState([])
     const [selectedNode, setSelectedNode] = useState(null)
@@ -439,7 +545,7 @@
         ctx.fill()
 
         // Border
-        ctx.strokeStyle = isSelected ? 'var(--color-white-full)' : isHighlighted ? `${color}cc` : `${color}30`
+        ctx.strokeStyle = isSelected ? palette.selectedBorder : isHighlighted ? `${color}cc` : `${color}30`
         ctx.lineWidth = isSelected ? 2 : isHighlighted ? 1.5 : 0.5
         ctx.stroke()
 
@@ -450,7 +556,7 @@
           ctx.font = `${isHighlighted ? 500 : 400} ${fontSize}px Inter,sans-serif`
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
-          ctx.fillStyle = isHighlighted ? 'var(--text-primary)' : 'var(--color-white-4)'
+          ctx.fillStyle = isHighlighted ? palette.text : palette.textDim
 
           // Background pill for readability
           if (isHighlighted || isSelected) {
@@ -465,12 +571,18 @@
               fontSize + padding,
               3)
             ctx.fill()
-            ctx.fillStyle = 'var(--text-primary)'
+            // Restored to a real colour, not `var(--text-primary)`. The
+            // pill above is unconditionally dark; in light mode a light
+            // `--text-primary` on it would be just as unreadable as the
+            // invisible text this replaces. The pill is the thing that
+            // guarantees contrast, so the text inside it is pinned to a
+            // colour that reads against that pill in either theme.
+            ctx.fillStyle = '#e2e4f0'
           }
 
           ctx.fillText(label, node.x, node.y + r + fontSize / 2 + 3)
         }
-      }, [highlightNodes, selectedNode]
+      }, [highlightNodes, selectedNode, palette]
     )
 
     // Draw edge with relationship label
@@ -486,7 +598,7 @@
         ctx.beginPath()
         ctx.moveTo(src.x, src.y)
         ctx.lineTo(tgt.x, tgt.y)
-        ctx.strokeStyle = isHighlighted ? 'rgba(129,140,248,0.6)' : 'var(--color-white-06)'
+        ctx.strokeStyle = isHighlighted ? 'rgba(129,140,248,0.6)' : palette.dimEdge
         ctx.lineWidth = isHighlighted ? 1.5 : 0.5
         ctx.stroke()
 
@@ -511,7 +623,7 @@
           ctx.textBaseline = 'middle'
           ctx.fillText(label, midX, midY)
         }
-      }, [highlightLinks]
+      }, [highlightLinks, palette]
     )
 
     const handleZoomIn = () => {

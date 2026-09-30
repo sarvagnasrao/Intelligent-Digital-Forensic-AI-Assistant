@@ -4,17 +4,104 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Intelligent Digital Forensic AI Assistant</title>
-  <script>
-    window.addEventListener('error', function(e) {
-      document.body.innerHTML += '<div style="position:fixed;top:0;left:0;background:red;color:white;z-index:9999;padding:20px;font-family:monospace">' + e.error.stack + '</div>';
-    });
-    window.addEventListener('unhandledrejection', function(e) {
-      document.body.innerHTML += '<div style="position:fixed;top:0;left:0;background:red;color:white;z-index:9999;padding:20px;font-family:monospace">Unhandled Promise: ' + (e.reason && e.reason.stack ? e.reason.stack : e.reason) + '</div>';
-    });
+  <script type="module">
+    // Global error reporting.
+    //
+    // This used to append a full-width red stack trace to <body> on every
+    // error and every unhandled rejection. Two problems, both of which
+    // mattered on a demo machine:
+    //
+    //  1. `innerHTML +=` on <body> does not merely overlay. It re-parses the
+    //     entire document and replaces the root's children, so React's mounted
+    //     tree is destroyed - the app did not just look broken, it stopped
+    //     being interactive and could not recover without a reload.
+    //  2. An unhandled rejection is thrown by background work the
+    //     investigator never initiated: a WebSocket handler, a poll, a
+    //     storage write. So a single stray rejection during a two-hour ingest
+    //     would leave a permanent red wall over the running job, and the
+    //     operator's only way back was a refresh - which is also the moment
+    //     the progress they were watching disappears.
+    //
+    // It now reports into a small fixed corner panel that does not touch the
+    // React tree, can be dismissed, and is a no-op in a production build.
+    // The build flag is the important part: this is a development aid, and
+    // shipping it means shipping a red box that a reviewer can trigger.
+    //
+    // type="module" is required, not stylistic: import.meta only exists in a
+    // module, so the DEV check below is a syntax error in a classic script.
+    // Vite transforms inline module scripts in index.html, so import.meta.env
+    // is replaced at build time and the whole IIFE is dropped from the
+    // production bundle.
+    (function () {
+      if (!import.meta.env || !import.meta.env.DEV) return;
+      var MAX = 4;
+      var shown = 0;
+      function report(kind, detail) {
+        if (shown >= MAX) return;
+        shown++;
+        try {
+          var box = document.createElement('div');
+          box.setAttribute('data-dev-error', 'true');
+          box.style.cssText = [
+            'position:fixed', 'bottom:12px', 'right:12px', 'z-index:9999',
+            'max-width:min(560px,70vw)', 'max-height:34vh', 'overflow:auto',
+            'background:#7f1d1d', 'color:#fee2e2', 'padding:10px 12px',
+            'border-radius:8px', 'font:11px/1.45 ui-monospace,monospace',
+            'white-space:pre-wrap', 'box-shadow:0 8px 24px rgba(0,0,0,.4)'
+          ].join(';');
+          var head = document.createElement('div');
+          head.style.cssText = 'display:flex;justify-content:space-between;gap:12px;margin-bottom:6px;font-weight:700';
+          var label = document.createElement('span');
+          label.textContent = kind;
+          var close = document.createElement('button');
+          close.textContent = 'dismiss';
+          close.style.cssText = 'background:none;border:1px solid #fecaca;color:#fecaca;border-radius:4px;padding:0 6px;cursor:pointer;font:inherit';
+          close.onclick = function () { box.remove(); };
+          head.appendChild(label);
+          head.appendChild(close);
+          var body = document.createElement('div');
+          body.textContent = detail;
+          box.appendChild(head);
+          box.appendChild(body);
+          // Wait for the root to exist. Appending to a missing #root is the
+          // same class of mistake as the original.
+          (document.body || document.documentElement).appendChild(box);
+        } catch (e) { /* reporting must never itself throw */ }
+      }
+      window.addEventListener('error', function (e) {
+        report('Error', (e.error && e.error.stack) || e.message || String(e));
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = e.reason;
+        report('Unhandled rejection', (r && r.stack) ? r.stack : String(r));
+      });
+    })();
   </script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <!--
+    No external requests on this page, deliberately.
+
+    This used to carry three:
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link href="https://fonts.googleapis.com/css2?family=Inter...">
+      <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+    Every one of them broke the product's central promise. The login page
+    advertises "100% Air-gapped" and the deployment is meant to run on a
+    machine with no route to the internet, yet opening the app attempted two
+    DNS lookups and two TLS handshakes to third-party CDNs before anything
+    rendered. On a genuinely isolated host those requests fail - slowly, since
+    a blocked egress usually means a connect timeout, not a refusal - and they
+    hold up first paint. On a connected host they work, and in exchange the
+    investigator's workstation announces itself to Google and unpkg on every
+    page view, which for a tool sold on keeping evidence local is the wrong
+    trade at any latency.
+
+    The fonts are now bundled from node_modules via @fontsource, and Leaflet's
+    stylesheet is imported in main.jsx from the `leaflet` package that was
+    already a dependency. Same rendering, zero third-party contact, and the
+    integrity hash is no longer needed because there is no remote file to
+    verify.
+  -->
 </head>
 <body class="bg-bg-primary text-text-primary">
   <div id="root"></div>

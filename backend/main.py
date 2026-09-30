@@ -801,7 +801,42 @@ def global_search(
 
 # ---------------------------------------------------------------------------
 # GET /api/cases/{case_id}/geomap
-# Returns GPS data from EXIF + IP geolocation
+# Returns GPS data from EXIF metadata.
+#
+# IP GEOLOCATION WAS REMOVED FROM THIS ENDPOINT. It used to call
+# `http://ip-api.com/json/<ip>` once per IP entity in the case, and that was
+# the most significant defect this audit found in the codebase, for three
+# independent reasons:
+#
+#  1. It leaked investigative data to a third party. Every IP address found
+#     in the evidence was sent, in plaintext HTTP, to a public geolocation
+#     service operated by someone else. So the subject of an investigation
+#     - and the fact that they were under investigation - left the machine,
+#     automatically, on a page view. This product's premise is that nothing
+#     does. A chain of custody that copies evidence to a third party on every
+#     map refresh is not a chain of custody.
+#
+#  2. It broke the air-gap promise that the frontend also broke, by fetching
+#     map tiles from tile.openstreetmap.org. The frontend route is now retired
+#     (see frontend/src/constants/hiddenRoutes.js); this removes the server
+#     half of the same problem.
+#
+#  3. It could hang the request for up to 100 seconds. Twenty IPs, each a
+#     sequential `requests.get` with `timeout=5`, inside a synchronous route
+#     handler - and an `except Exception: pass` wrapped around each one, so
+#     the slow case was also the silent case. A page load could sit for a
+#     minute and a half and then render a half-populated map with no sign
+#     that anything had failed.
+#
+# The EXIF half is kept, because it is entirely local: those coordinates were
+# written by the camera and are already inside the evidence file.
+#
+# IP entities are still *reported*, with coordinates absent and a reason
+# attached. Returning them with lat/lon null and nothing else would be
+# indistinguishable from "these addresses could not be located", and the
+# count below would read 0 for a case that plainly contains IP entities -
+# which is exactly the fabricated zero this codebase keeps having to be
+# checked for.
 # ---------------------------------------------------------------------------
 
 @app.get("/api/cases/{case_id}/geomap")
@@ -811,18 +846,23 @@ def get_geo_data(
     db: Session = Depends(get_db)
 ):
     """
-    Returns geographic data for the case:
-    - GPS coordinates from EXIF image metadata
-    - IP geolocation via ip-api.com (free, no key)
-    """
-    import requests as http_requests
+    Returns geographic data for the case.
 
+    - ``gps_points``  - coordinates extracted locally from EXIF metadata.
+      Real, measured, and present whenever the camera wrote them.
+    - ``ip_points``   - one entry per IP entity in the case, with
+      ``lat``/``lon`` always ``None`` and ``type`` = ``"ip_not_geolocated"``.
+      Geolocation would require sending the address to an external service,
+      so it is not performed. See the comment above.
+    - ``ip_geolocation`` - a state object, so a caller can distinguish "no
+      IPs in this case" from "IPs present and deliberately not geolocated".
+    """
     results = {
         "gps_points": [],
-        "ip_points": []
+        "ip_points": [],
     }
 
-    # ── GPS points from artifacts ──────────────────────────
+    # -- GPS points from artifacts (local: already in the file) ----
     gps_artifacts = db.query(
         models.ForensicArtifact
     ).filter(
@@ -841,7 +881,7 @@ def get_geo_data(
             "type": "gps"
         })
 
-    # ── IP entities — geolocate up to 20 ───────────────────
+    # -- IP entities: listed, never geolocated -------------------
     ip_entities = db.query(
         models.Entity
     ).filter(
@@ -849,83 +889,39 @@ def get_geo_data(
         models.Entity.entity_type == "IP"
     ).all()
 
-    for entity in ip_entities[:20]:
+    for entity in ip_entities:
         ip = entity.name.strip()
-
-        # Skip private / loopback addresses
-        if (ip.startswith("192.168.") or
-                ip.startswith("10.") or
-                ip.startswith("172.16.") or
-                ip.startswith("172.17.") or
-                ip.startswith("172.18.") or
-                ip.startswith("172.19.") or
-                ip.startswith("172.20.") or
-                ip.startswith("172.21.") or
-                ip.startswith("172.22.") or
-                ip.startswith("172.23.") or
-                ip.startswith("172.24.") or
-                ip.startswith("172.25.") or
-                ip.startswith("172.26.") or
-                ip.startswith("172.27.") or
-                ip.startswith("172.28.") or
-                ip.startswith("172.29.") or
-                ip.startswith("172.30.") or
-                ip.startswith("172.31.") or
-                ip == "127.0.0.1" or
-                ip == "::1"):
-            results["ip_points"].append({
-                "ip": ip,
-                "label": f"{ip} (private)",
-                "lat": None,
-                "lon": None,
-                "city": "Private Network",
-                "country": "N/A",
-                "isp": "",
-                "type": "ip_private"
-            })
-            continue
-
-        try:
-            geo = http_requests.get(
-                f"http://ip-api.com/json/{ip}"
-                f"?fields=status,country,city,lat,lon,isp",
-                timeout=5
-            ).json()
-
-            if geo.get("status") == "success":
-                results["ip_points"].append({
-                    "ip": ip,
-                    "lat": geo["lat"],
-                    "lon": geo["lon"],
-                    "city": geo.get("city", ""),
-                    "country": geo.get("country", ""),
-                    "isp": geo.get("isp", ""),
-                    "label": (
-                        f"{ip} \u2014 "
-                        f"{geo.get('city', '')}, "
-                        f"{geo.get('country', '')}"
-                    ),
-                    "type": "ip"
-                })
-            else:
-                results["ip_points"].append({
-                    "ip": ip,
-                    "lat": None,
-                    "lon": None,
-                    "city": "",
-                    "country": "",
-                    "isp": "",
-                    "label": ip,
-                    "type": "ip_unknown"
-                })
-        except Exception:
-            pass
+        results["ip_points"].append({
+            "ip": ip,
+            "lat": None,
+            "lon": None,
+            "city": "",
+            "country": "",
+            "isp": "",
+            "label": ip,
+            # Not "ip_unknown", which used to mean "we asked the service and
+            # it could not place this address". This means we deliberately
+            # did not ask.
+            "type": "ip_not_geolocated",
+        })
 
     results["total_gps"] = len(results["gps_points"])
-    results["total_ips"] = len([
-        p for p in results["ip_points"]
-        if p.get("lat") is not None
-    ])
+    # Retained for compatibility with the old response shape, but it is no
+    # longer a count of located IPs. It is now always 0, and is documented as
+    # such so nobody later reads it as "no IPs found".
+    results["total_ips"] = 0
+    results["ip_geolocation"] = {
+        "state": "not_attempted" if ip_entities else "no_ips",
+        "count": len(ip_entities),
+        "located": 0,
+        "reason": (
+            "IP geolocation is disabled. It would require transmitting each "
+            "IP address from this case to an external geolocation service, "
+            "which would move evidence off this machine. The addresses are "
+            "listed above and remain fully searchable; only their "
+            "coordinates are absent."
+        ) if ip_entities else "This case contains no IP entities.",
+    }
     return results
 
 

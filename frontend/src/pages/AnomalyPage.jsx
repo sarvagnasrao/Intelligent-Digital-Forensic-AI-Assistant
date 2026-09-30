@@ -2,11 +2,12 @@ import React, { useState,
                 useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { AlertTriangle, Shield,
-         Clock, Flag,
+         Clock, Flag, FileSearch,
          ChevronDown,
          ChevronRight } from 'lucide-react'
 import { getAnomalies, 
-         flagArtifact } from '../api/client'
+         flagArtifact,
+         apiErrorMessage } from '../api/client'
 import PageLayout from '../components/PageLayout'
 import toast from 'react-hot-toast'
 
@@ -41,16 +42,25 @@ export default function AnomalyPage() {
     useState(true)
   const [expanded, setExpanded] = 
     useState({})
+  const [loadError, setLoadError] =
+    useState(null)
 
   useEffect(() => {
     loadAnomalies()
   }, [caseId])
 
   const loadAnomalies = async () => {
+    setLoadError(null)
     try {
       const res = await getAnomalies(caseId)
       setData(res.data)
-    } catch {
+    } catch (e) {
+      // Left `data` null on failure, and null data reaches the
+      // `anomaly_count === 0` branch below, which drew a green
+      // "No anomalies detected / All timestamps appear consistent" shield.
+      // A request that never completed was displayed as a clean result.
+      setData(null)
+      setLoadError(apiErrorMessage(e, 'Could not load anomaly findings'))
       toast.error(
         'Failed to load anomalies')
     } finally {
@@ -71,7 +81,18 @@ export default function AnomalyPage() {
             : a
         )
       }))
-    } catch {}
+    } catch (e) {
+      /* Was `catch {}`. Note the state update is *inside* the try, so a
+         failure never toggled the badge - which is the right instinct (no
+         invented state) paired with the wrong follow-through: the click
+         produced no visual change and no message at all. An investigator
+         flags an anomaly because it matters, the request fails, and the UI
+         says nothing, so the flag is simply absent from the record later.
+         The optimistic update is not added here; reporting the failure is
+         the whole fix. */
+      toast.error(apiErrorMessage(
+        e, 'Could not flag this anomaly - the flag was not saved'))
+    }
   }
 
   if (loading) return (
@@ -84,7 +105,44 @@ export default function AnomalyPage() {
     </div>
   )
 
-  if (!data) return null
+  /* Was `return null` - a blank page. On a failed request this is
+     indistinguishable from a hang, and it is what let the all-clear
+     below render for a case that was never actually scanned. */
+  if (!data) {
+    return (
+      <PageLayout
+        title="Anomaly Detection"
+        subtitle="Timestamp and behaviour checks across every extracted artifact."
+      >
+        <div className="rounded-xl px-5 py-8 text-center"
+             style={{
+               background: 'rgba(239,68,68,0.04)',
+               border: '1px solid rgba(239,68,68,0.22)',
+             }}>
+          <p className="text-sm font-semibold text-red-400 mb-2">
+            Anomaly findings could not be loaded
+          </p>
+          <p className="text-xs text-ink-2 mb-4 max-w-md mx-auto">
+            {loadError ||
+              'The request did not return a result.'}{' '}
+            No timestamp has been checked, so the state of
+            this evidence is unknown rather than clean.
+          </p>
+          <button
+            onClick={() => {
+              setLoading(true)
+              loadAnomalies()
+            }}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold
+                       text-white"
+            style={{ background: '#4f46e5', border: 'none', cursor: 'pointer' }}
+          >
+            Retry
+          </button>
+        </div>
+      </PageLayout>
+    )
+  }
 
   const { anomalies, by_type,
           anomaly_count, total_artifacts,
@@ -187,20 +245,44 @@ export default function AnomalyPage() {
 
       {/* Anomalous files list */}
       {anomaly_count === 0 ? (
+        /* Three genuinely different states were collapsed into one green
+           all-clear. Only the middle one is a clean bill of health. */
         <div className="text-center py-16 
           text-ink-2">
-          <Shield size={40}
-            className="mx-auto mb-3 
-                       text-success 
-                       opacity-60" />
-          <p className="text-sm font-medium 
-            text-success">
-            No anomalies detected
-          </p>
-          <p className="text-xs mt-1">
-            All timestamps appear consistent
-            across {total_artifacts} artifacts
-          </p>
+          {total_artifacts === 0 ? (
+            <>
+              <FileSearch size={40}
+                className="mx-auto mb-3 
+                           text-ink-3 
+                           opacity-60" />
+              <p className="text-sm font-medium 
+                text-ink-1">
+                Nothing to analyse yet
+              </p>
+              <p className="text-xs mt-1">
+                No forensic artifacts have been
+                extracted for this case, so no
+                timestamp has been examined.
+                Ingest a disk image or file to
+                run anomaly detection.
+              </p>
+            </>
+          ) : (
+            <>
+              <Shield size={40}
+                className="mx-auto mb-3 
+                           text-success 
+                           opacity-60" />
+              <p className="text-sm font-medium 
+                text-success">
+                No anomalies detected
+              </p>
+              <p className="text-xs mt-1">
+                All timestamps appear consistent
+                across {total_artifacts} artifacts
+              </p>
+            </>
+          )}
         </div>
       ) : (
         <div>

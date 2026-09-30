@@ -9,6 +9,7 @@ import {
 } from 'lucide-react'
 import { getCases } from '../api/client'
 import { useAuth } from '../context/AuthContext'
+import { isRetiredCasePath } from '../constants/hiddenRoutes'
 
 // ── Global navigation ────────────────────────────────────────────────────
 // These routes are not scoped to a case.
@@ -35,12 +36,17 @@ const CASE_NAV = [
   { icon: Key,           label: 'Credentials',    path: 'credentials'    },
   { icon: Zap,           label: 'Contradictions', path: 'contradictions' },
   { icon: GitCompare,    label: 'Compare',        path: 'compare'        },
-  { icon: Globe,         label: 'Geo Map',        path: 'geomap'         },
   { icon: FileText,      label: 'Reports',        path: 'reports'        },
   { icon: StickyNote,    label: 'Notes',          path: 'notes'          },
   { icon: ShieldCheck,   label: 'Audit Log',      path: 'audit'          },
   { icon: Settings2,     label: 'Access',         path: 'settings'       },
-]
+  // 'Geo Map' was here and is gone. Rather than deleting the row, the
+  // retired-route registry is consulted at render time (see
+  // CASE_NAV.filter below), because a feature that is retired must also be
+  // unreachable - removing it from this list alone would have left it
+  // working at a typed URL, which is the version of this that a reviewer
+  // would try.
+].filter(item => !isRetiredCasePath(item.path))
 
 // Literal hex (not CSS vars) so the translucent tag background can be
 // derived by appending an alpha suffix - "1a" ~ 10%, "40" ~ 25%.

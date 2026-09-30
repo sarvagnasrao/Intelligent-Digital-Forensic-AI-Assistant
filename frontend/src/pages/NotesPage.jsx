@@ -1,19 +1,20 @@
 import React, { useState, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { Plus, StickyNote, Trash2, Link } from 'lucide-react'
+import { Plus, StickyNote, Trash2, Link, UserCheck } from 'lucide-react'
 import { getNotes, createNote, deleteNote } from '../api/client'
 import ConfirmDialog from '../components/ConfirmDialog'
 import PageLayout from '../components/PageLayout'
 import toast from 'react-hot-toast'
 import { formatDistanceToNow } from 'date-fns'
 import { fromUtc } from '../utils/time'
+import { useAuth } from '../context/AuthContext'
 
 export default function NotesPage() {
   const { caseId } = useParams()
+  const { user } = useAuth()
   const [notes, setNotes] = useState([])
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({
-    author: 'Investigator',
     content: '',
     linked_to_type: '',
     linked_to_id: ''
@@ -41,14 +42,13 @@ export default function NotesPage() {
     }
     try {
       const payload = {
-        author: form.author,
         content: form.content,
         linked_to_type: form.linked_to_type || null,
         linked_to_id: form.linked_to_id || null
       }
       const res = await createNote(caseId, payload)
       setNotes(prev => [res.data, ...prev])
-      setForm({ author: form.author, content: '', linked_to_type: '', linked_to_id: '' })
+      setForm({ content: '', linked_to_type: '', linked_to_id: '' })
       setShowForm(false)
       toast.success('Note added')
     } catch {
@@ -92,12 +92,19 @@ export default function NotesPage() {
           <h2 className="font-semibold text-ink-0 mb-4">New Note</h2>
           <div className="space-y-3">
             <div>
+              {/*
+                Was an editable "Author" input. The server now records the
+                authenticated user as the note's author, so a typed name
+                would be silently discarded - and a note's author is an
+                assertion inside a case file, not a caption. Shown, not
+                offered: the name that will be recorded is the account you
+                are signed in as.
+              */}
               <label className="text-xs text-ink-2 mb-1 block">Author</label>
-              <input
-                value={form.author}
-                onChange={e => setForm({ ...form, author: e.target.value })}
-                className="w-full bg-surface-1 border border-line rounded-lg px-3 py-2 text-sm text-ink-0 focus:outline-none focus:border-accent"
-              />
+              <div className="w-full bg-surface-0 border border-line rounded-lg px-3 py-2 text-sm text-ink-1 flex items-center gap-2">
+                <UserCheck size={14} className="text-accent shrink-0" />
+                <span className="truncate">{user?.username || 'your account'}</span>
+              </div>
             </div>
             <div>
               <label className="text-xs text-ink-2 mb-1 block">Content *</label>

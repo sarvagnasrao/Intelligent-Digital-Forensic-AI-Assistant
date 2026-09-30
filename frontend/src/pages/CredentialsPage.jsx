@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { Key, Shield, Eye, EyeOff } from 'lucide-react'
-import { getCredentials, confirmCredential, markFalsePositive } from '../api/client'
+import { getCredentials, confirmCredential, markFalsePositive, apiErrorMessage } from '../api/client'
 import PageLayout from '../components/PageLayout'
 import toast from 'react-hot-toast'
 
@@ -248,6 +248,7 @@ export default function CredentialsPage() {
   const { caseId } = useParams()
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
   const [filterSeverity, setFilterSeverity] = useState('')
   const [hideFP, setHideFP] = useState(true)
 
@@ -255,12 +256,20 @@ export default function CredentialsPage() {
 
   const load = async () => {
     setLoading(true)
+    setLoadError(null)
     try {
       const res = await getCredentials(caseId, {
         is_false_positive: hideFP ? false : undefined,
       })
       setData(res.data)
-    } catch {
+    } catch (e) {
+      // This used to be a bare `catch { toast.error(...) }` which left
+      // `data` null - and null data renders as `filtered.length === 0`,
+      // which drew the green "No credentials found / All findings are
+      // marked as false positives" shield below. A failed request was
+      // therefore displayed as a clean bill of health on the evidence.
+      setData(null)
+      setLoadError(apiErrorMessage(e, 'Could not load credential findings'))
       toast.error('Failed to load credential findings')
     } finally {
       setLoading(false)
@@ -381,6 +390,43 @@ export default function CredentialsPage() {
               animationDelay: `${i * 80}ms`,
             }} />
           ))}
+        </div>
+      ) : loadError ? (
+        /* A failure to load must never look like a clean result. This is the
+           single most misleading state in the product: a reviewer shown this
+           would conclude the evidence contains no exposed credentials. */
+        <div style={{
+          textAlign: 'center', padding: '70px 20px',
+          background: 'rgba(239,68,68,0.04)',
+          border: '1px solid rgba(239,68,68,0.22)',
+          borderRadius: 14,
+        }}>
+          <div style={{
+            width: 64, height: 64, borderRadius: 18,
+            background: 'rgba(239,68,68,0.08)',
+            border: '1px solid rgba(239,68,68,0.25)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            margin: '0 auto 16px',
+          }}>
+            <Shield size={28} color="rgba(248,113,113,0.7)" />
+          </div>
+          <p style={{ fontSize: 15, fontWeight: 600, color: '#f87171', marginBottom: 8 }}>
+            Credential scan could not be loaded
+          </p>
+          <p style={{ fontSize: 12, color: 'var(--color-white-2)', marginBottom: 14 }}>
+            {loadError} This is a request failure, not a finding - the
+            credential state of this evidence is unknown.
+          </p>
+          <button
+            onClick={load}
+            style={{
+              padding: '7px 14px', borderRadius: 8, border: 'none',
+              background: '#4f46e5', color: '#fff', fontSize: 12,
+              fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Retry scan
+          </button>
         </div>
       ) : filtered.length === 0 ? (
         <div style={{

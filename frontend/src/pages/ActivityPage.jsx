@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, Filter, X, ChevronLeft, ChevronRight, Activity, Clock, User, FolderOpen, Download, RefreshCw, ExternalLink } from 'lucide-react'
-import { getGlobalActivity } from '../api/client'
+import { Search, Filter, X, ChevronLeft, ChevronRight, Activity, Clock, User, FolderOpen, Download, RefreshCw, ExternalLink, AlertTriangle } from 'lucide-react'
+import { getGlobalActivity, apiErrorMessage } from '../api/client'
 import { format, formatDistanceToNow } from 'date-fns'
 import { fromUtc } from '../utils/time'
 import toast from 'react-hot-toast'
@@ -41,6 +41,11 @@ export default function ActivityPage() {
   const [filters, setFilters] = useState({ q: '', action_type: '', performed_by: '', case_id: '', date_from: '', date_to: '', severity: '' })
   const [inputQ, setInputQ] = useState('')
   const [showFilters, setShowFilters] = useState(false)
+  // Kept apart from `data` so a failed request can never be rendered as an
+  // empty audit log. On an audit page that distinction is the whole point:
+  // "no events recorded" and "we could not read the log" are very different
+  // facts about an investigation.
+  const [loadError, setLoadError] = useState(null)
 
   useEffect(() => { load() }, [page, filters])
 
@@ -50,7 +55,18 @@ export default function ActivityPage() {
       const params = { page, page_size: 50, ...Object.fromEntries(Object.entries(filters).filter(([,v]) => v)) }
       const res = await getGlobalActivity(params)
       setData(res.data)
-    } catch {
+      setLoadError(null)
+    } catch (e) {
+      /* `data` is left as-is, which on the first load means it stays `null`.
+         That is the whole bug: with `data === null` the empty-state test
+         `data?.items.length === 0` evaluates to `undefined === 0` - false -
+         so the empty state is skipped and the table falls through to
+         `data?.items.map(...)`, which maps over `undefined` and renders
+         nothing at all. The result was a header row, an empty body, and a
+         subtitle still reading "Loading..." that could never resolve: the
+         page looked like a request that never came back, rather than one
+         that came back broken. */
+      setLoadError(apiErrorMessage(e, 'Could not load activity'))
       toast.error('Failed to load activity')
     } finally {
       setLoading(false)
@@ -80,7 +96,9 @@ export default function ActivityPage() {
   return (
     <PageLayout
       title="Activity Log"
-      subtitle={data ? `${data.total.toLocaleString()} total events` : 'Loading...'}
+      subtitle={loadError
+        ? 'Activity log unavailable'
+        : data ? `${data.total.toLocaleString()} total events` : 'Loading...'}
       actions={
         <>
           <button onClick={load} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '7px 14px', borderRadius: 8, background: 'var(--color-white-04)', border: '1px solid rgba(255,255,255,0.08)', color: 'var(--color-white-5)', fontSize: 12, cursor: 'pointer' }}><RefreshCw size={13} />Refresh</button>
@@ -128,7 +146,17 @@ export default function ActivityPage() {
 
         {loading ? (
           <div>{Array(8).fill(0).map((_,i) => <div key={i} style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr 1fr 0.7fr 2.5fr 1fr', gap: 16, alignItems: 'center', padding: '14px 20px', borderBottom: '1px solid rgba(255,255,255,0.04)' }}><div className="skeleton" style={{ height: 20, borderRadius: 6, animationDelay: `${i*80}ms` }} /><div className="skeleton" style={{ height: 20, borderRadius: 6, animationDelay: `${i*80+40}ms` }} /><div className="skeleton" style={{ height: 20, borderRadius: 6, width: '70%', animationDelay: `${i*80+80}ms` }} /><div className="skeleton" style={{ height: 20, borderRadius: 6, width: '60%', animationDelay: `${i*80+120}ms` }} /><div className="skeleton" style={{ height: 20, borderRadius: 6, width: '80%', animationDelay: `${i*80+160}ms` }} /><div className="skeleton" style={{ height: 20, borderRadius: 6, width: '60%', animationDelay: `${i*80+200}ms` }} /></div>)}</div>
-        ) : data?.items.length === 0 ? (
+        ) : loadError ? (
+          /* Rendered before the empty state on purpose. An audit log that
+             could not be read must never present itself as an audit log with
+             nothing in it. */
+          <div style={{ padding: '60px 20px', textAlign: 'center', color: 'var(--color-white-2)' }}>
+            <AlertTriangle size={36} style={{ margin: '0 auto 12px', opacity: 0.4, color: 'var(--color-amber-400, #f59e0b)' }} />
+            <p style={{ fontSize: 14, color: 'var(--text-primary)' }}>Could not load the activity log</p>
+            <p style={{ fontSize: 12, marginTop: 4 }}>{loadError}</p>
+            <button onClick={load} style={{ marginTop: 14, fontSize: 12, color: '#818cf8', background: 'none', border: '1px solid rgba(129,140,248,0.4)', borderRadius: 6, padding: '6px 14px', cursor: 'pointer' }}>Try again</button>
+          </div>
+        ) : !data || data.items?.length === 0 ? (
           <div style={{ padding: '60px 20px', textAlign: 'center', color: 'var(--color-white-2)' }}><Activity size={36} style={{ margin: '0 auto 12px', opacity: 0.3 }} /><p style={{ fontSize: 14 }}>No activity found</p><p style={{ fontSize: 12, marginTop: 4 }}>Try adjusting your filters</p></div>
         ) : (
           data?.items.map((item, i) => {

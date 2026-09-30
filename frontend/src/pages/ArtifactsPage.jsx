@@ -234,10 +234,24 @@ export default function ArtifactsPage() {
               const isSelected = selected === artifact.id
 
               return (
-                <button
+                /* A div, not a <button>: the View and Flag controls below are
+                   themselves buttons, and a <button> inside a <button> is
+                   invalid HTML. The browser silently hoists the inner ones out
+                   of the row, so the row's own click handler stops covering
+                   them and the keyboard could not reach the row at all.
+                   role/tabIndex/onKeyDown keep it operable without nesting. */
+                <div
                   key={artifact.id}
+                  role="button"
+                  tabIndex={0}
                   onClick={() => openDetail(artifact)}
-                  className={`w-full flex items-center gap-3 p-3 rounded-xl text-left transition-all border
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      openDetail(artifact)
+                    }
+                  }}
+                  className={`w-full flex items-center gap-3 p-3 rounded-xl text-left transition-all border cursor-pointer
                     ${isSelected
                       ? 'bg-accent/10 border-accent/40'
                       : 'bg-surface-2 border-line hover:border-accent/30 hover:bg-surface-4'}`}
@@ -305,7 +319,7 @@ export default function ArtifactsPage() {
                     </button>
                     <ChevronRight size={13} className="text-ink-2" />
                   </div>
-                </button>
+                </div>
               )
             })
           )}

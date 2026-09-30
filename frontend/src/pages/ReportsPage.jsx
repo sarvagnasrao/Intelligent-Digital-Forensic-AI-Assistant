@@ -3,13 +3,14 @@ import { useParams } from 'react-router-dom'
 import { FileText, Plus, Download,
          Trash2, RefreshCw,
          CheckCircle, AlertCircle,
-         Clock, Shield } from 'lucide-react'
-import { getReports, createReport, getReport, deleteReport } from '../api/client'
+         Clock, Shield, UserCheck } from 'lucide-react'
+import { getReports, createReport, getReport, deleteReport, apiErrorMessage } from '../api/client'
 import ConfirmDialog from '../components/ConfirmDialog'
 import PageLayout from '../components/PageLayout'
 import toast from 'react-hot-toast'
 import { formatDistanceToNow } from 'date-fns'
 import { fromUtc } from '../utils/time'
+import { useAuth } from '../context/AuthContext'
 
 const REPORT_TYPES = [
   {
@@ -50,6 +51,7 @@ const STATUS_ICON = {
 
 export default function ReportsPage() {
   const { caseId } = useParams()
+  const { user } = useAuth()
   const [reports, setReports] = useState([])
   const [loading, setLoading] = 
     useState(true)
@@ -57,11 +59,16 @@ export default function ReportsPage() {
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState({
     report_type: 'Case Summary',
-    generated_by: 'Investigator',
     query_ids_included: []
   })
   const [confirmDelete, setConfirmDelete] = useState(null)
   const pollRef = useRef({})
+  // Consecutive failed status checks per report, and the reason the last one
+  // failed. Kept apart from `reports` because they describe a different
+  // thing: a row stuck on "Generating" after the poll could not reach the
+  // server is NOT a report that failed to generate.
+  const pollFailures = useRef({})
+  const [pollError, setPollError] = useState({})
 
   useEffect(() => {
     loadReports()
@@ -92,6 +99,16 @@ export default function ReportsPage() {
       async () => {
         try {
           const res = await getReport(caseId, reportId)
+          // A successful check clears the failure streak and any previously
+          // displayed "status unknown", so a recovered connection is visible
+          // rather than leaving a stale error next to a live row.
+          delete pollFailures.current[reportId]
+          setPollError(prev => {
+            if (!(reportId in prev)) return prev
+            const next = { ...prev }
+            delete next[reportId]
+            return next
+          })
           setReports(prev => prev.map(r =>
             r.id === reportId ? {
               ...r,
@@ -110,7 +127,37 @@ export default function ReportsPage() {
               toast.error('Report failed')
             }
           }
-        } catch {}
+        } catch (e) {
+          /* Was a bare `catch {}`. A report whose status check could not be
+             made stayed on "Generating" for ever, and because the interval
+             was only cleared inside the try block it never stopped polling
+             either. That is the B11/B18 shape: a failure that never becomes
+             terminal, so the row looks like slow work rather than a broken
+             connection.
+
+             Two things are deliberately not done here. The row is not
+             marked "Failed", because we know the *check* failed and not
+             that the *report* did - claiming the report failed would be its
+             own invention. And the interval is not cleared on the first
+             error, because a single dropped request during generation is
+             normal and three seconds of tolerance costs nothing. After
+             three consecutive failures the poll gives up and says the state
+             is unknown. */
+          const n = (pollFailures.current[reportId] || 0) + 1
+          pollFailures.current[reportId] = n
+          if (n >= 3) {
+            clearInterval(pollRef.current[reportId])
+            delete pollRef.current[reportId]
+            setPollError(prev => ({
+              ...prev,
+              [reportId]: apiErrorMessage(
+                e,
+                'Could not reach the server to check this report')
+            }))
+            toast.error(
+              'Stopped checking a report - status unknown. Reload the page to try again.')
+          }
+        }
       }, 3000)
   }
 
@@ -121,7 +168,13 @@ export default function ReportsPage() {
       setReports(prev => [{
         id: res.data.id,
         report_type: form.report_type,
-        generated_by: form.generated_by,
+        // What the SERVER recorded, not what was typed into the form.
+        // Prefer the response; fall back to the session user, which is
+        // exactly the value the server will have stored. Reading
+        // `form.generated_by` here would leave the row's byline blank
+        // until the first poll replaced it.
+        generated_by: res.data?.generated_by
+          || user?.username || 'your account',
         generated_at: new Date().toISOString(),
         status: 'Generating',
         page_count: 0,
@@ -230,23 +283,29 @@ export default function ReportsPage() {
               </p>
             </div>
             <div>
-              <label className="text-xs 
+              {/*
+                Was an editable "Prepared By" input. The server now takes
+                the report's author from the authenticated session — a
+                report is a document that may be called on for later, so
+                who prepared it is a fact about the record rather than a
+                caption — and a typed name would be silently discarded.
+                Shown, not offered, like the case and note forms.
+              */}
+              <label className="text-xs
                 text-ink-2 mb-1 block">
                 Prepared By
               </label>
-              <input
-                value={form.generated_by}
-                onChange={e => setForm({
-                  ...form,
-                  generated_by: e.target.value
-                })}
-                className="w-full bg-surface-1
+              <div className="w-full bg-surface-0
                   border border-line rounded-lg
-                  px-3 py-2 text-sm
-                  text-ink-0
-                  focus:outline-none 
-                  focus:border-accent"
-              />
+                  px-3 py-2 text-sm text-ink-1
+                  flex items-center gap-2">
+                <UserCheck
+                  size={14}
+                  className="text-accent shrink-0" />
+                <span className="truncate">
+                  {user?.username || 'your account'}
+                </span>
+              </div>
             </div>
           </div>
           <div className="flex gap-3">
@@ -329,6 +388,18 @@ export default function ReportsPage() {
                           : 'text-blue-400'}`}>
                         {report.status}
                       </span>
+                      {/* A third state, distinct from both Complete and
+                          Failed: the poll gave up, so the real status is
+                          unknown. The spinner keeps turning above because
+                          the server still believes it is Generating, and
+                          saying so is more truthful than picking one of the
+                          other two. */}
+                      {pollError[report.id] && (
+                        <span className="text-xs text-warning">
+                          {' '}· status unknown —{' '}
+                          {pollError[report.id]}
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs 
                       text-ink-2 mt-0.5">

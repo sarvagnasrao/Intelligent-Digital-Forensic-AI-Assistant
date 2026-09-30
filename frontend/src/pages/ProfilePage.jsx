@@ -5,7 +5,7 @@ import {
   ArrowLeft, RefreshCw, Flag, Sparkles, AlertTriangle,
   CheckCircle
 } from 'lucide-react'
-import { getEntities, generateEntityProfile, crossCaseSearch, getEntityProfile } from '../api/client'
+import { getEntities, generateEntityProfile, crossCaseSearch, getEntityProfile, apiErrorMessage } from '../api/client'
 import Badge from '../components/Badge'
 import PageLayout from '../components/PageLayout'
 import toast from 'react-hot-toast'
@@ -35,6 +35,9 @@ export default function ProfilePage() {
   const [filterType, setFilterType] = useState(entityTypeParam || 'Person')
   const [profileMeta, setProfileMeta] = useState(null)
   // Stores metadata about when the profile was generated
+  // `null` means "the server says there is no profile". A failed check is a
+  // separate state so the two cannot render the same message.
+  const [profileLoadError, setProfileLoadError] = useState(null)
 
   const [crossCaseResults, setCrossCaseResults] = useState(null)
   const [searchingCross, setSearchingCross] = useState(false)
@@ -74,6 +77,7 @@ export default function ProfilePage() {
   }
 
   const loadExistingProfile = async (entity) => {
+    setProfileLoadError(null)
     try {
       const res = await getEntityProfile(caseId, entity.id)
       if (res.data.has_profile) {
@@ -86,9 +90,17 @@ export default function ProfilePage() {
         setProfile(null)
         setProfileMeta(null)
       }
-    } catch {
+    } catch (e) {
+      /* This used to clear the profile and its metadata, which is
+         indistinguishable from the server having answered "there is no
+         profile" - the message rendered just below reads "No saved profile
+         found. Click Generate Profile to create one." A failed request was
+         therefore shown as the absence of a finding, and clicking Generate
+         would appear to be the fix for a problem that was a network error. */
       setProfile(null)
       setProfileMeta(null)
+      setProfileLoadError(
+        apiErrorMessage(e, 'Could not check for a saved profile'))
     }
   }
 
@@ -318,8 +330,16 @@ export default function ProfilePage() {
                       <span className="text-xs text-ink-2">
                         {profile.related_artifact_count} related files
                       </span>
-                      <Flag size={12} className="text-warning"/>
-                      <span className="text-xs text-warning">Auto-flagged in query history</span>
+                      {/* "Auto-flagged in query history" used to render here
+                          unconditionally, inside the block that only draws
+                          when a profile exists. There was no condition, no
+                          data behind it and no way for it to become true:
+                          the profile response carries no flag field, and
+                          `flagQuery` in client.js is exported but called by
+                          no page. So every profile claimed to be flagged and
+                          none were. Removed rather than given a fabricated
+                          condition - an investigator who trusts that badge
+                          would be trusting a warning that never fires. */}
                     </div>
                   </div>
 
@@ -402,10 +422,25 @@ export default function ProfilePage() {
                 <div className="bg-surface-1 rounded-xl p-6 text-center text-ink-2">
                   <Sparkles size={24} className="mx-auto mb-3 opacity-30"/>
                   <p className="text-sm">
-                    {profileMeta === null
+                    {profileLoadError
+                      /* Third state. "No saved profile found" is a real
+                         answer from the server and means there is nothing
+                         there; this means we never got to ask. They are
+                         different facts and used to render identically. */
+                      ? `Could not check for a saved profile: ${profileLoadError}`
+                      : profileMeta === null
                       ? 'No saved profile found. Click "Generate Profile" to create one.'
                       : 'Loading saved profile...'}
                   </p>
+                  {profileLoadError && (
+                    <button
+                      onClick={() => loadExistingProfile(selected)}
+                      className="mt-2 text-xs font-semibold text-accent hover:underline"
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                    >
+                      Try again
+                    </button>
+                  )}
                 </div>
               )}
             </div>

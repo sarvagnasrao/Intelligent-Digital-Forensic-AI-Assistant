@@ -5,15 +5,16 @@ import React, { useState,
 import { useParams } from 'react-router-dom'
 import {
   Send, Bot, User, RefreshCw,
-  Trash2, Shield, AlertCircle,
+  Trash2, Shield, AlertCircle, EyeOff,
   FileText, Sparkles, ChevronDown,
-  X, Download
+  X, Download, UserCheck
 } from 'lucide-react'
 import {
   getQueries, askQuestion,
   deleteQuery, getEvidence,
   generateCaseSummary,
-  getLatestSummary
+  getLatestSummary,
+  apiErrorMessage
 } from '../api/client'
 import { useAuth } from
   '../context/AuthContext'
@@ -134,7 +135,18 @@ function SummaryModal({ caseId, onClose }) {
         setExisting(res.data)
         setSummary(res.data.summary)
       }
-    } catch {}
+      setSummaryError(null)
+    } catch (e) {
+      /* Was `catch {}`. `summary` stays null, which is exactly what the
+         server returns for a case that has never been summarised - so a
+         failed request and a genuine absence rendered the identical
+         "Generate Summary" empty state. Here that is merely unhelpful. In
+         the summary block below, the same `null` is the input to a
+         "Generate" affordance that invites the investigator to spend a
+         model run reproducing a summary that already exists. */
+      setSummaryError(apiErrorMessage(
+        e, 'Could not check for an existing summary'))
+    }
   }
 
   const handleGenerate = async () => {
@@ -380,31 +392,78 @@ function SummaryModal({ caseId, onClose }) {
               textAlign: 'center',
               padding: '60px 20px',
             }}>
-              <FileText size={40} style={{
-                margin: '0 auto 14px',
-                color:
-                  'var(--color-white-1)',
-              }} />
-              <p style={{
-                fontSize: 13,
-                color:
-                  'var(--color-white-3)',
-                marginBottom: 6,
-              }}>
-                No summary yet
-              </p>
-              <p style={{
-                fontSize: 12,
-                color:
-                  'var(--color-white-2)',
-                maxWidth: 300,
-                margin: '0 auto',
-              }}>
-                Click Generate to produce
-                an executive summary of
-                all case evidence and
-                findings
-              </p>
+              {summaryError ? (
+                /* Third state, and the one that used to be missing. Both of
+                   the two branches below are true statements: "no summary
+                   yet" and "here is what to click". Neither is true when the
+                   question was never answered - and on this panel a false
+                   "No summary yet" is the costly direction, because it
+                   invites the investigator to spend a model run producing a
+                   summary that may already exist, and to overwrite it. */
+                <>
+                  <AlertCircle size={40} style={{
+                    margin: '0 auto 14px',
+                    color: 'rgba(239,68,68,0.5)',
+                  }} />
+                  <p style={{
+                    fontSize: 13,
+                    color: '#f87171',
+                    marginBottom: 6,
+                  }}>
+                    Could not check for a summary
+                  </p>
+                  <p style={{
+                    fontSize: 12,
+                    color: 'var(--color-white-2)',
+                    maxWidth: 320,
+                    margin: '0 auto 14px',
+                  }}>
+                    {summaryError}. This is not the same as there being
+                    none, so nothing has been generated or overwritten.
+                  </p>
+                  <button
+                    onClick={loadExisting}
+                    style={{
+                      fontSize: 12,
+                      color: '#818cf8',
+                      background: 'none',
+                      border: '1px solid rgba(129,140,248,0.4)',
+                      borderRadius: 6,
+                      padding: '6px 14px',
+                      cursor: 'pointer',
+                    }}>
+                    Try again
+                  </button>
+                </>
+              ) : (
+                <>
+                  <FileText size={40} style={{
+                    margin: '0 auto 14px',
+                    color:
+                      'var(--color-white-1)',
+                  }} />
+                  <p style={{
+                    fontSize: 13,
+                    color:
+                      'var(--color-white-3)',
+                    marginBottom: 6,
+                  }}>
+                    No summary yet
+                  </p>
+                  <p style={{
+                    fontSize: 12,
+                    color:
+                      'var(--color-white-2)',
+                    maxWidth: 300,
+                    margin: '0 auto',
+                  }}>
+                    Click Generate to produce
+                    an executive summary of
+                    all case evidence and
+                    findings
+                  </p>
+                </>
+              )}
             </div>
           )}
 
@@ -440,14 +499,15 @@ export default function InvestigatePage() {
     useState([])
   const [selectedEvidence, setSelectedEvidence] =
     useState('')
-  const [askedBy, setAskedBy] =
-    useState(user?.full_name ||
-             user?.username ||
-             'Investigator')
   const [showSummary, setShowSummary] =
     useState(false)
   const [hasMoreQueries, setHasMoreQueries] =
     useState(false)
+  // Fetch failures, held apart from the data they concern. A failed page
+  // load and a genuinely short history must not look the same, and a failed
+  // "is there already a summary" check must not look like "there is not".
+  const [historyError, setHistoryError] = useState(null)
+  const [summaryError, setSummaryError] = useState(null)
   const [queryPage, setQueryPage] =
     useState(1)
   const bottomRef = useRef()
@@ -495,7 +555,19 @@ export default function InvestigatePage() {
     try {
       localStorage.setItem(
         PENDING_KEY, JSON.stringify(all))
-    } catch {}
+    } catch (e) {
+      /* This is a real guard, not sloppiness: private-browsing modes and
+         full quotas both throw here, and without a catch the page dies.
+         But it was completely silent, and the feature it protects is the
+         in-flight-question reconciliation - a failed write means a question
+         that vanishes mid-generation is never re-rendered and never
+         reconciled. A console warning is the right weight: not a toast
+         (these fire from a fire-and-forget write, so a toast would be
+         noise the investigator cannot act on) and not silence. */
+      console.warn(
+        '[investigate] could not persist in-flight questions; ' +
+        'they will not survive a reload if it happens now:', e)
+    }
   }
 
   // Mirror for the polling interval, which must not close over a
@@ -522,7 +594,14 @@ export default function InvestigatePage() {
       } else {
         localStorage.removeItem(draftKey)
       }
-    } catch {}
+    } catch (e) {
+      // Same reasoning as writePending: the guard is necessary, silence is
+      // not. Losing the draft is invisible otherwise - the textarea simply
+      // comes back empty on the next visit, which looks like the
+      // investigator never typed it.
+      console.warn(
+        '[investigate] could not save the draft for ' + draftKey + ':', e)
+    }
   }, [question, draftKey])
 
   useEffect(() => {
@@ -607,7 +686,7 @@ export default function InvestigatePage() {
           id: `pending_${p.at}_${i}`,
           question_text: p.text,
           processed_response: null,
-          asked_by: p.askedBy || 'Investigator',
+          asked_by: user?.username || 'your account',
           asked_at: new Date(p.at).toISOString(),
           is_loading: true,
         })),
@@ -653,13 +732,32 @@ export default function InvestigatePage() {
       setQueryPage(next)
       setHasMoreQueries(
         res.data.has_next || false)
-    } catch {}
+      setHistoryError(null)
+    } catch (e) {
+      /* Was `catch {}`. `hasMoreQueries` is still true, so the control stays
+         on screen inviting another click, and every one of those clicks does
+         nothing at all - no new questions, no message, no disabled state.
+         On a page whose entire value is the transcript, a history that
+         silently stops growing is indistinguishable from a short
+         investigation, and nothing on screen suggests a request failed. */
+      setHistoryError(apiErrorMessage(
+        e, 'Could not load earlier questions'))
+    }
   }
 
+  /* This only ever emptied local state while announcing "Conversation
+     cleared" - no API call, so the transcript returned on reload and the
+     QueryLog rows were untouched. Deleting those rows would be the wrong
+     fix: a record of what was asked of an assistant is itself case
+     evidence. So the control is renamed to say what it actually does,
+     which is hide-this-transcript-from-the-view. */
   const clearMemory = () => {
     setQueries([])
+    setQueryPage(0)
+    setHasMoreQueries(false)
     toast.success(
-      'Conversation cleared')
+      'Transcript hidden from this view',
+      { icon: '👁' })
   }
 
   const handleAsk = async () => {
@@ -676,7 +774,6 @@ export default function InvestigatePage() {
     const stamp = {
       caseId,
       text: q,
-      askedBy,
       at: Date.now(),
     }
     const nextPending = [...pendingRef.current, stamp]
@@ -699,7 +796,7 @@ export default function InvestigatePage() {
       id: tempId,
       question_text: q,
       processed_response: null,
-      asked_by: askedBy,
+      asked_by: user?.username || 'your account',
       asked_at: new Date().toISOString(),
       is_loading: true,
     }
@@ -727,7 +824,6 @@ export default function InvestigatePage() {
       const res = await askQuestion(
         caseId, {
           question_text: q,
-          asked_by: askedBy,
           evidence_id:
             selectedEvidence || null,
           conversation_history: history
@@ -965,30 +1061,51 @@ export default function InvestigatePage() {
           ))}
         </select>
 
-        {/* Officer name */}
-        <input
-          value={askedBy}
-          onChange={e =>
-            setAskedBy(e.target.value)}
-          placeholder="Officer name"
-          style={{
-            width: 180,
-            background:
-              'var(--color-white-04)',
-            border:
-              '1px solid rgba(255,255,255,0.09)',
-            borderRadius: 8,
-            padding: '8px 12px',
-            fontSize: 12,
-            color: 'var(--text-primary)',
-            outline: 'none',
-          }}
-        />
+        {/*
+          Was an editable "Officer name" input whose value was written
+          verbatim into QueryLog.asked_by AND into the QUERY_MADE audit
+          entry - so the name on the forensic record was whatever was
+          typed into a text box on this page. The server now takes the
+          asker from the authenticated session, and a typed value would be
+          silently discarded.
 
-        {/* Clear conversation */}
+          Shown rather than offered, for the same reason as the case and
+          note forms: a control that looks editable and is not is the B29
+          defect. The investigator still needs to see who is asking, so
+          the name is displayed - it just cannot be changed here.
+        */}
+        <span
+          title="The query is recorded against your signed-in account."
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '8px 12px',
+            borderRadius: 8,
+            border: '1px solid rgba(255,255,255,0.09)',
+            background: 'var(--color-white-04)',
+            fontSize: 12,
+            color: 'var(--text-secondary)',
+            whiteSpace: 'nowrap',
+            maxWidth: 200,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+          }}
+        >
+          <UserCheck
+            size={13}
+            style={{ flexShrink: 0 }}
+          />
+          {user?.username
+            ? user.username
+            : 'your account'}
+        </span>
+
+        {/* Hide transcript - not a delete, so not styled as one */}
         {queries.length > 0 && (
           <button
             onClick={clearMemory}
+            title="Hides this transcript from the screen. The questions stay in the case record."
             style={{
               display: 'flex',
               alignItems: 'center',
@@ -997,30 +1114,30 @@ export default function InvestigatePage() {
               borderRadius: 8,
               background: 'none',
               border:
-                '1px solid rgba(239,68,68,0.2)',
+                '1px solid rgba(148,163,184,0.25)',
               color:
-                'rgba(239,68,68,0.5)',
+                'rgba(148,163,184,0.8)',
               fontSize: 12,
               cursor: 'pointer',
             }}
             onMouseEnter={e => {
               e.currentTarget.style
-                .color = '#f87171'
+                .color = '#cbd5e1'
               e.currentTarget.style
                 .borderColor =
-                'rgba(239,68,68,0.4)'
+                'rgba(148,163,184,0.45)'
             }}
             onMouseLeave={e => {
               e.currentTarget.style
                 .color =
-                'rgba(239,68,68,0.5)'
+                'rgba(148,163,184,0.8)'
               e.currentTarget.style
                 .borderColor =
-                'rgba(239,68,68,0.2)'
+                'rgba(148,163,184,0.25)'
             }}
           >
-            <Trash2 size={12} />
-            Clear conversation
+            <EyeOff size={12} />
+            Hide transcript
           </button>
         )}
       </div>
@@ -1081,6 +1198,43 @@ export default function InvestigatePage() {
             }}>
             Load earlier messages
           </button>
+        )}
+
+        {/* A failed "load earlier" is stated next to the control that
+            failed, and the control stays available so the investigator can
+            retry. It is not disabled, because a transient failure is the
+            common case and a permanently greyed-out button would be a
+            control that never recovers on its own. */}
+        {historyError && (
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+            marginBottom: 16,
+            padding: '8px 12px',
+            borderRadius: 8,
+            border: '1px solid rgba(239,68,68,0.2)',
+            background: 'rgba(239,68,68,0.05)',
+            fontSize: 12,
+            color: '#f87171',
+          }}>
+            <span>{historyError}</span>
+            <button
+              onClick={loadEarlier}
+              style={{
+                flexShrink: 0,
+                background: 'none',
+                border: '1px solid rgba(239,68,68,0.35)',
+                borderRadius: 6,
+                padding: '3px 10px',
+                color: '#f87171',
+                fontSize: 11,
+                cursor: 'pointer',
+              }}>
+              Retry
+            </button>
+          </div>
         )}
 
         {/* Loading history */}
@@ -1415,8 +1569,15 @@ export default function InvestigatePage() {
                           'var(--color-white-1)',
                         marginTop: 4,
                       }}>
-                        {q.model_used}
-                        {' '}·{' '}
+                        {/* The model name is shown only when a model actually
+                            answered. `model_used` is null whenever the
+                            question never reached the model — retrieval
+                            failed, or nothing survived the relevance floor —
+                            and rendering it unconditionally left a dangling
+                            "· 0.1s" that implied a model had replied. */}
+                        {q.model_used
+                          ? q.model_used + ' · '
+                          : 'No model consulted · '}
                         {(q.response_time_ms
                           / 1000
                         ).toFixed(1)}s

@@ -28,7 +28,7 @@ import ReportsPage from './pages/ReportsPage'
 import AnomalyPage from './pages/AnomalyPage'
 import ProfilePage from './pages/ProfilePage'
 import WatchlistPage from './pages/WatchlistPage'
-import GeoMapPage from './pages/GeoMapPage'
+import RetiredRoute from './components/RetiredRoute'
 import ContradictionsPage from './pages/ContradictionsPage'
 import QueuePage from './pages/QueuePage'
 import SystemHealthPage from './pages/SystemHealthPage'
@@ -194,8 +194,14 @@ function AppLayout() {
                 <ProtectedRoute minimumRole="Analyst"><WatchlistPage /></ProtectedRoute>
               } />
               <Route path="/cases/:caseId/geomap" element={
+                /* Retired - see constants/hiddenRoutes.js. Routed to an
+                   explanation rather than 404-ing, so a stale bookmark or
+                   an old link says what happened instead of looking like a
+                   broken URL. The page component is deleted, not just
+                   unrouted: the reason it cannot be kept is recorded in the
+                   registry, and git holds the rest. */
                 <ProtectedRoute minimumRole="Viewer">
-                  <ErrorBoundary><GeoMapPage /></ErrorBoundary>
+                  <ErrorBoundary><RetiredRoute /></ErrorBoundary>
                 </ProtectedRoute>
               } />
               <Route path="/cases/:caseId/notes" element={

@@ -710,7 +710,10 @@ export default function EvidencePage() {
   const [restoring, setRestoring] = useState({})
   const [uploading, setUploading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
-  const [investigator, setInvestigator] = useState('Investigator')
+  // `investigator` used to be a state string appended to the upload
+  // FormData as `ingested_by`. The server now takes the uploader from the
+  // authenticated session, because that name is written to the chain of
+  // custody — so the state is gone rather than kept as a dead field.
   const [includeDeleted, setIncludeDeleted] = useState(false)
   const [showFormats, setShowFormats] = useState(false)
   const [confirmArchive, setConfirmArchive] = useState(null)
@@ -723,6 +726,17 @@ export default function EvidencePage() {
   // Queue state
   const [queuingEv, setQueuingEv] = useState(null)
   const [estimates, setEstimates] = useState({})
+  // Per-evidence in-flight and failed estimates. Without `estimating`, a
+  // second click would fire a duplicate request; without `estimateError`, a
+  // failed estimate simply leaves the previous figure (or nothing) on
+  // screen, which reads as "no estimate available" rather than "the request
+  // failed". See handleEstimate.
+  const [estimating, setEstimating] = useState({})
+  const [estimateError, setEstimateError] = useState({})
+  // Queue/history fetch failures. Kept apart from `queue`/`history` so that
+  // a request that failed can never be rendered as an empty result.
+  const [queueLoadError, setQueueLoadError] = useState(null)
+  const [historyLoadError, setHistoryLoadError] = useState(null)
   const [addingToQueue, setAddingToQueue] = useState({})
 
   // Storage stats
@@ -768,7 +782,6 @@ export default function EvidencePage() {
       if (files.length === 1) {
         const formData = new FormData()
         formData.append('file', files[0])
-        formData.append('ingested_by', investigator)
         await uploadEvidence(caseId, formData)
         toast.success(`Uploaded ${files[0].name}`)
       } else {
@@ -776,7 +789,6 @@ export default function EvidencePage() {
         for (let i = 0; i < files.length; i++) {
           formData.append('files', files[i])
         }
-        formData.append('ingested_by', investigator)
         await uploadMultiEvidence(caseId, formData)
         // Not "combined": the endpoint combines split disk-image segments
         // and stores everything else individually, so claiming a merge here
@@ -843,15 +855,30 @@ export default function EvidencePage() {
     }
   }
 
-  const handleEstimate = async (ev) => {
+  // Currently unwired: QueueModal exposes no estimate control, so nothing
+  // calls this. It is kept because the endpoint exists and the estimator is
+  // genuinely useful, and it now takes the same arguments as
+  // handleAddToQueue so that wiring it up cannot reintroduce the bug below.
+  //
+  // What the bug was: this read `queueConfig[ev.id]`, and there is no
+  // `queueConfig` anywhere in the file. The per-evidence settings do not
+  // live in a map at all - QueueModal holds them as local state and passes
+  // them to onQueue. So the first line of this function would have thrown a
+  // ReferenceError, been caught by the catch below, and shown the user
+  // "Failed to estimate time" for a request that was never sent. It never
+  // fired only because nothing calls it, which means it was dead code
+  // guarding a guaranteed crash: correct-looking, impossible to reach, and
+  // wrong the moment someone added the button it was written for.
+  const handleEstimate = async (ev, cpu, ingestionMode) => {
+    setEstimating(prev => ({ ...prev, [ev.id]: true }))
     try {
-      const cfg = queueConfig[ev.id] || {}
-      // Omitted limits are filled from the live device budget server-side,
-      // so the estimate reflects the machine rather than a stale default.
+      // Limits omitted here are filled from the live device budget
+      // server-side, so the estimate reflects this machine rather than a
+      // stale default.
       const res = await estimateTime(
         [ev.id],
-        cfg.cpu_throttle_percent ?? null,
-        cfg.ingestion_mode ?? null
+        cpu ?? null,
+        ingestionMode ?? null
       )
       const files = res.data.files || res.data.estimates || []
       const est = Array.isArray(files)
@@ -859,7 +886,16 @@ export default function EvidencePage() {
         : (res.data.estimates[ev.id] || { human_readable: 'Unknown' })
       setEstimates(prev => ({ ...prev, [ev.id]: est }))
     } catch (e) {
-      toast.error('Failed to estimate time')
+      // Distinguishes "we could not ask" from "we asked and there is no
+      // estimate", and says which - the same measured/could-not-measure
+      // split the rest of this pass has been applying.
+      setEstimateError(prev => ({
+        ...prev,
+        [ev.id]: apiErrorMessage(e, 'Could not reach the server for a time estimate')
+      }))
+      toast.error(apiErrorMessage(e, 'Failed to estimate time'))
+    } finally {
+      setEstimating(prev => ({ ...prev, [ev.id]: false }))
     }
   }
 
@@ -947,7 +983,19 @@ export default function EvidencePage() {
     try {
       const res = await getQueue()
       setQueue(Array.isArray(res.data) ? res.data : [])
-    } catch {}
+      setQueueLoadError(null)
+    } catch (e) {
+      // Was a bare `catch {}`, which left `queue` at its previous value.
+      // On the very first load that previous value is `[]`, and the panel
+      // below renders "No active jobs" from it. So a backend that was down
+      // — or slow, or restarting — displayed a confidently empty queue: an
+      // investigator would conclude nothing was ingesting and nothing was
+      // wrong, while a job could have been running the whole time. Same
+      // class as the rest of this pass: an unmeasured value rendered as a
+      // measured one.
+      setQueueLoadError(
+        apiErrorMessage(e, 'Could not load the ingestion queue'))
+    }
   }
 
   const loadHistory = async () => {
@@ -955,7 +1003,11 @@ export default function EvidencePage() {
     try {
       const res = await getQueueHistory()
       setHistory(Array.isArray(res.data) ? res.data : [])
-    } catch {}
+      setHistoryLoadError(null)
+    } catch (e) {
+      setHistoryLoadError(
+        apiErrorMessage(e, 'Could not load the queue history'))
+    }
     finally { setLoadingHistory(false) }
   }
 
@@ -1293,7 +1345,19 @@ export default function EvidencePage() {
             </h3>
             <div className="space-y-3">
               {running.length === 0 ? (
-                <p className="text-sm text-ink-2 italic bg-surface-1 p-3 rounded-lg border border-line border-dashed">No active jobs</p>
+                queueLoadError ? (
+                  /* A failed check, not a measured zero. "No active jobs" is
+                     a real answer from the server; this means we never got
+                     to ask. The badge above still reads 0 because there is
+                     genuinely nothing in the local list to count - so the
+                     count is the one figure on screen that a failure could
+                     have changed, and it is stated as unmeasured here. */
+                  <p className="text-sm text-warning bg-surface-1 p-3 rounded-lg border border-warning/40">
+                    Could not load the queue — status unknown. {queueLoadError}
+                  </p>
+                ) : (
+                  <p className="text-sm text-ink-2 italic bg-surface-1 p-3 rounded-lg border border-line border-dashed">No active jobs</p>
+                )
               ) : (
                 running.map(job => (
                   <div key={job.id} className="bg-surface-1 border border-accent/30 rounded-xl p-3 shadow-[0_0_15px_rgba(var(--accent),0.1)] relative overflow-hidden group">
@@ -1392,6 +1456,20 @@ export default function EvidencePage() {
               History
             </h3>
             <div className="space-y-2">
+              {historyLoadError ? (
+                /* Same distinction as the queue above. A bare `.map` with no
+                   else-branch renders a bare heading over nothing, which is
+                   indistinguishable from "nothing has ever been ingested
+                   here" - a claim this page used to make implicitly on every
+                   failed request. */
+                <p className="text-sm text-warning bg-surface-1 p-3 rounded-lg border border-warning/40">
+                  Could not load history — {historyLoadError}
+                </p>
+              ) : history.length === 0 ? (
+                <p className="text-sm text-ink-2 italic bg-surface-1 p-3 rounded-lg border border-line border-dashed">
+                  No ingestion history yet
+                </p>
+              ) : null}
               {history.map(job => {
                 const ev = evidence.find(e => e.id === job.evidence_id)
                 const filename = ev ? ev.original_filename : (job.evidence_id || 'Unknown File')

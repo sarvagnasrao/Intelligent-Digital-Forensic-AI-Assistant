@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import { Zap, RefreshCw, AlertTriangle, CheckCircle, Search } from 'lucide-react'
-import { detectContradictions, getLatestContradictions } from '../api/client'
+import { detectContradictions, getLatestContradictions, apiErrorMessage } from '../api/client'
 import { formatDistanceToNow } from 'date-fns'
 import { fromUtc } from '../utils/time'
 import toast from 'react-hot-toast'
@@ -13,6 +13,9 @@ export default function ContradictionsPage() {
   const [loading, setLoading] = useState(true)
   const [running, setRunning] = useState(false)
   const [meta, setMeta] = useState(null)
+  // A failed check is not an absent finding. Held separately from `meta`
+  // so the two can never render the same screen.
+  const [loadError, setLoadError] = useState(null)
 
   useEffect(() => {
     loadExisting()
@@ -25,7 +28,17 @@ export default function ContradictionsPage() {
         setAnalysis(res.data.analysis)
         setMeta(res.data)
       }
-    } catch {} finally {
+      setLoadError(null)
+    } catch (e) {
+      /* Was `catch {}`. Both `analysis` and `meta` stay null, and the page
+         renders its "No analysis yet" empty state. So a backend that was
+         unreachable displayed the same screen as a case that has genuinely
+         never been analysed - and on a page whose entire purpose is to
+         tell an investigator whether the evidence contradicts itself, an
+         unanswered question and a clean answer are the two most different
+         things this app could show. */
+      setLoadError(apiErrorMessage(e, 'Could not load the previous analysis'))
+    } finally {
       setLoading(false)
     }
   }
@@ -138,6 +151,32 @@ export default function ContradictionsPage() {
               animationDelay: `${i*80}ms`,
             }} />
         ))
+      ) : loadError ? (
+        <div style={{
+          textAlign: 'center',
+          padding: '40px 20px',
+          background: 'rgba(239,68,68,0.05)',
+          border: '1px solid rgba(239,68,68,0.2)',
+          borderRadius: 14,
+        }}>
+          <AlertTriangle size={40} style={{
+            margin: '0 auto 14px',
+            color: 'rgba(239,68,68,0.5)',
+          }} />
+          <p style={{ fontSize: 14, fontWeight: 600, color: '#f87171', marginBottom: 6 }}>
+            Could not check for a previous analysis
+          </p>
+          <p style={{ fontSize: 12, color: 'var(--color-white-3)', marginBottom: 14 }}>
+            {loadError} — this is not the same as there being none.
+          </p>
+          <button onClick={loadExisting} style={{
+            fontSize: 12, color: '#818cf8', background: 'none',
+            border: '1px solid rgba(129,140,248,0.4)', borderRadius: 6,
+            padding: '6px 14px', cursor: 'pointer',
+          }}>
+            Try again
+          </button>
+        </div>
       ) : analysis ? (
         <div style={{
           background: 'rgba(255,255,255,0.025)',

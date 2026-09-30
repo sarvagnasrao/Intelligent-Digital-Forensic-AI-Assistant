@@ -4,6 +4,7 @@ import {
   Music, Video, Mail, Database, AlertTriangle,
   ZoomIn, ZoomOut
 } from 'lucide-react'
+import { apiErrorMessage } from '../api/client'
 
 // ── Categorise by extension ───────────────────────────────────
 
@@ -92,24 +93,49 @@ function PDFViewer({ url }) {
   )
 }
 
+/**
+ * fetch that refuses to hand back an error page as if it were content.
+ *
+ * Both viewers below used `r.text()` with no status check, so a 401, 403 or
+ * 500 produced a *resolved* promise and its body was rendered as the
+ * evidence. The text viewer showed `{"detail":"Not authorized"}` under a
+ * filename; the email viewer parsed the same body into a message with no
+ * From, no Subject and no Date and presented it as a recovered email. In a
+ * forensic viewer a fabricated artefact is worse than a visible failure,
+ * because it is the one thing on the screen a reviewer cannot sanity-check
+ * at a glance.
+ *
+ * The thrown value is shaped like an axios error so `apiErrorMessage` can be
+ * reused unchanged — that keeps one precedence ladder for "what do we tell
+ * the operator" instead of a second, subtly different one here.
+ */
+async function fetchChecked(url) {
+  const r = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${localStorage.getItem('cfi_token')}`
+    }
+  })
+  if (!r.ok) {
+    throw Object.assign(new Error(`HTTP ${r.status}`), {
+      response: { status: r.status, data: null }
+    })
+  }
+  return r.text()
+}
+
 function TextViewer({ url, filename }) {
   const [content, setContent] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    fetch(url, {
-      headers: {
-        Authorization: `Bearer ${localStorage.getItem('cfi_token')}`
-      }
-    })
-      .then(r => r.text())
+    fetchChecked(url)
       .then(text => {
         setContent(text)
         setLoading(false)
       })
       .catch(e => {
-        setError(e.message)
+        setError(apiErrorMessage(e, 'Could not load the file.'))
         setLoading(false)
       })
   }, [url])
@@ -189,14 +215,10 @@ function VideoViewer({ url, filename }) {
 function EmailViewer({ url }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState(null)
 
   useEffect(() => {
-    fetch(url, {
-      headers: {
-        Authorization: `Bearer ${localStorage.getItem('cfi_token')}`
-      }
-    })
-      .then(r => r.text())
+    fetchChecked(url)
       .then(text => {
         const lines = text.split('\n')
         const headers = {}
@@ -220,7 +242,10 @@ function EmailViewer({ url }) {
         setData({ headers, body })
         setLoading(false)
       })
-      .catch(() => setLoading(false))
+      .catch(e => {
+        setError(apiErrorMessage(e, 'Could not load the message.'))
+        setLoading(false)
+      })
   }, [url])
 
   if (loading) return (
@@ -228,8 +253,15 @@ function EmailViewer({ url }) {
       Loading email…
     </div>
   )
+  if (error) return (
+    <div className="text-danger text-sm">{error}</div>
+  )
   if (!data) return (
-    <div className="text-ink-2 text-sm">Could not parse email</div>
+    <div className="text-ink-2 text-sm">
+      The server returned the file, but its contents are not a message this
+      viewer can read. It has not been shown here rather than shown
+      incorrectly.
+    </div>
   )
 
   return (

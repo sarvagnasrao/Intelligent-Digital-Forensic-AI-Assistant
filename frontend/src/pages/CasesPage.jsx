@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plus, FolderOpen, ChevronRight, Archive, Upload } from 'lucide-react'
+import { Plus, FolderOpen, ChevronRight, Archive, Upload, UserCheck } from 'lucide-react'
 import { getCases, createCase, archiveCase, importCase } from '../api/client'
 import Badge from '../components/Badge'
 import ConfirmDialog from '../components/ConfirmDialog'
@@ -8,9 +8,11 @@ import PageLayout from '../components/PageLayout'
 import toast from 'react-hot-toast'
 import { formatDistanceToNow } from 'date-fns'
 import { fromUtc } from '../utils/time'
+import { useAuth } from '../context/AuthContext'
 
 export default function CasesPage({ setActiveCaseId }) {
   const navigate = useNavigate()
+  const { user } = useAuth()
   const [cases, setCases] = useState([])
   const [loading, setLoading] = useState(true)
   const [showForm, setShowForm] = useState(false)
@@ -19,7 +21,6 @@ export default function CasesPage({ setActiveCaseId }) {
     case_number: '',
     priority: 'Medium',
     description: '',
-    created_by: 'Investigator',
     tags: ''
   })
   const [confirmArchive, setConfirmArchive] = useState(null)
@@ -53,7 +54,7 @@ export default function CasesPage({ setActiveCaseId }) {
       const res = await createCase(payload)
       toast.success('Case created')
       setShowForm(false)
-      setForm({ case_name: '', case_number: '', priority: 'Medium', description: '', created_by: 'Investigator', tags: '' })
+      setForm({ case_name: '', case_number: '', priority: 'Medium', description: '', tags: '' })
       setActiveCaseId(res.data.id)
       navigate(`/cases/${res.data.id}`)
     } catch {
@@ -181,13 +182,23 @@ export default function CasesPage({ setActiveCaseId }) {
               </select>
             </div>
             <div>
-              <label className="text-xs text-ink-2 mb-1 block">Investigator Name</label>
-              <input
-                value={form.created_by}
-                onChange={e => setForm({ ...form, created_by: e.target.value })}
-                placeholder="Det. Markov"
-                className="w-full bg-surface-1 border border-line rounded-lg px-3 py-2 text-sm text-ink-0 placeholder:text-ink-2 focus:outline-none focus:border-accent"
-              />
+              <label className="text-xs text-ink-2 mb-1 block">Opened by</label>
+              {/*
+                This used to be a free-text "Investigator Name" input, and
+                whatever was typed was written into Case.created_by and into
+                the CASE_CREATED audit entry. The server now takes the
+                creator from the authenticated session instead, so a typed
+                name would be silently discarded - a field that looks
+                editable and is not is the B29 defect (a control that works
+                perfectly and does nothing).
+
+                So it is shown, not offered: the one name that will be
+                recorded is the account you are signed in as.
+              */}
+              <div className="w-full bg-surface-0 border border-line rounded-lg px-3 py-2 text-sm text-ink-1 flex items-center gap-2">
+                <UserCheck size={14} className="text-accent shrink-0" />
+                <span className="truncate">{user?.username || 'your account'}</span>
+              </div>
             </div>
             <div className="col-span-2">
               <label className="text-xs text-ink-2 mb-1 block">Description</label>

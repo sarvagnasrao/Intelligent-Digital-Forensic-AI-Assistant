@@ -8,6 +8,7 @@ import {
   Sparkles, Key, GitCompare, Settings2, Download, Zap,
 } from 'lucide-react'
 import { getCase, getEvidence, getEntities, exportCase } from '../api/client'
+import { isRetiredCasePath } from '../constants/hiddenRoutes'
 import Badge from '../components/Badge'
 import AnimStatCard from '../components/AnimStatCard'
 import TiltActionCard from '../components/TiltActionCard'
@@ -34,11 +35,14 @@ const ACTIONS = [
   { icon: Key,           label: 'Credentials', desc: 'Passwords & API keys',  path: 'credentials', color: '#f87171' },
   { icon: Zap,           label: 'Contradictions', desc: 'AI inconsistency finder', path: 'contradictions', color: '#fbbf24' },
   { icon: GitCompare,    label: 'Compare',     desc: 'Side-by-side view',    path: 'compare',     color: '#67e8f9' },
-  { icon: Globe,         label: 'Geo Map',     desc: 'GPS & IP locations',    path: 'geomap',      color: '#4ade80' },
   { icon: StickyNote,    label: 'Notes',       desc: 'Case notes',            path: 'notes',       color: '#fde68a' },
   { icon: ShieldCheck,   label: 'Audit Log',   desc: 'Chain of custody',      path: 'audit',       color: '#94a3b8' },
   { icon: Settings2,     label: 'Access',      desc: 'Manage user access',    path: 'settings',    color: '#c084fc' },
-]
+  // 'Geo Map' was here, advertising "GPS & IP locations". It is filtered
+  // out below rather than deleted, so that the retired-route registry is the
+  // single place a feature is retired from - and so that re-enabling it is
+  // one edit in one file rather than a hunt for three.
+].filter(item => !isRetiredCasePath(item.path))
 
 export default function CaseDetailPage() {
   const { caseId } = useParams()

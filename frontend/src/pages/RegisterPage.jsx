@@ -44,7 +44,9 @@ export default function RegisterPage() {
         email: form.email,
         password: form.password,
         full_name: form.full_name,
-        role: form.role
+        // No role is sent. The backend assigns the first account Admin and
+        // every later one Analyst, ignoring any role in the request body, so
+        // sending one would only suggest the client chooses it.
       })
       // Auto login after register
       await signIn(
@@ -103,7 +105,11 @@ export default function RegisterPage() {
           </h1>
           <p className="text-ink-2
             text-sm mt-1">
-            First user becomes Admin
+            The first account created on
+            this workstation becomes
+            Admin. Later accounts start as
+            Analyst and are promoted from
+            User Management.
           </p>
         </div>
 
@@ -142,35 +148,15 @@ export default function RegisterPage() {
               </div>
             ))}
 
-            <div>
-              <label className="text-xs
-                text-ink-2 mb-1 block
-                font-medium">
-                Role
-              </label>
-              <select
-                id="register-role"
-                value={form.role}
-                onChange={e => setForm({
-                  ...form,
-                  role: e.target.value
-                })}
-                className="w-full
-                  bg-surface-1 border
-                  border-line rounded-xl
-                  px-4 py-2.5 text-sm
-                  text-ink-0
-                  focus:outline-none
-                  focus:border-accent
-                  transition-colors"
-              >
-                {['Viewer', 'Analyst',
-                  'Investigator',
-                  'Admin'].map(r => (
-                  <option key={r}>{r}</option>
-                ))}
-              </select>
-            </div>
+            {/* The role selector was removed. The backend used to take the
+                role straight from this dropdown, so any anonymous visitor
+                could create themselves an Admin account on a product whose
+                entire value is a trustworthy chain of custody. The backend
+                no longer accepts a client-supplied role at all; the first
+                account created becomes Admin and every later one is an
+                Analyst until an existing Admin promotes it from User
+                Management. Offering the choice here would have been
+                decoration over an escalation that is no longer possible. */}
 
             <button
               id="register-submit"

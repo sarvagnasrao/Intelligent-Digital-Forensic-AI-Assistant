@@ -49,9 +49,22 @@
     },
   ]
 
+  // Every figure here is checkable, so every figure here is measured.
+  //
+  // "AES / Encryption" was a straight falsehood. Grepping the backend for
+  // Fernet, AES, encrypt(), decrypt(), pycryptodome or Cryptodome returns
+  // nothing: this application performs no encryption at all. The app's own
+  // Artifacts page even says a file may be "Likely encrypted - content may be
+  // hidden", which is the *detection* of somebody else's encryption, not this
+  // product doing any. Claiming AES on the front door of a forensics tool
+  // would be the worst kind of lie: it invites someone to rely on protection
+  // that is not there.
+  //
+  // "15+ File formats" was true but pointlessly vague; GET
+  // /api/evidence/formats reports 110 accepted extensions across 14 groups.
   const STATS = [
-    { value: '15+', label: 'File formats' },
-    { value: 'AES', label: 'Encryption' },
+    { value: '110', label: 'File extensions' },
+    { value: '4', label: 'Access roles' },
     { value: '100%', label: 'Air-gapped' },
     { value: 'SHA-256', label: 'Integrity' },
   ]

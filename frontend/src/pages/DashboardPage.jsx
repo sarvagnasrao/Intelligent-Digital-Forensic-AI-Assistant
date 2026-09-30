@@ -1,52 +1,35 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
-  FolderOpen, Database, Cpu, AlertTriangle, CheckCircle, FileText, Bot, Clock, 
-  Search, MessageSquare, Plus, Upload, UserCheck, ArrowUpRight, TrendingUp, Sparkles, HelpCircle
+  FolderOpen, Database, AlertTriangle, CheckCircle, FileText, Bot, Clock,
+  MessageSquare, Plus, Upload
 } from 'lucide-react'
-import { ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts'
-import api from '../api/client'
+import { ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
+import api, { apiErrorMessage } from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import toast from 'react-hot-toast'
 
-// Mock sparkline trends for the metric cards
-const generateSparklineData = (value, multiplier = 1) => {
-  const seed = value || 10
-  return [
-    { value: seed * 0.7 * multiplier },
-    { value: seed * 0.9 * multiplier },
-    { value: seed * 0.75 * multiplier },
-    { value: seed * 1.1 * multiplier },
-    { value: seed * 0.85 * multiplier },
-    { value: seed * 1.2 * multiplier },
-    { value: seed * 1.1 * multiplier },
-  ]
+// Relative time, from a real timestamp. The previous footer read a hardcoded
+// "Last updated: 10 min ago" and the insight cards read "10 min ago" /
+// "25 min ago" / "1 hour ago" / "2 hours ago" that never changed.
+function timeAgo(iso) {
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return null
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000))
+  if (s < 60) return `${s}s ago`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m} min ago`
+  const h = Math.round(m / 60)
+  if (h < 24) return `${h} hour${h === 1 ? '' : 's'} ago`
+  const d = Math.round(h / 24)
+  return `${d} day${d === 1 ? '' : 's'} ago`
 }
 
-// Sparkline Mini-Chart Component
-function Sparkline({ data, color }) {
-  return (
-    <div style={{ width: '100%', height: 28, marginTop: 10 }}>
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 2, right: 2, left: 2, bottom: 2 }}>
-          <defs>
-            <linearGradient id={`sparkGrad-${color.replace('#','')}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor={color} stopOpacity={0.25} />
-              <stop offset="100%" stopColor={color} stopOpacity={0.0} />
-            </linearGradient>
-          </defs>
-          <Area 
-            type="monotone" 
-            dataKey="value" 
-            stroke={color} 
-            strokeWidth={1.5} 
-            fill={`url(#sparkGrad-${color.replace('#','')})`} 
-            dot={false}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  )
+// Human label for an audit action_type, e.g. QUERY_MADE -> "Query made".
+function actionLabel(action) {
+  if (!action) return 'Activity'
+  return String(action).replace(/_/g, ' ').toLowerCase()
+    .replace(/^./, c => c.toUpperCase())
 }
 
 export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
@@ -54,6 +37,8 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
   const navigate = useNavigate()
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState(null)
+  const [loadedAt, setLoadedAt] = useState(null)
 
   useEffect(() => { loadStats() }, [])
 
@@ -61,12 +46,18 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
     try {
       const res = await api.get('/dashboard/stats')
       setStats(res.data)
-      
+      setLoadedAt(new Date().toISOString())
+      setLoadError(null)
+
       // Auto-set active case if none is set and cases exist
       if (!activeCaseId && res.data.recent_cases?.length > 0) {
         setActiveCaseId(res.data.recent_cases[0].id)
       }
-    } catch {
+    } catch (e) {
+      // Previously this was `catch { toast.error(...) }` followed by
+      // `if (!stats) return null`, which rendered the entire main panel
+      // blank with no explanation - indistinguishable from a hang.
+      setLoadError(apiErrorMessage(e, 'Could not load dashboard statistics'))
       toast.error('Failed to load stats')
     } finally {
       setLoading(false)
@@ -85,44 +76,103 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
     </div>
   )
 
-  if (!stats) return null
+  if (!stats) {
+    // Was `return null` - a blank page on failure, which reads as a broken
+    // app rather than a failed request. The distinction matters most here,
+    // because every other number on this page is a measurement.
+    return (
+      <div className="animate-fade-in" style={{ width: '100%', color: 'var(--text-primary)' }}>
+        <div className="ref-card" style={{ padding: 24, textAlign: 'center' }}>
+          <h2 style={{ fontSize: 16, fontWeight: 700, margin: '0 0 6px 0' }}>
+            Dashboard statistics unavailable
+          </h2>
+          <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '0 0 14px 0' }}>
+            {loadError || 'The statistics request did not return a result.'}
+          </p>
+          <button
+            onClick={() => { setLoading(true); loadStats() }}
+            style={{
+              padding: '7px 14px', borderRadius: 8, border: 'none',
+              background: '#4f46e5', color: '#fff', fontSize: 12,
+              fontWeight: 600, cursor: 'pointer',
+            }}
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    )
+  }
 
-  // 1. Calculations for dynamic metric values
+  // 1. Calculations for dynamic metric values.
+  //    Every figure below is read from /dashboard/stats. This page previously
+  //    carried hardcoded deltas ("+12% this month"), a hardcoded total
+  //    ("|| 1248"), fixed donut proportions and a fake evidence size, which
+  //    contradicted the real counters printed beside them. Where a number
+  //    cannot be measured it is now omitted rather than invented.
   const totalCases = stats.cases?.total || 0
   const totalEvidence = stats.evidence?.total || 0
   const aiAnalyses = stats.queries?.total || 0
-  const alertCount = stats.artifacts?.anomalies || 0
   const resolvedCases = stats.cases?.by_status?.Closed || 0
 
-  // 2. Evidence Overview Donut Chart Data (proportional to total evidence)
-  const evTotal = totalEvidence || 1248
+  // `stats.alerts` always carries at least one entry - the backend appends an
+  // "All Systems Operational" info row when nothing is wrong. Counting the
+  // array would therefore report 1 alert on a completely clean system, so
+  // count the ones that actually describe a problem.
+  const activeAlerts = (stats.alerts || []).filter(a => a.level !== 'info')
+  const alertCount = activeAlerts.length
+
+  // 2. Evidence Overview - the real ingestion state of every evidence row.
+  //    Drawn from measured counts, so the slices always sum to the total
+  //    printed in the middle of the donut.
+  const evTotal = totalEvidence
+  const evIndexed = stats.evidence?.indexed || 0
+  const evFailed = stats.evidence?.failed || 0
+  const evPending = Math.max(0, evTotal - evIndexed - evFailed)
   const evidenceOverviewData = [
-    { name: 'Images', value: Math.round(evTotal * 0.36), color: '#3b82f6' },
-    { name: 'Documents', value: Math.round(evTotal * 0.24), color: '#10b981' },
-    { name: 'Videos', value: Math.round(evTotal * 0.15), color: '#8b5cf6' },
-    { name: 'Audio', value: Math.round(evTotal * 0.10), color: '#fbbf24' },
-    { name: 'Archives', value: Math.round(evTotal * 0.09), color: '#06b6d4' },
-    { name: 'Others', value: Math.round(evTotal * 0.06), color: '#ec4899' },
-  ]
+    { name: 'Indexed', value: evIndexed, color: '#10b981' },
+    { name: 'Awaiting ingest', value: evPending, color: '#3b82f6' },
+    { name: 'Failed', value: evFailed, color: '#ef4444' },
+  ].filter(d => d.value > 0)
 
-  // 3. Case Status Distribution Data
-  const caseStatusData = [
-    { name: 'In Progress', value: stats.cases?.by_status?.Active || 18, color: '#3b82f6' },
-    { name: 'Completed', value: stats.cases?.by_status?.Closed || 12, color: '#10b981' },
-    { name: 'Under Review', value: stats.cases?.by_status?.Open || 7, color: '#f59e0b' },
-    { name: 'On Hold', value: stats.cases?.by_status?.OnHold || 5, color: '#8b5cf6' },
-  ]
+  // 3. Case Status Distribution - real counts only. The old version used
+  //    `|| 18` / `|| 12` fallbacks, which rendered a genuine zero as 18 and
+  //    produced a legend reading "Completed 12 (400%)" under a centre that
+  //    said "3 Total Cases".
+  const STATUS_COLOURS = {
+    Active: '#3b82f6', Open: '#f59e0b', Closed: '#10b981',
+    'Under Review': '#8b5cf6', OnHold: '#6b7280', Archived: '#9ca3af',
+  }
+  const STATUS_LABELS = {
+    Active: 'In Progress', Open: 'Open', Closed: 'Closed',
+    'Under Review': 'Under Review', OnHold: 'On Hold', Archived: 'Archived',
+  }
+  const caseStatusData = Object.entries(stats.cases?.by_status || {})
+    .filter(([, v]) => v > 0)
+    .map(([k, v]) => ({
+      name: STATUS_LABELS[k] || k,
+      value: v,
+      color: STATUS_COLOURS[k] || '#6b7280',
+    }))
 
-  // 4. Analysis Trend (Line area chart data)
-  const trendData = [
-    { name: 'May 14', value: 30 },
-    { name: 'May 15', value: 62 },
-    { name: 'May 16', value: 45 },
-    { name: 'May 17', value: 60 },
-    { name: 'May 18', value: 55 },
-    { name: 'May 19', value: 80 },
-    { name: 'May 20', value: 72 },
-  ]
+  // 4. Real activity, for the activity feed. The previous "Analysis Trend"
+  //    was seven hardcoded points dated 14-20 May that never changed and had
+  //    a period selector wired to nothing. There is no time series behind
+  //    /dashboard/stats, so the card shows the audit trail that does exist.
+  const recentActivity = (stats.recent_activity || []).slice(0, 6)
+  const lastUpdated = loadedAt
+
+  // Entity types, largest first, as bars against the largest type.
+  const entityTotal = stats.entities?.total || 0
+  const entityTypeRows = Object.entries(stats.entities?.by_type || {})
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([k, v]) => ({
+      name: k,
+      value: v,
+      pct: entityTotal > 0 ? Math.round((v / entityTotal) * 100) : 0,
+    }))
 
   // Tool Click Handler
   const handleToolClick = (path) => {
@@ -226,11 +276,7 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
           <div style={{ marginTop: 8 }}>
             <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{totalCases}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#3b82f6' }}>↑ 12% this month</span>
-            </div>
           </div>
-          <Sparkline data={generateSparklineData(totalCases, 1)} color="#3b82f6" />
         </div>
 
         {/* Metric 2: Total Evidence */}
@@ -243,11 +289,10 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
           <div style={{ marginTop: 8 }}>
             <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{totalEvidence.toLocaleString()}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#10b981' }}>↑ 18% this month</span>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+              {evIndexed} indexed · {evPending} queued · {evFailed} failed
             </div>
           </div>
-          <Sparkline data={generateSparklineData(totalEvidence, 1.2)} color="#10b981" />
         </div>
 
         {/* Metric 3: AI Analyses */}
@@ -260,11 +305,10 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
           <div style={{ marginTop: 8 }}>
             <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{aiAnalyses}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#8b5cf6' }}>↑ 25% this month</span>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+              questions asked of the assistant
             </div>
           </div>
-          <Sparkline data={generateSparklineData(aiAnalyses, 0.85)} color="#8b5cf6" />
         </div>
 
         {/* Metric 4: Alerts */}
@@ -277,11 +321,15 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
           <div style={{ marginTop: 8 }}>
             <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{alertCount}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#f59e0b' }}>↓ 3 new alerts</span>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+              {/* Was a hardcoded "↓ 3 new alerts" directly beneath a counter
+                  that rendered 0 - a self-contradiction on one card. Now it
+                  says what is actually true, including when that is nothing. */}
+              {alertCount === 0
+                ? 'no integrity, lock or ingestion problems'
+                : activeAlerts.map(a => a.title).join(', ')}
             </div>
           </div>
-          <Sparkline data={generateSparklineData(alertCount, 1.5)} color="#f59e0b" />
         </div>
 
         {/* Metric 5: Resolved Cases */}
@@ -294,11 +342,12 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
           <div style={{ marginTop: 8 }}>
             <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{resolvedCases}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#06b6d4' }}>↑ 8% this month</span>
+            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+              {/* Was a hardcoded "↑ 8% this month" under a counter that
+                  renders 0 - growth claimed from nothing. */}
+              of {totalCases} case{totalCases === 1 ? '' : 's'} closed
             </div>
           </div>
-          <Sparkline data={generateSparklineData(resolvedCases, 0.95)} color="#06b6d4" />
         </div>
       </div>
 
@@ -450,94 +499,105 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
           
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderTop: '1px solid var(--border-base)', paddingTop: 10, marginTop: 10, fontSize: 10, color: 'var(--text-muted)' }}>
-            <span>Evidence size: <strong>256.7 GB</strong></span>
-            <span>Last updated: 10 min ago</span>
+            {/* Was hardcoded: "Evidence size: 256.7 GB" and "Last updated:
+                10 min ago". /dashboard/stats carries no byte total, so the
+                size claim had no measurement behind it at all - claiming
+                256.7 GB for a corpus of a few hundred MB. Removed rather
+                than guessed; the timestamp below is the real fetch time. */}
+            <span>
+              {evTotal === 0
+                ? 'No evidence ingested yet'
+                : `${evIndexed} of ${evTotal} indexed and searchable`}
+            </span>
+            <span>
+              {lastUpdated
+                ? `Updated ${timeAgo(lastUpdated) || 'just now'}`
+                : 'Updated —'}
+            </span>
           </div>
         </div>
 
-        {/* Card 3: AI Insights */}
+        {/* Card 3: Activity & Alerts */}
         <div className="ref-card">
           <div className="ref-card-header">
-            <span className="ref-card-title">AI Insights</span>
-            <button onClick={() => handleToolClick('investigate')} style={{ fontSize: 11, color: '#4f46e5', border: 'none', background: 'none', cursor: 'pointer', fontWeight: 600 }}>View All</button>
+            <span className="ref-card-title">Activity &amp; Alerts</span>
+            <button onClick={() => navigate('/activity')} style={{ fontSize: 11, color: '#4f46e5', border: 'none', background: 'none', cursor: 'pointer', fontWeight: 600 }}>View All</button>
           </div>
 
+          {/* The four cards this replaces were static JSX claiming
+              "AI found 3 potential matches in case Cyber Fraud
+              Investigation", "Unusual file behavior detected in Malware
+              Incident Response", 'Keyword "confidential" found in 12 new
+              documents' and "AI recommends 2 similar cases". Neither named
+              case exists in the database, the keyword alert was not wired to
+              the watchlist, the "recommendation" was not produced by
+              anything, and the four timestamps never changed. All of it is
+              now read from /dashboard/stats. */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {/* Insight 1: Potential Match Found */}
-            <div style={{
-              display: 'flex', gap: 10, padding: 10, borderRadius: 8,
-              background: 'rgba(16,185,129,0.04)', borderLeft: '3px solid #10b981'
-            }}>
-              <div style={{ color: '#10b981', flexShrink: 0, marginTop: 1 }}>
-                <UserCheck size={14} />
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#10b981' }}>Potential Match Found</span>
-                  <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>10 min ago</span>
+            {activeAlerts.map((a, i) => {
+              const colour = a.level === 'critical' ? '#ef4444' : '#f59e0b'
+              const tint = a.level === 'critical'
+                ? 'rgba(239,68,68,0.04)' : 'rgba(245,158,11,0.04)'
+              return (
+                <div key={`alert-${i}`} style={{
+                  display: 'flex', gap: 10, padding: 10, borderRadius: 8,
+                  background: tint, borderLeft: `3px solid ${colour}`
+                }}>
+                  <div style={{ color: colour, flexShrink: 0, marginTop: 1 }}>
+                    <AlertTriangle size={14} />
+                  </div>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: colour }}>{a.title}</span>
+                      {a.action && (
+                        <button
+                          onClick={() => navigate(a.action)}
+                          style={{ fontSize: 9, fontWeight: 700, color: colour, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                        >
+                          Review
+                        </button>
+                      )}
+                    </div>
+                    <p style={{ fontSize: 10, color: 'var(--text-secondary)', margin: '2px 0 0 0', lineHeight: 1.3 }}>
+                      {a.message}
+                    </p>
+                  </div>
                 </div>
-                <p style={{ fontSize: 10, color: 'var(--text-secondary)', margin: '2px 0 0 0', lineHeight: 1.3 }}>
-                  AI found 3 potential matches in case Cyber Fraud Investigation
-                </p>
-              </div>
-            </div>
+              )
+            })}
 
-            {/* Insight 2: Anomaly Detected */}
-            <div style={{
-              display: 'flex', gap: 10, padding: 10, borderRadius: 8,
-              background: 'rgba(245,158,11,0.04)', borderLeft: '3px solid #f59e0b'
-            }}>
-              <div style={{ color: '#f59e0b', flexShrink: 0, marginTop: 1 }}>
-                <AlertTriangle size={14} />
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#f59e0b' }}>Anomaly Detected</span>
-                  <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>25 min ago</span>
+            {recentActivity.slice(0, activeAlerts.length === 0 ? 4 : 2).map((a, i) => (
+              <div key={`act-${i}`} style={{
+                display: 'flex', gap: 10, padding: 10, borderRadius: 8,
+                background: 'rgba(59,130,246,0.04)', borderLeft: '3px solid #3b82f6'
+              }}>
+                <div style={{ color: '#3b82f6', flexShrink: 0, marginTop: 1 }}>
+                  <Clock size={14} />
                 </div>
-                <p style={{ fontSize: 10, color: 'var(--text-secondary)', margin: '2px 0 0 0', lineHeight: 1.3 }}>
-                  Unusual file behavior detected in Malware Incident Response
-                </p>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: '#3b82f6' }}>
+                      {actionLabel(a.action)}
+                    </span>
+                    <span style={{ fontSize: 9, color: 'var(--text-muted)', flexShrink: 0 }}>
+                      {timeAgo(a.at) || '—'}
+                    </span>
+                  </div>
+                  <p style={{ fontSize: 10, color: 'var(--text-secondary)', margin: '2px 0 0 0', lineHeight: 1.3 }}>
+                    {a.by ? `by ${a.by}` : 'system'}
+                    {a.case_id ? ` · case ${a.case_id.slice(0, 8)}` : ''}
+                  </p>
+                </div>
               </div>
-            </div>
+            ))}
 
-            {/* Insight 3: Keyword Alert */}
-            <div style={{
-              display: 'flex', gap: 10, padding: 10, borderRadius: 8,
-              background: 'rgba(59,130,246,0.04)', borderLeft: '3px solid #3b82f6'
-            }}>
-              <div style={{ color: '#3b82f6', flexShrink: 0, marginTop: 1 }}>
-                <Search size={14} />
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#3b82f6' }}>Keyword Alert</span>
-                  <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>1 hour ago</span>
-                </div>
-                <p style={{ fontSize: 10, color: 'var(--text-secondary)', margin: '2px 0 0 0', lineHeight: 1.3 }}>
-                  Keyword "confidential" found in 12 new documents
-                </p>
-              </div>
-            </div>
-
-            {/* Insight 4: Similar Case Recommendation */}
-            <div style={{
-              display: 'flex', gap: 10, padding: 10, borderRadius: 8,
-              background: 'rgba(139,92,246,0.04)', borderLeft: '3px solid #8b5cf6'
-            }}>
-              <div style={{ color: '#8b5cf6', flexShrink: 0, marginTop: 1 }}>
-                <TrendingUp size={14} />
-              </div>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#8b5cf6' }}>Similar Case Recommendation</span>
-                  <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>2 hours ago</span>
-                </div>
-                <p style={{ fontSize: 10, color: 'var(--text-secondary)', margin: '2px 0 0 0', lineHeight: 1.3 }}>
-                  AI recommends 2 similar cases for reference
-                </p>
-              </div>
-            </div>
+            {activeAlerts.length === 0 && recentActivity.length === 0 && (
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0, lineHeight: 1.4 }}>
+                No recorded activity yet. An entry appears here when an
+                integrity check fails, an account locks, or evidence fails to
+                ingest.
+              </p>
+            )}
           </div>
         </div>
 
@@ -590,7 +650,16 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
             {/* Legends */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, marginLeft: 16 }}>
               {caseStatusData.map((d, i) => {
-                const pct = Math.round((d.value / (totalCases || 1)) * 100) || 0
+                // Was `Math.round((d.value / (totalCases || 1)) * 100) || 0`,
+                // which was not clamped - with the old `|| 18` fallbacks the
+                // seeded database rendered "Completed 12 (400%)" directly
+                // under a donut reading "3 Total Cases". Slices are now
+                // derived from the same by_status dict the donut centre is
+                // summed from, but the clamp is kept so a total that ever
+                // disagrees cannot print an impossible percentage.
+                const pct = totalCases > 0
+                  ? Math.min(100, Math.round((d.value / totalCases) * 100))
+                  : 0
                 return (
                   <div key={d.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
@@ -612,50 +681,40 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
         {/* Card 2: Analysis Trend */}
         <div className="ref-card" style={{ display: 'flex', flexDirection: 'column' }}>
           <div className="ref-card-header" style={{ marginBottom: 12 }}>
-            <span className="ref-card-title">Analysis Trend</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <select style={{
-                fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)',
-                background: 'var(--bg-hover)', border: 'none', borderRadius: 4,
-                padding: '3px 6px', outline: 'none', cursor: 'pointer'
-              }}>
-                <option>Last 7 Days</option>
-                <option>Last 30 Days</option>
-              </select>
-            </div>
+            <span className="ref-card-title">Entities Extracted</span>
+            <span style={{ fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>
+              {(stats.entities?.total || 0).toLocaleString()} total
+            </span>
           </div>
 
-          <div style={{ flex: 1, width: '100%', height: 110, marginTop: 4 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={trendData} margin={{ top: 5, right: 5, left: -25, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="trendGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#4f46e5" stopOpacity={0.2} />
-                    <stop offset="100%" stopColor="#4f46e5" stopOpacity={0.0} />
-                  </linearGradient>
-                </defs>
-                {/* Horizontal grid/ticks omitted matching reference design */}
-                <Area 
-                  type="monotone" 
-                  dataKey="value" 
-                  stroke="#4f46e5" 
-                  strokeWidth={2} 
-                  fill="url(#trendGrad)"
-                  dot={{ r: 3, stroke: '#4f46e5', strokeWidth: 1, fill: '#ffffff' }}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-          
-          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0 0 0', borderTop: '1px solid var(--border-base)', marginTop: 8, fontSize: 9, color: 'var(--text-muted)', fontWeight: 600 }}>
-            <span>May 14</span>
-            <span>May 15</span>
-            <span>May 16</span>
-            <span>May 17</span>
-            <span>May 18</span>
-            <span>May 19</span>
-            <span>May 20</span>
-          </div>
+          {/* Replaces the "Analysis Trend" area chart: seven hardcoded points
+              dated 14-20 May, with a "Last 7 Days / Last 30 Days" select
+              that had no onChange and so changed nothing. There is no time
+              series behind /dashboard/stats to plot, so rather than invent
+              one this shows the entity-type breakdown, which is measured. */}
+          {entityTypeRows.length === 0 ? (
+            <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0, lineHeight: 1.4 }}>
+              No entities extracted yet. They appear here once evidence has
+              been ingested and named-entity recognition has run over it.
+            </p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 9, flex: 1, justifyContent: 'center' }}>
+              {entityTypeRows.map(e => (
+                <div key={e.name}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                    <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)' }}>{e.name}</span>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-primary)' }}>{e.value}</span>
+                  </div>
+                  <div style={{ height: 5, background: 'var(--bg-hover)', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${e.pct}%`, height: '100%',
+                      background: '#4f46e5', borderRadius: 3,
+                    }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Card 3: Tools & Modules Grid */}
@@ -681,7 +740,7 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
               onMouseLeave={e => e.currentTarget.style.filter = 'none'}
             >
               <Database size={15} style={{ marginBottom: 4 }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>File Carver</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Artifacts</span>
             </button>
 
             {/* Tool 2: Hash Analyzer */}
@@ -696,12 +755,17 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
               onMouseLeave={e => e.currentTarget.style.filter = 'none'}
             >
               <span style={{ fontSize: 13, fontWeight: 800, marginBottom: 4, fontFamily: 'monospace', lineHeight: 1.15 }}>#</span>
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Hash Analyzer</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Evidence</span>
             </button>
 
-            {/* Tool 3: Metadata Extractor */}
+            {/* Tool 3: Entity Graph. This was labelled "Metadata
+                Extractor" and pointed at `artifacts` - the same destination as
+                the card above it. There is no metadata-extraction module in
+                this product and no malware scanner either; both names
+                advertised capabilities that do not exist. Repointed at a
+                page that does, and named after what it actually opens. */}
             <button
-              onClick={() => handleToolClick('artifacts')}
+              onClick={() => handleToolClick('entities')}
               style={{
                 display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                 padding: '10px 4px', borderRadius: 8, border: 'none', background: 'rgba(139,92,246,0.06)',
@@ -711,7 +775,7 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
               onMouseLeave={e => e.currentTarget.style.filter = 'none'}
             >
               <FileText size={15} style={{ marginBottom: 4 }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Metadata Ext.</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Entity Graph</span>
             </button>
 
             {/* Tool 4: Malware Scanner */}
@@ -726,7 +790,7 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
               onMouseLeave={e => e.currentTarget.style.filter = 'none'}
             >
               <AlertTriangle size={15} style={{ marginBottom: 4 }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Malware Scan</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Anomalies</span>
             </button>
 
             {/* Tool 5: Timeline Builder */}
@@ -741,7 +805,7 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
               onMouseLeave={e => e.currentTarget.style.filter = 'none'}
             >
               <Clock size={15} style={{ marginBottom: 4 }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Timeline Bld.</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Timeline</span>
             </button>
 
             {/* Tool 6: Chat with AI */}
@@ -756,16 +820,19 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
               onMouseLeave={e => e.currentTarget.style.filter = 'none'}
             >
               <MessageSquare size={15} style={{ marginBottom: 4 }} />
-              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Chat with AI</span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-primary)' }}>Ask AI</span>
             </button>
           </div>
         </div>
 
       </div>
       
-      {/* Footer timezone indicator */}
+      {/* Footer */}
       <div style={{ display: 'flex', justifyContent: 'center', marginTop: 24, fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>
-        All times are in IST (UTC +05:30)
+        {/* Was hardcoded to "All times are in IST (UTC +05:30)", which is
+            wrong anywhere else and was not a timezone this app ever
+            configured. Timestamps render in the viewer's own locale. */}
+        Times shown in your local timezone
       </div>
 
     </div>

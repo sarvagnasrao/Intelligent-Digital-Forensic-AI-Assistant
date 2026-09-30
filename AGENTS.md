@@ -2388,3 +2388,620 @@ unreadable scripts would have printed **405 passed, 2 failed** and exited
 non-zero — technically a failure, but with a total that looks like a
 measurement. That is TRAP 8's fix (§21) earning its keep on a case nobody
 designed for it: not a summary-format change, but a genuinely broken tree.
+---
+
+## 24. Audit pass before review — B30, B31, and five defects verification would never have found
+
+A full read of the codebase and a live pass over every page, on the way to a
+review. Four of the eleven findings below were **not** found by reading the
+code that contained them. They were found by a DOM probe, a metric that
+measured the wrong thing, an air-gap requirement, and three test suites that
+turned out to be passing for the wrong reason. The pattern is §22's, one level
+up: this file keeps recording verification that reported success without
+measuring anything, and the places it does that are not obvious from a diff.
+
+### ✅ FIXED B30. A failed search was reported as "nothing matched" — and that clears a suspect
+
+`search_chunks` ended in the shape this file exists to prevent:
+
+```python
+except Exception as e:
+    print(f"QDRANT SEARCH ERROR: {e}")
+    return []
+```
+
+`run_rag_query` cannot tell an empty list from a failed search, so a locked
+Qdrant directory, a missing collection or a dead embedder produced the sentence
+**"Nothing in this case matched that question, and the model returned no
+analysis."** That is the exculpatory direction. A B1 or B10 stale row is a
+cosmetic problem; this one tells an investigator, in the app's own voice, that
+the evidence supporting a suspect is not there. It is the most consequential
+instance of the defining defect in the repo, and it had been there since the
+vector store was written.
+
+- `search_chunks` now raises `VectorStoreError` with the underlying reason
+  attached, exactly as `store_chunks` does (B10's fix, already in the file).
+  `StopIteration` is re-raised first, for §15's reason.
+- `run_rag_query` catches it and returns an answer that says the search could
+  not be run, names the reason, and states explicitly that **nothing has been
+  ruled out**. `prompt_stats.retrieval_failed` and `.retrieval_error` make the
+  two states distinguishable to a caller. The model is not consulted.
+
+> **Generalisable, and it is the half that was easy to miss:** the honest
+> "nothing matched" message did exist — inside the empty-response branch of
+> `process_response`. So it was only reachable **if the model happened to
+> return nothing**. Handed a question, an entity graph and zero excerpts, a
+> chat model will happily produce a paragraph, and the investigator reads it as
+> a finding. The app's own statement of what it found must not depend on the
+> model's behaviour. There is now an early return for "the search ran and
+> nothing survived", which also names *why* — an empty collection and a
+> relevance floor that dropped everything are different situations with
+> different next steps.
+
+This is also the cheap path: a grounded answer costs a 13,000-token prefill on
+CPU, measured at 165 s, and this state is reached by exactly the questions that
+have nothing to retrieve.
+
+### The relevance floor, and why the number is not a guess
+
+Qdrant returned `top_k=7` **unconditionally** and `build_prompt` divided the
+context allowance between all seven, so a real question about a suspect and a
+question of "hi" were answered from the same seven excerpts. Retrieval scoring
+exists to be thresholded and it was not.
+
+The scores recorded in `query_logs.chunks_used` on this corpus (12 queries,
+ranked within each) put the threshold in evidence rather than in taste:
+
+| query | scores |
+|---|---|
+| "hi" / "hello" | 0.134 – 0.138 |
+| "what is duck?" | 0.060 – 0.076 |
+| suspect email / phone | 0.094 – 0.107 |
+| operators and hosts | 0.465 – 0.476 |
+| suspect behind darknode.io | 0.395 – 0.476 |
+
+There is a **gap between 0.138 and 0.395 with nothing in it**; the floor sits
+in that gap (0.25), not on a round number. `verify_retrieval_integrity.py` §F
+pins it between the two clusters, so changing it to any value outside the gap
+**fails the suite**.
+
+Two caveats recorded in the constant's own comment, so the next person does not
+mistake this for settled: the sample is small and several entries are
+near-duplicates of "hi"; and cosine similarity is not calibrated across
+embedding models, so this threshold is a property of `all-MiniLM-L6-v2` over
+this corpus. It is exposed in `prompt_stats` so a surprising answer can be
+explained rather than guessed at.
+
+- `RETRIEVAL_TOP_K = 14`, wider than before, because a floor applied after
+  retrieval needs candidates to drop. Fetching 14 and discarding the weak ones
+  beats fetching 7 mediocre ones.
+- `chunks_retrieved` is the count **before** the floor and
+  `chunks_below_floor` the count after, so "retrieved nothing" stays
+  distinguishable from "retrieved 14 and kept none".
+- A chunk with **no score is kept**. The floor is a statement about a
+  measurement; refusing to act when there is nothing to compare is correct, and
+  silently discarding every chunk from a caller that does not supply scores
+  would turn a missing field into "no evidence" — B10's shape, one layer over.
+
+### 🔴 A negative result: the degenerate-chunk filter was not warranted, and I nearly shipped it
+
+The demo corpus is visibly full of filler — 44% of its lines are runs of `=`
+and `-`. The obvious fix is to skip degenerate chunks at retrieval. **Measured,
+that filter would have dropped 0.0% of chunks**, because no chunk in the corpus
+is more than 86% decorative lines (the separator runs are interleaved with real
+log lines inside every chunk).
+
+The first version of the measurement said something else — "52% separator
+characters", and chunks that "compete for top-k slots" — and that number is
+**wrong**. The metric counted ` ` and `\n` as separator characters, so ordinary
+prose scored 0.43 and a run of bare `=` scored 0.40. Measuring by **line**,
+against `^[=\-_*#~\s]+$`, gives the real figure: 44% of *lines*, and zero
+degenerate chunks.
+
+> **Two lessons, both worth more than the filter.** (1) A threshold chosen to
+> match a metric that measures the wrong thing is a safeguard that does
+> nothing while looking like one — the code-level twin of B22's fabricated
+> health card. (2) The filler *dilutes* the embeddings of the chunks it shares
+> with; it does not displace them. The relevance floor handles dilution
+> correctly and the heuristic would not have. **No filter was added**, and this
+> paragraph is here so the next agent does not add it.
+
+### 🔴 TRAP 10 — an air-gap tool was calling `ip-api.com`
+
+`get_geo_data` in `backend/main.py` geolocated IP entities by making an
+**outbound HTTPS request to a public geolocation service**, for every batch of
+IP entities it was shown. The product's stated requirement is that nothing
+leaves the machine. The map also renders the *investigator's* IP-derived
+location, which is both an air-gap violation and a privacy problem, and in an
+offline deployment it hung for up to 100 s per lookup.
+
+Removed outright. EXIF geolocation — which is read from the evidence file
+itself and never leaves the machine — is kept. IP entities now come back with
+`lat/lon: null`, `type: "ip_not_geolocated"`, and a new `ip_geolocation` state
+object saying `not_attempted`, with `count` and `located: 0`, so the UI can
+say *not geolocated* rather than draw a pin at (0, 0). Verified live: 20 ms
+instead of up to 100 s, 47 IPs, `state=not_attempted count=47 located=0`.
+
+> **The generalisable form:** an air-gap claim is a property of the *whole*
+> dependency graph, including runtime HTTP. `grep` for a hostname finds
+> deliberate calls; it does not find a library that phones home, and it says
+> nothing about what a `fetch` in a frontend component reaches. This one was in
+> a function nobody had read since it was written.
+
+### ✅ FIXED B31. Four identity fields that looked editable and were not
+
+The investigator could type a name into "Investigator Name", "Author",
+"Officer name" and "Prepared By", and the server stored **whatever they typed**.
+Chain-of-custody records that name as who did the work. A user could attribute
+a note, a report, a case or a query to any other user, including an Admin, and
+the audit log would agree with them.
+
+The fix is server-authoritative: the authenticated user is recorded for every
+attribution, and the client-supplied identity fields are **ignored, not
+trusted**. `asked_by`, `created_by`, `author`, `generated_by` and
+`ingested_by` are no longer accepted from the body at all.
+
+The four visible name inputs were **replaced with a read-only badge** showing
+the signed-in user, rather than left in place and ignored. A field that looks
+editable and is not is the B29 defect: the operator believes they said
+something, and the record says something else.
+
+`tests/verify_identity_attribution.py` (19 assertions) forges `"admin"` in a
+request body and asserts the database says otherwise, then sweeps the routers
+for any remaining `body.<identity>`. **Verified discriminating: 19/19 on the
+fix, 11 failures on the reverted code.**
+
+### 🔴 TRAP 11 — three test suites were passing through a privilege-escalation hole
+
+`POST /api/auth/register` accepted a `role` in the request body and honoured
+it. That is the escalation hole B31's sibling, and §3's own note ("first
+registered user becomes Admin; later ones default to Analyst") says the
+behaviour is *supposed* to be fixed.
+
+It was not fixed, and it was masking itself: **`verify_queue_api.py`,
+`verify_job_stop.py` and `verify_live_stack.py` all registered with
+`"role": "Investigator"` and passed** — not because the suite worked, but
+because the suite was quietly asking for the privilege it needed. The
+escalation is now impossible (the backend assigns Analyst to every later user)
+and all three suites **promote in the database** instead.
+
+> A test that passes because the product has a security hole is worse than a
+> failing test, because it converts the hole into a fixture. When a test
+> *registers a user with a role*, that is a signal to check whether the
+> registration endpoint is allowed to honour one — not a convenience.
+
+### ✅ FIXED — the file viewer rendered error pages as evidence
+
+`FileViewer.jsx` fetched with `r.text()` and **no status check**, so a 401, 403
+or 500 resolved successfully and its body became the file. The text viewer
+showed `{"detail":"Not authorized"}` under a filename. The email viewer parsed
+that same body into a message with no `From`, no `Subject` and no `Date` and
+presented it as a recovered email. `EmailViewer` also ended in
+`.catch(() => setLoading(false))`, so the failure surfaced as "Could not parse
+email" — blaming the evidence for what was an auth error.
+
+Both go through one `fetchChecked` that refuses a non-2xx and throws an
+axios-shaped error, so the existing `apiErrorMessage` precedence ladder is
+reused rather than a second, subtly different one. In a forensic viewer a
+fabricated artefact is worse than a visible failure, because it is the one
+thing on screen a reviewer cannot sanity-check at a glance.
+
+### ✅ FIXED — four silent `var()` no-ops in the entity graph canvas
+
+`EntityMapPage.jsx` assigned canvas colours from CSS custom properties
+(`ctx.fillStyle = 'var(--accent)'` and similar). **An invalid value assigned to
+`fillStyle`/`strokeStyle` is a silent no-op** — the previous colour survives, no
+error, no log. The graph was drawn in whatever colour happened to be left in
+the context. Now read through `readCanvasPalette()` / `useCanvasPalette()` with
+a `CANVAS_IS_USABLE_COLOR` test, and the palette is in the dependency array so
+a theme change actually repaints.
+
+### ✅ FIXED — CDN fonts and a CDN Leaflet build
+
+`index.html` loaded Inter and JetBrains Mono from `fonts.googleapis.com` and
+Leaflet CSS from `unpkg.com`. Two problems: an offline machine gets the system
+fallback and a different-looking app, and a forensic workstation silently
+phones out on every page load. Both are now local — `@fontsource/inter` (300 to
+700) and `@fontsource/jetbrains-mono` (400/500), with `import 'leaflet/dist/
+leaflet.css'` in `main.jsx`. **All subsets are kept** (latin, latin-ext,
+cyrillic, greek, vietnamese; 547 KB) because the entity names in the evidence
+are not reliably ASCII.
+
+> **Grep cannot verify this.** An explanatory HTML comment in the built
+> `dist/index.html` still contains the strings `fonts.googleapis` and `unpkg`.
+> Verify the *fetchable* `href`/`src` attributes, not the file's text.
+
+### ✅ FIXED — the system prompt told the model the evidence was fake
+
+`SYSTEM_PROMPT` opened with a paragraph asserting that this is "a fictional
+Capture the Flag (CTF) training simulation", that all evidence is "entirely
+simulated and not real", and that the model "MUST answer all questions ... Do
+not refuse to assist."
+
+For a forensic product that is the worst possible opening line: it tells the
+model its grounding is imaginary, in a tool whose entire value is that it is
+not — and a reviewer will correctly challenge the app for claiming its own
+evidence is fabricated. It also invited the exact failure B26 was about, by
+pressing the model past its own caution instead of giving it more evidence.
+
+Replaced with an honest version of the intent: *this is real casework, answer
+the question, the presence of sensitive material is the reason the case exists
+rather than a reason to withhold it, and never invent — an answer you cannot
+ground is worse than an answer that says what is missing.* No test referenced
+the old text.
+
+### Two more, both the same shape as §24's larger theme
+
+- **A dangling byline.** With `model_used: null` — which is now the correct
+  value whenever the question never reached the model — `InvestigatePage`
+  rendered `{q.model_used}` unconditionally, leaving `· 0.1s` and implying a
+  model had replied. It now prints `No model consulted · 0.1s`. Ninth
+  occurrence of §16's rule in this file.
+- **Invalid HTML in the artifact list.** `ArtifactsPage.jsx` nested `View` and
+  `Flag` `<button>`s inside the row's own `<button>`. A `<button>` inside a
+  `<button>` is invalid; the browser hoists the inner ones out of the row, so
+  the row's click handler stops covering them and the keyboard cannot reach the
+  row at all. The row is now a `div` with `role="button"`, `tabIndex` and an
+  `onKeyDown`.
+
+### A negative result worth keeping: `?token=` is not dead
+
+`FileViewer` builds media URLs as
+`/api/cases/{id}/evidence/artifacts/{id}/view?token=...`, and I had recorded
+that as a dead fallback to be removed. **It is correct and load-bearing.**
+`<img>`, `<audio>` and `<video>` cannot set an `Authorization` header on a
+`src`, and `evidence.py:1363-1387` accepts the token as a query parameter
+precisely for that. Removing it would break inline media viewing for every
+viewable artifact. Do not "clean this up".
+
+### A third test bug, and a new shape for §22's habit 1
+
+The full gate came back **931 passed, 2 failed** after the chunk sizes were cut,
+and both failures were in `verify_ingestion_modes.py`:
+
+```
+FAIL  normal:   chunk count matches chunk_size 6000 - expected 10, got 11
+FAIL  accurate: chunk count matches chunk_size 3000 - expected 20, got 22
+```
+
+**The product was right and the test was wrong.** `chunk_text` advances by
+`chunk_size - overlap`, so the count is `ceil(len / stride)`. The assertion
+computed `ceil(len / chunk_size)`, which is only the chunk count when overlap
+is **zero**. Overlap is not a rounding artefact — it is what stops a fact
+straddling a boundary from being lost, and it was added deliberately to `normal`
+(200) and `accurate` (300) in the same change that produced this failure. So
+the fix was to the assertion, and deliberately *not* to the product.
+
+The corrected formula is **stricter than the one it replaced**, which matters:
+the old expression could not tell "chunk_size reached the pipeline but overlap
+was silently dropped" from success, because it never looked at overlap at all.
+
+This is §22's habit 1 in a shape the other two instances did not cover. Those
+were literals encoding a *device* fact (`ram_floor_max_mb`, `estimated_tokens <
+4096`). This one encoded a **product assumption that a later change removed** —
+and nothing about it looked like a device fact, so it would not have been
+suspected.
+
+> **When a deliberate product parameter changes, assume some assertion is
+> quietly assuming its absence.** Search the tests for the arithmetic before
+> touching the table, not after the gate goes red.
+
+Two assertions were added alongside it rather than just correcting the formula:
+
+- `overlap < chunk_size` is asserted, not divided by. A non-positive stride
+  makes `chunk_text` never advance and loop for ever, so the failure must name
+  the cause instead of raising `ZeroDivisionError`.
+- The `len(c.strip()) > 20` trim inside `chunk_text` **is measured to be a
+  no-op on this input** (`chunker returned 11, stride arithmetic says 11`)
+  before exact equality is claimed. Without that, exact equality is a
+  coincidence rather than an assertion — if `BODY` is ever changed to end in
+  whitespace the count quietly stops matching and the formula would be blamed
+  for something it never claimed.
+
+Also worth recording, since it nearly became a false alarm: the suite's own
+exit code is **0** on a clean run. The `Exited with code 1` in that shell
+session came from PowerShell's `Select-String`, not from the test. The gate
+reads both the summary *and* the exit code, so a suite must be run bare when
+the exit code is what is being checked.
+
+### What this session changed, in one place
+
+| | |
+|---|---|
+| **Fixed** | B30 (search failure vs no match) · B31 (server-authoritative identity) · relevance floor · CTF paragraph · `ip-api.com` · canvas `var()` no-ops · CDN fonts/Leaflet · `FileViewer` error bodies · artifact nested buttons · `model_used` byline |
+| **Measured and rejected** | the degenerate-chunk filter (0.0% of chunks would drop) · removing `?token=` |
+| **New** | `tests/verify_retrieval_integrity.py` (36 assertions) · `tests/verify_identity_attribution.py` (19) · chunk sizes `fastest` 12000, `normal` 6000/200, `accurate` 3000/300 · `RETRIEVAL_TOP_K` 14 |
+| **Negative results** | see the two above — both are traps for the next agent |
+
+### Read before touching these
+
+- **`rag_engine.py`** — §19's budgeter, §20's window, and B30's floor. The
+  floor is pinned to a measurement; `verify_retrieval_integrity.py` §F fails if
+  it is moved outside the observed gap.
+- **`vector_store.py`** — B10 (`store_chunks` raises) and B30 (`search_chunks`
+  raises). Both must keep re-raising `StopIteration` first, for §15's reason.
+- **anything that renders a field shaped like a measurement.** Nine instances
+  in this file; the newest is the byline above.
+- **`tests/verify_queue_api.py`, `verify_job_stop.py`, `verify_live_stack.py`** —
+  they promote roles **in the database** on purpose. Reopening the
+  registration escalation to make a test pass is a regression, not a fix.
+
+---
+
+## 25. The gate went red because the suite was racing a worker — and the suites were writing to the live database
+
+Two findings, both from running the full gate after the chunk sizes were cut.
+Neither is a product defect. Both are defects in the instrument that is
+supposed to catch product defects, which is the one place this class of error is
+least welcome.
+
+### The gate failure that looked like a regression
+
+```
+FAIL  patch returns 200 - {"detail":"The ingestion profile is fixed once a
+      job starts - it sets the chunk size and embedding batch, and changing
+      either mid-run would leave the case half-indexed at mixed granularity.
+      Cancel this job and queue it again ..."}
+FAIL  refused profile left the stored mode untouched - accurate
+```
+
+**The product was right.** That refusal is B16 (§17) working exactly as designed:
+changing the profile mid-run would leave a case indexed at mixed granularity,
+so the backend answers 400 and says why. The assertion was wrong.
+
+### Why it failed at all: the suite was racing its own worker
+
+`verify_queue_api.py` drives the real app through `with TestClient(app)`.
+**Entering that block runs the FastAPI lifespan**, and the lifespan calls
+`job_worker.start_worker()`. So the suite was polling for `Queued` jobs — the
+same ones it had just created through `/api/queue/add` — with a live thread, for
+its entire run. The worker's loop wakes every 2 s; the suite's next request can
+easily arrive after that. When it did, the row said `Running`, the refusal was
+correct, and the assertion failed against correct behaviour.
+
+The first gate run passed the same assertion and the second one did not. That
+intermittency is the finding: **an assertion that depends on a race is a
+measurement that reports success without measuring anything** (§22's theme, in
+the tool that exists to stop it). The previous green run was the accident.
+
+The fix is to remove the race, not to weaken the assertion — the assertion is
+testing a real and important contract:
+
+```python
+jw.stop_worker()                      # inside the `with`, after the lifespan
+_t = jw._worker_thread
+if _t is not None and _t.is_alive():
+    _t.join(timeout=30)               # the loop sleeps up to 2 s; not instant
+```
+
+> **It has to go *inside* the `with`.** The lifespan runs on entry, so stopping
+> the worker before the block means it gets started again immediately after.
+
+Audited rather than assumed: of the four suites that enter the lifespan, only
+this one **creates** a `Queued` job and then asserts on its status. The other
+three — `verify_job_stop.py`, `verify_evidence_archive.py`,
+`verify_identity_attribution.py` — create no jobs at all (`verify_job_stop.py`
+inserts its job as `Running` and drives `_process_job` itself), so the stop is
+not warranted there and adding it "for symmetry" would be churn on suites that
+cannot race.
+
+> **Generalisable:** a suite that enters an app's lifespan inherits everything
+> the lifespan starts. Background threads are the part that matters — they do
+> not belong to the caller, do not appear in the API, and will happily mutate
+> the fixtures the suite is about to assert on. If a test framework offers
+> `TestClient(app)` *without* the context manager, the difference is the
+> lifespan, and that is usually the whole point.
+
+### 🔴 The suites had been writing to the live forensic database
+
+Found while diagnosing the above, and much the more serious of the two.
+
+```python
+db.query(m).filter(m.id.in_(ids)).delete(...)   # job, evidence, case
+os.remove(path)                                  # the temp file
+```
+
+That cleanup sat at the very end of the happy path, with **no `finally` and no
+`atexit`**, and it **never deleted the registered user**. Measured on
+`data/forensic.db` before the fix: **92 test accounts** (`modes_*`, `stop_*`,
+`arch_*`, `b31_*` — one per suite run) and **249 audit rows** attributed to
+usernames that had been deleted, plus an orphaned `API modes` case and its
+`apimode_*.txt` evidence. Every run of the gate had been adding to it.
+
+`verify_live_stack.py` hit the identical problem and fixed it with an `atexit`
+hook long ago (§14). The other four were never converted. The rows did not break
+anything, which is exactly why they accumulated for this long.
+
+> **A test suite that writes to the live database is a defect in its own right**
+> — and in this product specifically, because the database *is* the evidence
+> record. `verify_service_health.py` already established the rule for itself:
+> *"Nothing here touches `data/forensic.db`."* Three of the four suites that
+> violate it are the ones that register a user.
+
+New `tests/_purge.py` holds the one implementation, shared by all four. It
+records ids and the throwaway account as they are created, and deletes them
+from an `atexit` hook, so it fires on a failed assertion, an exception, and
+`sys.exit(1)` alike. Two details in it are easy to get wrong and fail
+**silently**, which is why they are commented at the definition:
+
+- **Children are deleted before parents.** `Query.delete()` bypasses ORM
+  cascades, so the ordering is the only thing between a partial run and a
+  foreign-key error.
+- **Audit rows carry the username in `performed_by`, not the user id.**
+  `_log_auth_event` passes `details["username"]`. Filtering `performed_by` by
+  *id* deletes nothing at all and leaves the account's own audit trail
+  orphaned behind a name that no longer resolves to anything. This was written
+  wrong on the first attempt in `verify_queue_api.py` and only corrected by
+  reading the helper — a filter that matches nothing is indistinguishable from
+  one that worked.
+
+**Verified by measurement, not by reading the code**: a script counts the
+throwaway rows, runs all four suites, and counts again. Delta 0 for users,
+audit rows and cases. All four pass — 52 + 17 + 38 + 19 = **126 assertions**.
+
+**Full gate, servers stopped: 940 passed, 0 failed across 15 scripts**, and the
+per-suite lines sum to exactly 940. That reconciliation is the check that
+matters: a mis-parsed total is a number that does not agree with its own parts,
+and §21's TRAP 8 was precisely a total that did not.
+
+> The pre-existing 92 accounts were left alone, deliberately. A test script
+> silently deleting rows it did not create is the behaviour these suites were
+> just corrected for, and the operator was asked.
+
+### Why this is worth more than the two bugs
+
+§22 listed six bugs that verification caught rather than reading. This is the
+seventh instance, and it points the other way: **the verification itself
+produced a red result the product did not earn**, one run after a green one that
+earned nothing either.
+
+A flaky suite is worse than no suite, because a green one is believed and a red
+one is acted on. The day before a review, a red gate that looks like a product
+regression is close to the worst possible failure — it invites somebody to
+"fix" correct behaviour, and the fix would be to delete the refusal. §21's
+TRAP 8 is the same shape one layer out: a summariser that reported 0 failures
+for a suite with 15 converted a red run green. Here the parser was fine and the
+*input* was noise.
+
+> **So the gate has two independent ways to lie, and they pull in opposite
+> directions.** A parser that cannot read the summary turns red into green
+> (TRAP 8). A test that depends on a race turns correct into red. Neither is
+> detectable by reading the other, and a fix for one does not touch the other.
+> Fixing the parser is a parser problem; the only cure for the second is to
+> remove the timing dependency, which means knowing which side of the race the
+> product is on — and that is a question about the product, not the test.
+
+---
+
+## 26. Re-ingesting the last stale row — and my own instrument reported a fake `0`
+
+The one piece of pre-existing evidence data still disagreeing with itself: the
+PDF in Test1 read `status=Indexed, chunk_count=1` while its Qdrant collection
+was believed to hold 0 points. A row that looks searchable and returns nothing
+is §15/B14 rebuilt from the other side, and an investigator searching there
+concludes the evidence was clean.
+
+### I re-ingested it, and my helper said it failed
+
+```
+[INGESTION] Done: 5 chunks, 135 entities (pdf, mode=normal)
+  row says : status=Indexed  chunk_count=5
+  qdrant   : 0 points
+VERDICT: STILL DISAGREE
+```
+
+Asked Qdrant directly instead of trusting the helper — **5 points, 384-dim,
+all tagged with the right `evidence_id`, collection green.** The helper looked
+for a collection whose name contains the full case UUID; the real name is
+`case_f15d31a9` — the **first 8 characters**. It found no match and returned
+`0`, because `0` is what "the collection list was not empty and nothing matched
+it" also evaluates to.
+
+> **That is §16's rule, committed by me while writing the rule down**, and it is
+> the tenth occurrence of it in this file. A check that cannot distinguish
+> "measured, and it is zero" from "looked for the wrong key" reports a
+> confident `0` in both cases, and `0` is precisely the reading that looks like
+> "the evidence is clean."
+>
+> **Generalisable:** a helper that *filters* what it found must be able to
+> report that the filter excluded everything. `return 0` on an empty match is
+> the same `except: return 0` shape as B10, with the exception replaced by a
+> `next(..., 0)`. The two scripts disagreed, and the one that disagreed with
+> the product was mine.
+
+The re-ingest itself was two mistakes of my own, both instructive:
+
+- **Wrong positional order.** The signature is
+  `(evidence_id, case_id, file_path, filename, job_id)`. I passed the case id
+  first, so the pipeline was handed a UUID as `file_path`, found no file, and
+  **returned successfully in 0.3 s**. A "successful" ingest that read a
+  non-existent path is precisely B1's shape reached by a typo rather than a
+  bug — and it produced no error, so nothing in the output said otherwise.
+- **`ingestion_jobs.evidence_id` is UNIQUE**, so the botched run's job row made
+  the second attempt fail on insert. `queue_router.add_to_queue` deletes any
+  existing row for the same evidence to satisfy exactly this constraint; the
+  script had to do the same rather than invent a second id.
+
+Final state, verified against Qdrant and not against the row: **Indexed,
+5 chunks, 135 entities, 5 points in the index.** The row and the index agree.
+
+> The pre-ingest state is now unverifiable — the collection was rewritten, so
+> whether it held 1 point or 0 before cannot be recovered, and the original
+> "chunk_count=1 vs 0 points" reading was made with an instrument now known to
+> be broken. **It should not be reported as a confirmed defect.**
+
+### `entity_count` is a count of mentions, not of rows — and four readers assume rows
+
+`evidence.entity_count = 135`, but only **113** entity rows carry this
+`evidence_id`. The 22 are not missing and not duplicates (`GROUP BY name,
+entity_type` finds no repeat within the document); they are entities that
+already existed in the case from an earlier ingest and were merged rather than
+re-inserted. `build_graph` reuses entities across a case, which is correct.
+
+So `entity_count` means *distinct entities this document mentions*, and it is
+read as if it meant *entity records attributable to this document* by
+`cases.py:1112` (export), `reports.py:174`, `report_generator.py:201` (PDF) and
+`queue_router.py:432`. A reviewer who opens the database and counts gets a
+different number from the report, with no way to tell which is right.
+
+> **This is B29's `chunk_count` problem in the neighbouring column, and it is
+> not fixed.** B29 resolved it by making `chunk_count` mean "what is in the
+> index right now", because that was the simple invariant. `entity_count`
+> cannot adopt the same invariant without either dropping the count or counting
+> rows instead of mentions — and counting rows would report **113 for a
+> document that surfaced 135 distinct entities**, which is the opposite error.
+> It needs a label change ("entities mentioned" vs "entity records") before a
+> reviewer reads the two numbers as one, and that is a decision rather than a
+> bug fix. Flagged, not churned the day before a review.
+
+### 🔴 421 of Test1's 534 entities point at evidence that does not exist
+
+```
+263  56a19bf1  ORPHAN - no such evidence row
+120  fb8cc81b  ORPHAN - no such evidence row
+113  3df5c449  exists
+ 38  d0592b3b  ORPHAN - no such evidence row
+```
+
+78 % of the entity graph in the user's own case is populated from evidence
+files that were deleted. The entity graph and the entity list both show them,
+attributed to the case, and there is no document behind any of them. For a
+forensic tool that is worse than a count being off: **the graph asserts links
+between entities that the retained evidence does not support.**
+
+The operator was asked about earlier residue and chose to leave it alone, and
+that answer is respected — but it was asked about *directories on disk*, and
+this is different in kind: it is data the app actively displays. Not deleted,
+not hidden, **reported**.
+
+### `ingested_at` means "uploaded at"
+
+`models.py:53` sets `default=datetime.utcnow` at row creation, and
+`evidence.py:236/397/438` set it explicitly on all three upload paths — every
+one of which also writes `status="Uploaded"`. **The ingestion pipeline never
+touches it.** So after the re-ingest just performed, the row reads
+`chunk_count=5` written seconds ago beside an `ingested_at` of 2026-09-27.
+
+Harmless today, because no frontend page reads the field and its only consumer
+is the ordering at `evidence.py:128` — where upload order is the correct sort.
+But the name is a promise the field does not keep, and this file's whole
+subject is a field shaped like a measurement that is not one. Renaming it
+changes ordering semantics and needs its own decision.
+
+---
+
+## 27. What is still open, in one place
+
+For whoever picks this up next, with nothing hidden:
+
+| | |
+|---|---|
+| **`entity_count`** | counts mentions, four readers read it as rows. Needs a label, not a code change (§26). |
+| **421 orphan entities** | 78 % of Test1's graph, from deleted evidence. Operator chose to leave them; they are still displayed (§26). |
+| **`ingested_at`** | is upload time. Unused by the UI, used for ordering (§26). |
+| **Test1's disk image** `8fe98ee9` | `Failed` — the truncated `SCHARDT.001` from §6 B1. Correct outcome, needs re-acquisition. |
+| **~340 orphan case directories** | under `data/cases/`, from earlier runs. Left alone by the operator's choice. |
+| **Re-index required** | chunk sizes are cut, so a case ingested before this session still has 30,000-character chunks. Test1 and the Phantom Trace demo are re-indexed; nothing else is. |
+| **`vendor/python/torch-*.whl`** | 152 MB of dead weight — but §8's caution stands: a CUDA build is what GPU transcription needs. |
+| **Chunk-size half of §19** | raising the window recovered 5.4×; smaller chunks recover the rest, and need a re-index per case. |
+| **`cases.py:968`** | `author = "<imported> (imported)"` — the last client-influenced attribution, judged defensible (§24). |

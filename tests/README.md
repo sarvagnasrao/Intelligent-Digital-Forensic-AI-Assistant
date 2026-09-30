@@ -19,6 +19,10 @@ PYTHONPATH=. venv/bin/python tests/verify_cpu_sampler.py
 PYTHONPATH=. venv/bin/python tests/verify_gpu_telemetry.py
 PYTHONPATH=. venv/bin/python tests/verify_eta.py
 PYTHONPATH=. venv/bin/python tests/verify_service_health.py
+PYTHONPATH=. venv/bin/python tests/verify_prompt_budget.py
+PYTHONPATH=. venv/bin/python tests/verify_evidence_archive.py
+PYTHONPATH=. venv/bin/python tests/verify_retrieval_integrity.py
+PYTHONPATH=. venv/bin/python tests/verify_identity_attribution.py
 PYTHONPATH=. venv/bin/python tests/verify_live_stack.py   # needs the stack running
 
 # Windows
@@ -32,13 +36,22 @@ $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_cpu_sampler.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_gpu_telemetry.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_eta.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_service_health.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_prompt_budget.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_evidence_archive.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_retrieval_integrity.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_identity_attribution.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_live_stack.py
 ```
 
-The first eight are self-contained — **585 assertions**. `verify_live_stack.py`
-is the ninth and needs `ollama serve`, uvicorn on `:8000` and the Vite dev
-server on `:3000` already running; it waits 90 s for the backend and skips
-cleanly if it never comes up.
+Fourteen are self-contained — **940 assertions** (9 + 15 + 17 + 17 + 19 + 36 +
+38 + 45 + 52 + 59 + 85 + 153 + 171 + 209). `verify_live_stack.py` is the
+exception and needs `ollama serve`, uvicorn on `:8000` and the Vite dev server
+on `:3000` already running; it waits 90 s for the backend and skips cleanly if
+it never comes up.
+
+Read the totals, not the exit code. A gate that reports `0 passed` for a script
+which did not run converts a red suite green, which is the one outcome these
+scripts exist to prevent.
 
 > **Stop the backend before running the self-contained ones.** A live server on
 > the same `data/forensic.db` runs its own worker thread, and that worker
@@ -48,10 +61,19 @@ cleanly if it never comes up.
 > instance of Qdrant client`. These scripts insert fixture jobs as `Running`
 > for exactly that reason (the worker only ever selects `Queued`), but they
 > also share the database with anything you have running.
+>
+> **Four of them drive the app through `with TestClient(app)`, which runs the
+> FastAPI lifespan — so they start a worker thread of their own** that selects
+> `Queued` jobs. `verify_queue_api.py` stopped one explicitly after this bit
+> it; see the Notes.
 
 | Script | What it proves | Cost |
 |---|---|---|
-| `verify_ingestion_modes.py` | The three ingestion profiles reach the pipeline: same file ingested under `fastest` / `normal` / `accurate` yields 2 / 3 / 8 chunks, matching the configured `chunk_size` exactly. Progress is monotonic, ends at 100, and the profile is persisted on the job. Also asserts **a failed index is never reported as a success**. | ~15 s |
+| `verify_ingestion_modes.py` | The three ingestion profiles reach the pipeline: the same file ingested under `fastest` / `normal` / `accurate` yields a chunk count matching `ceil(len / (chunk_size − overlap))` — the *stride*, not the chunk size, which is what the chunker actually advances by. Progress is monotonic, ends at 100, and the profile is persisted on the job. Also asserts **a failed index is never reported as a success**. | ~15 s |
+| `verify_prompt_budget.py` | The prompt fits the window Ollama is actually *serving*, not the one it was trained for. These are different numbers (131072 vs 4096 on this box) and conflating them is the whole bug. Asserts `num_ctx` is on the wire and equals the clamped requested value, that the budget and the request derive from the same figure, the two truncation guards behave differently, and that a model refusal is caught as a missing answer rather than filed as a response. Touches the network: it reads `/api/tags`, `/api/show` and `/api/ps` for real, because the claim under test is what an *operator* can see. | ~30 s |
+| `verify_evidence_archive.py` | Archiving must **mean** something. The write was always correct; the read was the lie — archived rows stayed in the default listing, so the operation relabelled rather than hid. Asserts archived items disappear by default and reappear only behind the disclosure, that restore sets `Uploaded` and never `Indexed` (restoring to `Indexed` would recreate the "searchable but empty" defect), that the Qdrant delete is fatal to the archive rather than logged and non-fatal, that `chunk_count` is zeroed because four readers trust it, and that the three refusals (mid-ingest, a Viewer, a failed cleanup) each return their own code. | ~15 s |
+| `verify_retrieval_integrity.py` | A **failed** search is not an empty one. `search_chunks` returned `[]` on error, which the RAG engine read as "nothing in this case matched" — the exculpatory direction, and it told an investigator in the app's own voice that the evidence against a suspect was not there. Asserts a search failure raises, that the answer says nothing has been ruled out, and that when the search *succeeds* but the relevance floor drops everything the model is never consulted at all. Also pins the floor between the two measured clusters in `query_logs.chunks_used`, so moving it outside the gap fails. | ~15 s |
+| `verify_identity_attribution.py` | Four fields looked editable and were not. The investigator could type a name into "Investigator Name", "Author", "Officer name" and "Prepared By", and the server stored whatever they typed — so a note, a report or a case could be attributed to any other user, including an Admin, and the audit log would agree. Forges `"admin"` in a request body and requires the database to say otherwise, then sweeps the routers for any remaining client-supplied identity field. | ~10 s |
 | `verify_ws_progress.py` | Ingestion progress reaches subscribers on the **server's** event loop — the exact defect that made live progress appear broken. Also asserts a strict 5-argument callback (the worker's shape) is honoured. | ~10 s |
 | `verify_queue_api.py` | The queue API surface the frontend depends on: the three profiles, a device-derived budget with slider bounds, mode-aware estimates, limit validation, live settings on a running job. Also asserts the **settings endpoint never reports success for something it did not do** — a profile change on a `Running` job is refused *and leaves the stored column untouched*, CPU/RAM stay editable while running, an empty body is refused, and a `Stopped` job is still listed in `/queue/list` and `/queue/history` and can be re-queued with its profile carried forward. | ~5 s |
 | `verify_job_stop.py` | The Stop button actually stops. Drives the real `_process_job` on a worker thread, fires `stop_job()` from another thread exactly as the endpoint does, and requires that the job halts, is recorded `Stopped` rather than `Failed`, reverts the evidence to `Uploaded`, and **did not reach 100 %** — a stop that is acknowledged but ignored is otherwise indistinguishable from a job that simply finished. Also pins the HTTP contract, including that `DELETE /queue/{id}/cancel` still refuses a `Running` job. | ~20 s |
@@ -188,3 +210,24 @@ while the behaviour is wrong:
   wrapped as `RuntimeError("Mount failed: ... stopped by user ...")` still produced
   the right outcome, because the handler above classified it by substring match. The
   test passed for the wrong reason until it checked `isinstance(..., StopIteration)`.
+- **Entering `with TestClient(app)` runs the FastAPI lifespan, which starts the
+  ingestion worker.** `verify_queue_api.py` asserted a 200 on a `PATCH` against a
+  job it had just queued, and failed on some runs and not others: the worker picks
+  up `Queued` jobs on a 2 s poll, so if it started the job first the status was
+  `Running` and refusing a profile change was the *correct* behaviour. The product
+  was right and the assertion lost a race. It now calls `job_worker.stop_worker()`
+  and joins the thread — **inside** the `with`, since the lifespan runs on entry.
+  An assertion that depends on timing is a measurement that reports success
+  without measuring anything.
+- `tests/_purge.py` deletes the rows a run created, from an `atexit` hook, so it
+  fires on a failed assertion as well as a clean one. The four TestClient suites
+  each used to delete their case and evidence at the end of the happy path with
+  no `finally` and **never deleted the registered user** — measured at 92 accounts
+  and 249 orphaned audit rows in `data/forensic.db`. Note that audit rows carry
+  the **username** in `performed_by`, not the user id, so the filter has to match
+  on the name or it deletes nothing while appearing to work.
+- When a suite writes a **summary**, the gate parses it, so it has to be
+  unambiguous. `verify_prompt_budget.py` prints `85 passed, 0 failed` while most
+  others print `PASSED: 85    FAILED: 0`; a parser matching only one form reads
+  `0` for the other, which turns a red suite green. A suite whose counts cannot be
+  read **fails the gate** rather than being skipped.

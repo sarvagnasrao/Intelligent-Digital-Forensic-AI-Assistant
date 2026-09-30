@@ -49,6 +49,22 @@ class Settings(BaseSettings):
     # n_ctx is shared between prompt and completion.
     ollama_num_predict: int = 1024
 
+    # Fixed sampling seed, so the same evidence and the same question give the
+    # same answer. This is a forensic requirement rather than a nicety: an answer
+    # may be quoted in a report, and an investigator who re-runs the same query
+    # to check it must not get a different one.
+    #
+    # It is needed because temperature 0.1 still samples. §20 of AGENTS.md
+    # records the measurement that established this - a proof script with a
+    # "did the model see the fact?" column answered no, then YES, for the same
+    # clamped request across two runs. That column was sampling noise, and it is
+    # exactly why a reproducibility claim could not be made from it.
+    #
+    # Set OLLAMA_SEED=-1 to opt back out of determinism (llama.cpp reads a
+    # negative seed as "choose one at random"). There is no reason to, other
+    # than wanting to sample the same question several times.
+    ollama_seed: int = 42
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -405,6 +405,21 @@ def generate_response_detailed(prompt: str,
             # it is what makes ollama_num_ctx a control rather than a number
             # that only ever appears in the budget arithmetic.
             "num_ctx": requested_context_tokens(),
+            # Fixed so the same evidence and the same question give the same
+            # answer. temperature 0.1 still samples, and an investigator
+            # re-running a query to check an answer they are about to quote in a
+            # report must not get a different one. See dependencies.py.
+            "seed": settings.ollama_seed,
+            # top_p, top_k and repeat_penalty are deliberately NOT set. Ollama
+            # already defaults them to 0.9 / 40 / 1.1, so sending them would
+            # change nothing while implying they had been considered here.
+            # They were considered: temperature is already near-greedy, which
+            # is right for a factual claim and is the setting that grounds
+            # answers in the retrieved text rather than in the model's priors.
+            # The one real risk at low temperature is repetition on repetitive
+            # evidence -- a prompt full of log lines is full of repeated
+            # timestamps and IPs -- and repeat_penalty at its 1.1 default is
+            # what already guards it.
         }
     }
 

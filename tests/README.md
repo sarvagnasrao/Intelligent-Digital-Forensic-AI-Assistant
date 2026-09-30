@@ -43,8 +43,8 @@ $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_identity_attribution.p
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_live_stack.py
 ```
 
-Fourteen are self-contained — **940 assertions** (9 + 15 + 17 + 17 + 19 + 36 +
-38 + 45 + 52 + 59 + 85 + 153 + 171 + 209). `verify_live_stack.py` is the
+Fourteen are self-contained — **941 assertions** (9 + 15 + 17 + 17 + 19 + 36 +
+38 + 45 + 52 + 59 + 86 + 153 + 171 + 209). `verify_live_stack.py` is the
 exception and needs `ollama serve`, uvicorn on `:8000` and the Vite dev server
 on `:3000` already running; it waits 90 s for the backend and skips cleanly if
 it never comes up.
@@ -70,7 +70,7 @@ scripts exist to prevent.
 | Script | What it proves | Cost |
 |---|---|---|
 | `verify_ingestion_modes.py` | The three ingestion profiles reach the pipeline: the same file ingested under `fastest` / `normal` / `accurate` yields a chunk count matching `ceil(len / (chunk_size − overlap))` — the *stride*, not the chunk size, which is what the chunker actually advances by. Progress is monotonic, ends at 100, and the profile is persisted on the job. Also asserts **a failed index is never reported as a success**. | ~15 s |
-| `verify_prompt_budget.py` | The prompt fits the window Ollama is actually *serving*, not the one it was trained for. These are different numbers (131072 vs 4096 on this box) and conflating them is the whole bug. Asserts `num_ctx` is on the wire and equals the clamped requested value, that the budget and the request derive from the same figure, the two truncation guards behave differently, and that a model refusal is caught as a missing answer rather than filed as a response. Touches the network: it reads `/api/tags`, `/api/show` and `/api/ps` for real, because the claim under test is what an *operator* can see. | ~30 s |
+| `verify_prompt_budget.py` | The prompt fits the window Ollama is actually *serving*, not the one it was trained for. These are different numbers (131072 vs 4096 on this box) and conflating them is the whole bug. Asserts `num_ctx` is on the wire and equals the clamped requested value, that the budget and the request derive from the same figure, the two truncation guards behave differently, that a fixed `seed` reaches the wire so the same question gets the same answer twice, and that a model refusal is caught as a missing answer rather than filed as a response. Touches the network: it reads `/api/tags`, `/api/show` and `/api/ps` for real, because the claim under test is what an *operator* can see. | ~30 s |
 | `verify_evidence_archive.py` | Archiving must **mean** something. The write was always correct; the read was the lie — archived rows stayed in the default listing, so the operation relabelled rather than hid. Asserts archived items disappear by default and reappear only behind the disclosure, that restore sets `Uploaded` and never `Indexed` (restoring to `Indexed` would recreate the "searchable but empty" defect), that the Qdrant delete is fatal to the archive rather than logged and non-fatal, that `chunk_count` is zeroed because four readers trust it, and that the three refusals (mid-ingest, a Viewer, a failed cleanup) each return their own code. | ~15 s |
 | `verify_retrieval_integrity.py` | A **failed** search is not an empty one. `search_chunks` returned `[]` on error, which the RAG engine read as "nothing in this case matched" — the exculpatory direction, and it told an investigator in the app's own voice that the evidence against a suspect was not there. Asserts a search failure raises, that the answer says nothing has been ruled out, and that when the search *succeeds* but the relevance floor drops everything the model is never consulted at all. Also pins the floor between the two measured clusters in `query_logs.chunks_used`, so moving it outside the gap fails. | ~15 s |
 | `verify_identity_attribution.py` | Four fields looked editable and were not. The investigator could type a name into "Investigator Name", "Author", "Officer name" and "Prepared By", and the server stored whatever they typed — so a note, a report or a case could be attributed to any other user, including an Admin, and the audit log would agree. Forges `"admin"` in a request body and requires the database to say otherwise, then sweeps the routers for any remaining client-supplied identity field. | ~10 s |
@@ -231,3 +231,17 @@ while the behaviour is wrong:
   others print `PASSED: 85    FAILED: 0`; a parser matching only one form reads
   `0` for the other, which turns a red suite green. A suite whose counts cannot be
   read **fails the gate** rather than being skipped.
+- **When you verify a guard by reverting the fix, check that the revert
+  actually happened.** A scripted revert that matches nothing leaves the file
+  unchanged, so the suite runs twice against identical code and reports
+  `passes with the fix, passes without it` — which is exactly what a guard that
+  cannot fail looks like. This bit `verify_prompt_budget.py` J8 for real: the
+  revert string ended in `\n` against a CRLF file, `assert PATTERN in original`
+  passed anyway (it only proves the fix existed), and the first verdict was
+  "GUARD IS DECORATIVE". It was not. Assert on the **absence** of the change
+  after reverting, and check that the failure names the reverted behaviour.
+  AGENTS.md §28, TRAP 12.
+- A guard that reads a **configuration value** must be checked against the wire,
+  not against `settings`. The seed assertion is `payload.options.seed ==
+  settings.ollama_seed`, because a value sitting in config proves nothing about
+  what Ollama receives — that was B27, a knob that only fed arithmetic.

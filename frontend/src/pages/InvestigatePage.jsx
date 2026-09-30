@@ -1480,9 +1480,19 @@ export default function InvestigatePage() {
                           padding:
                             '1px 6px',
                           borderRadius: 4,
-                        }}>
+                        }}
+                        title={
+                          'Sentences in this answer that carry a source '
+                          + 'marker. A low proportion means the model '
+                          + 'asserted more than the evidence behind it '
+                          + 'supports.'
+                        }>
                           {q.cited_sentence_count}
-                          {' '}citations
+                          {' of '}
+                          {q.cited_sentence_count
+                           + (q.uncited_sentence_count
+                             || 0)}
+                          {' '}sentences cited
                         </span>
                       )}
                       <button

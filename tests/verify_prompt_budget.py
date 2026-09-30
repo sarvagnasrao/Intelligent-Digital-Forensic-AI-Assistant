@@ -525,6 +525,22 @@ check("J6 the wire value is the clamped one",
       _wire.get("num_ctx") == _requested,
       f"wire {_wire.get('num_ctx')} vs requested {_requested}")
 
+# J8 -- reproducibility. Asserted here because this is the only place the
+# transport contract is observable at all: a seed sitting in settings, or even
+# in the payload builder, is not the same fact as a seed Ollama receives.
+#
+# The claim being guarded is the one an investigator acts on -- re-run the same
+# query and get the same answer -- and §20 is what made it urgent. That section
+# records a proof script whose "did the model see the fact?" column answered no,
+# then YES, for the *same* clamped request across two runs. temperature 0.1 still
+# samples, so without a fixed seed two runs are two different answers, and an
+# answer quoted in a report cannot be re-checked.
+check("J8 a fixed seed is on the wire, so answers are reproducible",
+      _wire.get("seed") == get_settings().ollama_seed,
+      f"wire seed {_wire.get('seed')!r} vs configured "
+      f"{get_settings().ollama_seed!r} -- with no seed the same evidence and the "
+      f"same question give different answers on different runs")
+
 # And the second guard: a window smaller than we think we have must still be
 # caught, which is the exact failure the old saturation check could not see.
 def _saturating_post(prompt_eval_count, estimated_tokens):

@@ -3005,3 +3005,105 @@ For whoever picks this up next, with nothing hidden:
 | **`vendor/python/torch-*.whl`** | 152 MB of dead weight — but §8's caution stands: a CUDA build is what GPU transcription needs. |
 | **Chunk-size half of §19** | raising the window recovered 5.4×; smaller chunks recover the rest, and need a re-index per case. |
 | **`cases.py:968`** | `author = "<imported> (imported)"` — the last client-influenced attribution, judged defensible (§24). |
+
+---
+
+## 28. 🔴 TRAP 12 — a no-op revert is indistinguishable from a decorative guard
+
+§22's habit 2 is the rule this file leans on hardest:
+
+> **Make every new guard able to fail when the fix is reverted.**
+
+The way you check that is to revert the fix and re-run. That check is itself a
+measurement, and it can lie in exactly the way every other measurement here has
+been caught lying.
+
+### What happened
+
+Added a fixed `seed` to the Ollama request so answers are reproducible, and
+wrote `J8` to guard it. Then ran the revert check. The result:
+
+```
+=== 1. with the fix ===      86 passed, 0 failed
+=== 2. seed removed ===      86 passed, 0 failed      <- "the guard is decorative"
+```
+
+Which would have been a serious result: it would have said the seed reaches
+nothing, which is **B27's exact shape** — a knob that only feeds the arithmetic.
+And the correct conclusion was the opposite. The revert had never happened.
+
+```python
+target = '            "seed": settings.ollama_seed,\n'
+if target in src: ...        # -> False. It was never True.
+```
+
+The file is **CRLF**. The target string ended in a bare `\n`, so the `str.replace`
+matched nothing, the file was rewritten unchanged, and the suite was run twice
+against **identical** code. The script's own `assert PATTERN in original`
+checked only that the seed *existed*, which was true in both states, so it
+raised nothing.
+
+With the revert made newline-agnostic and its application **verified**:
+
+```
+=== 1. with the fix ===      86 passed, 0 failed
+=== 2. seed removed ===      85 passed, 1 failed
+      FAIL  J8 a fixed seed is on the wire ... wire seed None vs configured 42
+VERDICT: guard is real
+```
+
+### 🔴 The trap, stated generally
+
+**A revert that silently fails to apply produces `passes with the fix, passes
+without it` — byte-identical to the signature of a guard that cannot fail.**
+There is no way to tell the two apart from the suite's output, and the natural
+reading of that result is the alarming one.
+
+So "verified discriminating" is not a single measurement. It is two, and the
+first one is about the *harness* rather than the suite:
+
+1. **the revert applied** — assert on the *absence* of the change afterwards,
+   not the presence of it before. `assert PATTERN in original` proves the fix
+   existed; it says nothing about whether you removed it.
+2. **the suite went red on that assertion and not another** — the failure line
+   should name the reverted behaviour.
+
+A harness that cannot prove (1) has not measured (2), and its verdict is a
+confident `0` — the eleventh occurrence of §16's rule in this file, and the
+second one committed by me (§26) *while writing the rule down*.
+
+> **Do not trust a "verified discriminating" claim that was not checked twice.**
+> §21 and §24 verified theirs by reverting and reading the failure count. That
+> was sufficient there because those reverts were done by editing files in the
+> editor, where a failed match is visible. A *scripted* revert hides it, because
+> the script's job looks like it succeeded.
+
+### Why it belongs here rather than in a footnote
+
+This is the check that guards every other check in this repository. If the
+revert harness can silently no-op, then "verified discriminating" is a claim
+about a run nobody can reproduce, and the whole edifice rests on a measurement
+nobody looked at closely — which is §22's exact theme, one meta-level up.
+
+### What the seed is for, and why the other sampling parameters are absent
+
+`temperature: 0.1` **still samples**. So without a fixed seed, two runs of the
+same question against the same evidence return two different answers, and §20
+is the proof: its "did the model see the fact?" column answered `no`, then
+`YES`, for the *same* clamped request. That column was noise — and it is
+precisely why reproducibility could not be claimed from it.
+
+This matters for **this product specifically**: an investigator may paste an
+answer into a report, and a report that cannot be re-derived is not evidence.
+`OLLAMA_SEED=-1` opts back out (llama.cpp reads a negative seed as random); there
+is no reason to except wanting to sample the same question repeatedly.
+
+`top_p`, `top_k` and `repeat_penalty` are deliberately **not** sent. Ollama
+already defaults them to 0.9 / 40 / 1.1, so sending them would change nothing
+while implying they had been chosen here. They *were* considered: temperature is
+already near-greedy, which is right for a factual claim because it keeps the
+answer in the retrieved text rather than the model's priors; and the one real
+risk at low temperature is **repetition on repetitive evidence** — a prompt full
+of log lines is full of repeated timestamps and IPs — which `repeat_penalty` at
+its default is already guarding. That reasoning is recorded in the code so the
+next reader knows the absence was a decision rather than an oversight.

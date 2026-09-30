@@ -356,7 +356,12 @@ def build_prompt(query: str,
     headers = [
         (f"[Excerpt {i + 1}]\n"
          f"Source: {chunk.get('source', '')} | "
-         f"Confidence: {chunk.get('score', '')}\n"
+         # Labelled "Relevance", not "Confidence". The value is a raw cosine
+         # similarity from the embedder, which is a RANKING, not a probability --
+         # it is not calibrated across embedding models, and 0.42 does not mean
+         # "42% likely". Calling it confidence invited the model to reason
+         # probabilistically about a number carrying no such meaning.
+         f"Relevance: {chunk.get('score', '')}\n"
          f"Content: ")
         for i, chunk in enumerate(chunks)
     ]

@@ -329,6 +329,63 @@ for ext, blob, label in families:
     check(f"{ext:8} is routed to an extractor, not 'unsupported'",
           ty != "unsupported", f"got {ty!r}")
 
+# ---- routing, asserted on the CONTRACT rather than on the final label ----
+#
+# The loop above asserts `ty != 'unsupported'`, which does test ROUTING -- but it
+# observes it through the final extraction_type, and that conflates three
+# situations which need three different answers:
+#
+#   1. the extension reached no extractor at all       -> a real routing bug
+#   2. the extractor ran and the file yielded nothing  -> the file is what it is
+#   3. the extractor could not RUN (ffmpeg absent)    -> a missing dependency
+#
+# It went red on .flv and .m4v on a box with no ffmpeg, and situation 3 is what
+# happened. The reader returned '', the empty-result guard in
+# forensic_ingestion then had to choose a type, and it chose 'unsupported' --
+# a FALSE statement, because .flv is an accepted upload extension and section K
+# below asserts it is categorised 'media'. Before that guard landed the answer
+# was equally false in the other direction: '' carrying the claimed type 'flv',
+# i.e. a processed-looking artifact holding nothing (§18's class).
+#
+# So the routing assertion stays, and the contract behind it is asserted where it
+# can be checked precisely -- on the two video formats, whose reader is the one
+# that can fail for reason 3.
+#
+# NOTE the deliberate scope. This is NOT asserted over all eight families:
+# .gif/.webp/.tif legitimately return '' with type 'exif' (the EXIF reader ran
+# and there is no EXIF) and .sqlite returns '' with type 'sqlite'. Those are a
+# different and pre-existing convention, and asserting against them here would
+# be asserting something this suite has not measured.
+VIDEO_FAMILIES = ((".flv", b"FLV\x01" + b"\x00" * 40, "flv"),
+                  (".m4v", b"\x00\x00\x00\x20ftypM4V " + b"\x00" * 40, "m4v"))
+
+for ext, blob, _label in VIDEO_FAMILIES:
+    name = "f" + ext
+    text, ty = extract(name, blob, run_ocr=False)
+    check(f"{ext:8} keeps the video type when the file cannot be read",
+          ty == 'video', f"got {ty!r}")
+    # Either the tool is absent (placeholder naming ffmpeg) or the tools ran and
+    # failed on a 43-byte fake header (placeholder naming ffprobe). Both name the
+    # culprit, so the assertion holds with and without ffmpeg installed.
+    check(f"{ext:8} names the missing dependency instead of yielding nothing",
+          "ffmpeg" in text.lower() or "ffprobe" in text.lower(),
+          f"got {text[:140]!r}")
+    check(f"{ext:8} is not mislabelled an unsupported format",
+          category_for(name) in (None, "media", "video"),
+          f"category_for={category_for(name)!r} against type={ty!r}")
+
+# The pairing that separates "the reader could not run" from "the reader ran and
+# produced nothing": the audio readers DO reach Whisper, and its missing-tool
+# placeholder is non-empty text, so they keep their type and yield text. Remove
+# the video placeholder and the checks above fail; remove the audio one and this
+# fails. Neither fact is established by reading the code.
+for ext in (".aiff", ".wma"):
+    name = "f" + ext
+    text, ty = extract(name, b"\x00" * 44, run_ocr=False)
+    check(f"{ext:8} keeps the audio type and yields placeholder text",
+          ty == "audio" and bool(text.strip()),
+          f"ty={ty!r} with {len(text)} bytes")
+
 check("a .log is not mistaken for a disk image", not is_forensic_image("a.log"))
 check("a .E01 is", is_forensic_image("disk.E01"))
 check("a .001 is (the EWF split segment)", is_forensic_image("disk.001"))

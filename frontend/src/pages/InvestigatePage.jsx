@@ -1482,17 +1482,19 @@ export default function InvestigatePage() {
                           borderRadius: 4,
                         }}
                         title={
-                          'Sentences in this answer that carry a source '
-                          + 'marker. A low proportion means the model '
-                          + 'asserted more than the evidence behind it '
-                          + 'supports.'
+                          'How many distinct evidence files the '
+                          + 'answer drew on. This is a count of FILES, '
+                          + 'not a measure of how well grounded each '
+                          + 'sentence is: the answers carry no per-sentence '
+                          + 'source markers, so no citation ratio is '
+                          + 'computed and none is shown. To check a specific '
+                          + 'claim, open the source file listed at the foot '
+                          + 'of the answer.'
                         }>
                           {q.cited_sentence_count}
-                          {' of '}
-                          {q.cited_sentence_count
-                           + (q.uncited_sentence_count
-                             || 0)}
-                          {' '}sentences cited
+                          {q.cited_sentence_count === 1
+                           ? ' source'
+                           : ' sources'}
                         </span>
                       )}
                       <button

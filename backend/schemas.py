@@ -92,7 +92,17 @@ class QueryResponse(BaseModel):
     question_text: str
     processed_response: Optional[str]
     model_used: str
+    # MISNOMER, kept for stored-record compatibility. This counts distinct
+    # evidence FILES the answer drew on, not sentences, and nothing in the
+    # pipeline emits a per-sentence source marker to count. It previously
+    # rendered in the UI as "N of N sentences cited" -- which is always 100%
+    # -- with a tooltip claiming it showed whether the model asserted more
+    # than the evidence supports. That is a measurement-shaped field carrying
+    # no measurement, so the UI now says "N sources".
     cited_sentence_count: int
+    # ALWAYS 0. Not a measurement. Per-sentence citation marking was removed,
+    # and the field was left behind still named like a count. Do not render it
+    # and do not compute a ratio with it.
     uncited_sentence_count: int
     response_time_ms: int
     is_flagged: bool

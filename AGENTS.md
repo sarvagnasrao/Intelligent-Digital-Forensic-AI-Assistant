@@ -3107,3 +3107,484 @@ risk at low temperature is **repetition on repetitive evidence** — a prompt fu
 of log lines is full of repeated timestamps and IPs — which `repeat_penalty` at
 its default is already guarding. That reasoning is recorded in the code so the
 next reader knows the absence was a decision rather than an oversight.
+
+---
+
+## 29. A hand-built raw image, and the five bugs it found on first contact
+
+A 32 MB FAT16 raw image authored in pure Python (`C:\Windows\Temp\opencode\mkraw.py`),
+carrying an insider-exfil case across 12 files, then ingested through the real
+HTTP API. The corpus was built so the interesting relationships are only
+reachable by joining files:
+
+| file | what only it holds |
+|---|---|
+| `EMPLOYEE.DAT` | Marcus Webb, `E-4471`, `m.webb@northwind-corp.com` |
+| `CHATLOG2.TXT` | the handle `nightowl` |
+| `MALCFG.JSO` | `operator_handles: ["nightowl","m.webb"]` -- the join |
+| `VPNEXCPT.TXT` | signed "M. Webb", approver P. Raghunathan |
+| `SECMEMO.TXT` | `SEC-114`, `darknode.io`, `198.51.100.0/24` |
+| `FWLOGNOV.CSV` | 33 KB of noise, one line of which is `m.webb -> 198.51.100.47` |
+| `PAYMENTS.CSV` | 3 transfers to Halcyon Freight |
+| `_EDGERDL.REC` | **deleted**, in a deallocated cluster only, holds the rest |
+
+280 lines of firewall noise were included specifically so the relevance floor
+(§24) has something to reject.
+
+Two decisions worth keeping. **The image was verified with `pytsk3`
+independently, before the app ever saw it** -- a hand-built filesystem that the
+product cannot read measures the writer, not the product. And **the deleted
+ledger exists only in a deallocated cluster**, never also as a live file,
+otherwise deleted-file recovery would appear to work for the wrong reason.
+
+### The first ingest reproduced B1/B10/B18 exactly
+
+```
+Completed 100% - Complete - 0 artifacts - chunks=0 - entities=0 - elapsed=3s
+evidence row: status=Indexed
+```
+
+The file was on disk at its full 33,568,256 bytes. Nothing was extracted, and
+the app reported success. That is the exculpatory direction: an investigator
+reads it as a clean drive. Four further bugs were underneath it.
+
+### BUG A. `entry.as_file()` does not exist on pytsk3 -- every read failed
+
+```
+AttributeError: 'pytsk3.File' object has no attribute 'as_file'
+```
+
+`dir()` on a walked entry is `['as_directory', 'current_attr', 'info',
+'max_attr', 'read_random']`. The entry is *already* a `File`; the call was a
+guess. So all 12 reads raised, every file yielded nothing, and the job
+completed with 0 artifacts. Fixed to `read_random`, with a short-read guard
+that raises `IOError` rather than returning a short buffer.
+
+### BUG B. `except Exception: return {"extracted_text": ""}` is B10's shape
+
+A failed read produced "a file with no text", which is indistinguishable from a
+file that genuinely had none. Now `IOError`/`OSError` propagate, `ingestion.py`
+counts `read_failures`, and **all** reads failing raises `RuntimeError`. A read
+failure can no longer look like a clean disk.
+
+> Do not weaken the assertion to accommodate this. The correct fix is always to
+> make the failure raise or be counted, never to make the test expect less.
+
+### BUG C. The extension allow-list silently discarded the four most important files
+
+FAT truncates every name to 8.3, so `MALCFG.JSON` arrives as `MALCFG.JSO`,
+`CONTACTS.VCF`, `EMPLOYEE.DAT` and `_EDGERDL.REC` were all rejected outright.
+**The file containing the join between the handle and the identity was among
+them.** 8 of 12 files yielded text; the content fallback
+(`_looks_like_text` / `_sniff_unknown_text`) takes it to **12 of 12**.
+
+Sniffing must not turn binaries into text. Verified refused: PNG, JPEG, ZIP,
+SQLite, random bytes, empty file. Accepted: cp1252 with a stray high byte, and
+the whole payload is decoded rather than only the 4 KB sample.
+
+The sniffed type is reported as `text_sniffed`, distinct from `text`, so an
+analyst can tell content-identified files from extension-identified ones.
+
+### BUG D. A failed Office extractor still claimed it was a Word document
+
+`extract_media` returns `(text, type)` and `extract_docx` returns `""` on
+failure, so the pair `('', 'docx')` said "this is a Word document and it yielded
+nothing":
+
+```
+[MEDIA] docx extraction error: no item named '[Content_Types].xml'
+-> extraction_type='docx', extracted_text=''
+```
+
+The error went to a log nobody reads while the artifact list reported a
+processed Word document. **An empty result may no longer keep the claimed
+type** -- it falls through to the content sniffer, which identifies the file
+from its bytes if it is recoverable that way and otherwise says `unsupported`,
+which is the truth.
+
+*Verified discriminating, both halves of §28's TRAP 12:* 24 assertions with
+the guard, **22 with it reverted** (2 failures naming the behaviour). The
+revert is applied newline-agnostically and then asserted **absent** before the
+suite runs, because my first attempt replaced a string ending in `\n` against a
+CRLF file, changed nothing, and produced "passes either way".
+
+> A separate test bug, recorded because it is the §26 shape: my hand-built
+> `.docx` fixture zipped up `[Content_Types].xml` and `word/document.xml` and
+> failed with "no relationship of type .../officeDocument". A real `.docx` also
+> needs `_rels/.rels`. The fixture was invalid, not the product. Hand-built
+> Office files measure the test.
+
+### The usability bug: every chunk was attributed to the image, not to a file
+
+This one is the reason the test was worth running.
+
+```python
+combined_text = "\n\n---\n\n".join(all_chunk_texts[:500])
+chunks = chunk_text(combined_text)
+store_chunks(chunks=chunks, source_filename=filename, ...)   # the IMAGE name
+```
+
+Measured: 11 artifacts, 18,363 B of text, **3 chunks**, each an arbitrary ~6 KB
+window spanning several files, all labelled `NIGHTINGALE.001`. The `[File: ...]`
+tag survived only at the head of each file's first chunk, so a citation to
+"chunk 2 of NIGHTINGALE.001" told the investigator nothing about which of the
+eleven files supports a finding -- they would have to open the image and search
+it by hand. And a chunk spanning a file boundary mixes two documents in one
+embedding.
+
+Now stored **per artifact**, each under its own filename: 12 artifacts, **13
+chunks**, all 12 files separately attributed (verified by reading the index,
+not the row). The entity graph and credential scanner still get the full chunk
+list -- only the *store* is per-artifact, because that is what carries the
+filename.
+
+> `chunk_index` is the index **within one `store_chunks` call**, so it now
+> restarts at 0 per file. Verified no `(source, chunk_index)` pair collides. If
+> anything ever locates a chunk by `chunk_index` alone, it becomes ambiguous.
+
+### B32. A truncated image that recovered files said nothing about being truncated
+
+This is the seventh occurrence of the §18 class, and the first where **every
+mechanism fired correctly and the operator still could not tell**.
+
+A 20 MB cut of the 32 MB image recovers all 12 files, because FAT16 keeps its
+tables and the small files at the front of the volume. So the 0-artifact
+`Failed` branch correctly did not fire, and:
+
+```
+job.current_step   'Complete - 12 artifacts'
+evidence.status    Indexed
+evidence.error_message   None
+evidence.notes     'IMAGE IS TRUNCATED - partition 0 (FAT12/16) declares 32.0 MB
+                     but only 20.0 MB (62.4%) is present ... re-acquire'
+audit              FILE_INGESTED, and nothing else
+```
+
+The pre-flight wrote a **clear, correct, specific** warning. It went to
+`evidence.notes` -- which is in `EvidenceResponse`, and which
+**`EvidencePage.jsx` never renders**. So the only record that the acquisition
+covered 62 % of the volume was a database column, a print in a log, and a
+`FILE_INGESTED` entry that reads as a clean success.
+
+That is the worst shape this defect takes: files that were **never copied** are
+indistinguishable from files that were **never on the drive**, and the
+investigator is shown a normally-ingested evidence file with 13 chunks.
+
+Fixed in three places, because one is not enough:
+
+- the job's terminal `current_step` now reads
+  `Complete - 12 artifacts [warning] IMAGE TRUNCATED - only part of the volume
+  was present; re-acquire before treating missing files as absent`. The queue
+  row is the one surface always displayed;
+- a `FILE_INGEST_PARTIAL` audit entry (severity `warning`, registered in
+  `audit_helper.SEVERITY_MAP` and both frontend label maps) fires whenever
+  truncation is detected, not only when nothing was recovered;
+- `EvidencePage.jsx` renders `ev.notes` as an amber banner.
+
+> **This fix also covers a second, quieter lie.** `evidence.notes` is written in
+> exactly two places: the truncation warning, and
+> `"Combined from N split files"` at `evidence.py:400` -- the **EWF segment-set
+> path**. An investigator who uploads `image.E01`, `image.E02`, `image.E03` is
+> shown **one** evidence row with no indication that three files were merged.
+> Also invisible before this. Amber rather than red deliberately: partial
+> recovery is the intended behaviour (§6), and marking it `Failed` would
+> discard the files that were recovered.
+
+**The contract is now "truncation reaches the queue row", not "truncation is
+recorded"** -- a record nobody renders is not a warning.
+
+### B2 verified by construction: routing is content-based, twice over
+
+The same bytes renamed to `.e01` recovered **the same 12 artifacts and the same
+13 chunks**, and both files hash to `41e011855ddb06d3...`. And a synthetic file
+beginning with the `EVF` signature *is* detected as `ewf`, which is the half
+that stops the content check being decorative.
+
+### A lie in the citation badge: "10 of 10 sentences cited", always
+
+`cited_sentence_count` counts distinct evidence **files**. `uncited_sentence_count`
+is **hardcoded `0`** -- "we no longer mark individual sentences" (rag_engine.py).
+The UI rendered their sum as a green ratio with a tooltip claiming:
+
+> Sentences in this answer that carry a source marker. A low proportion means
+> the model asserted more than the evidence behind it supports.
+
+So it always read 100%, in green, and made a claim about grounding that the
+mechanism does not exist to support. An investigator relying on it would
+believe every sentence is traceable. The answers carry **no inline citation
+markers at all** -- only a footer list of files.
+
+Both fields are now documented in `schemas.py` as what they are, and both UI
+sites say "N sources" with a tooltip that says what to do instead (open the
+source file). `cited_sentence_count` is kept for stored-record compatibility.
+
+### What the bot actually found
+
+Five multi-hop questions, `llama3.2:3b`, `accurate` profile, 13,322/16,384
+prompt tokens. **All 12 files were cited by at least one answer**, and the
+relevance floor dropped 3-10 of 13 chunks per query while keeping the right
+ones.
+
+| question | result |
+|---|---|
+| who is `nightowl` | **correct** - Marcus Webb, `E-4471`, `m.webb@northwind-corp.com`; joined CHATLOG2 + EMPLOYEE.DAT + MALCFG.JSO |
+| VPN exception | **correct** - Raghunathan (E-1188, CISO), 2024-11-03, `10.20.14.0/24 -> 198.51.100.0/24`, 443/8443, TLS inspection bypassed |
+| money to Halcyon | **correct** - 1.2M + 1.25M + 2.45M = **4.9M**, and it cited `_EDGERDL.REC`, so **deleted-file recovery fed the answer** |
+| deleted ledger | partly wrong - identified the file, then claimed "the file's content is not available" while citing the file that contains it |
+| C2 address | **contradicts itself** - states `m.webb` talked to `198.51.100.47` on eleven occasions, then says the evidence does not say who talked to it |
+
+So the explicit cross-file joins work. The **implicit** ones are missed, and
+those are the ones an investigator actually wants:
+
+- `_EDGERDL.REC` line 2 -- `sent: spools/ledger_202411.zip 412.8 MB via
+  exfil.darknode.io` -- **the exfiltration volume**, never mentioned;
+- `takedaon dropped the third` next to `APPROVER A. Tanaka` in `PAYMENTS.CSV` --
+  a one-character join, missed;
+- `T-90333 ... duplicate - reversed` -- the 4th Halcyon row, never mentioned.
+
+The 4.9M total is right (the reversal nets out), so none of these make the
+answers *wrong*; they make them **incomplete in the direction that matters**.
+That is a model-capability ceiling on a 3B model, recorded rather than
+"fixed": the evidence was retrieved and cited in every case.
+
+The §19 trimming caveat rendered correctly on the two answers that hit it
+("1 of 10 retrieved excerpts were trimmed to fit the model's 16,384-token
+context window").
+
+### Five bugs in my own test scripts, all the same shape
+
+Worth the space, because four of them produced a **confident wrong reading** of
+a correct product.
+
+| bug | what it reported |
+|---|---|
+| read `artifact_count` off the queue row (not a field) | `None` -> "Indexed with 0 artifacts" for a run that recovered 12 |
+| read `response` instead of `processed_response` | **every answer empty**, printed as `ANSWER:` followed by nothing |
+| posted `"mode"` instead of `"ingestion_mode"` | job silently ran `normal`, `include_deleted` False -- and I printed `mode=accurate` from **my own default** |
+| looked up the Qdrant collection by full case UUID | not found -> `0` points, on a run that stored 13 |
+| `api/query/ask?case_id=` instead of `/api/cases/{id}/queries/ask` | HTTP 404, summarised as a missing answer |
+
+Each is §26 verbatim: **a helper that filters for the wrong key reports a
+confident empty, and an empty answer is indistinguishable from a model that
+said nothing.** The third is the subtlest -- a fallback that fills in the value
+you meant to send is how a test reports the setting you did not use.
+
+> **Two of these were found only because a result looked wrong and I checked
+> the product instead of the script.** The zero-artifact "failure" and the five
+> empty answers were both *my* bugs. If the assertion had been trusted, the
+> first would have had me "fixing" a correct ingest and the second would have
+> had me reporting the model as broken.
+
+### Verification
+
+```bash
+PYTHONPATH=. python C:/Windows/Temp/opencode/verify_sniff.py            # 24
+PYTHONPATH=. python C:/Windows/Temp/opencode/verify_b1b2.py            # 4
+PYTHONPATH=. python C:/Windows/Temp/opencode/verify_revert_discriminating.py
+PYTHONPATH=. python C:/Windows/Temp/opencode/verify_b1b2_api.py        # end to end
+```
+
+`verify_b1b2_api.py` asserts the **contract** rather than the detection: that
+the queue row states truncation, that `evidence.notes` survives, that the intact
+image carries **no** truncation banner (a banner that fires on a whole image
+trains the operator to dismiss it), and that `.001` and `.e01` recover the same
+count from the same bytes.
+
+### Read before touching these
+
+- **`forensic_ingestion.py`** - `read_random`, the re-raise ordering, and the
+  empty-result guard. B19's `StopIteration` re-raise in the walk loop still
+  applies.
+- **`ingestion.py`** - the forensic store is **per artifact**; `indexed_chunks`
+  feeds the entity graph and credential scanner. `run_ingestion_with_progress`
+  argument order matters (`evidence_id, case_id, file_path, filename, job_id`).
+- **`evidence.notes`** - two writers, both now rendered. Do not add a third
+  without rendering it.
+- **`cited_sentence_count`** - counts files. `uncited_sentence_count` is `0`.
+  Never render a ratio from them.
+
+---
+
+## 30. A video that uploads and yields nothing - and the guard that took three attempts to prove
+
+The gate came back **939 passed, 2 failed across 15 scripts**, both in
+`verify_file_formats.py`:
+
+```
+FAIL  .flv     is routed to an extractor, not 'unsupported'  got 'unsupported'
+FAIL  .m4v     is routed to an extractor, not 'unsupported'  got 'unsupported'
+```
+
+941 had been the recorded state, and `verify_file_formats` was 153 both times -
+so exactly these two flipped. §25's warning applies before anything else: **a red
+gate one run after a green one is not a regression until you know which of the
+two is wrong**, because the day before a review a red gate invites somebody to
+"fix" correct behaviour.
+
+### The cause was mine, and the assertion was measuring the wrong thing
+
+Both failures came from BUG D's guard, added earlier in this session: an empty
+extraction may no longer keep its claimed format type. `.flv` and `.m4v` have no
+extractor output on their fixtures, so the guard fired and assigned
+`unsupported`. The assertion then read:
+
+```python
+check(f"{ext:8} is routed to an extractor, not 'unsupported'", ty != "unsupported")
+```
+
+which tests **routing** but observes it through the **final extraction_type** -
+and that conflates three situations needing three different answers:
+
+| | situation | correct answer |
+|---|---|---|
+| 1 | the extension reached no extractor at all | a real routing bug |
+| 2 | the extractor ran and the file yielded nothing | the file is what it is |
+| 3 | **the extractor could not RUN** | **a missing dependency** |
+
+`.flv` was situation 3. And so the guard had traded one false statement for
+another: before it, `''` carried the claimed type `flv` (a processed-looking
+artifact holding nothing, §18's class); after it, a **supported** format was
+reported as unsupported. The second is worse for an investigator deciding
+whether to convert the video - "unsupported" says *give up*, the truth says
+*install ffmpeg*.
+
+### ✅ FIXED B33. `extract_video` swallowed "my reader could not run"
+
+Measured, not assumed. `ffmpeg` is **not installed on this box**, so all three
+steps raised and all three were printed to a log nobody reads:
+
+```
+[MEDIA] ffprobe error: [WinError 2] The system cannot find the file specified
+[MEDIA] Video audio extraction error: [WinError 2] The system cannot find the file specified
+```
+
+`extract_video` returned `''`. The defect was pre-existing (§18, eighth
+occurrence); the guard only made its consequences visible.
+
+The codebase already had the right convention and the video path simply lacked
+it: `extract_audio_transcript` returns a **placeholder naming the missing tool**
+when Whisper is absent, which is why `.aiff` and `.wma` come back with 84 bytes
+of honest text and keep their type. `.flv` and `.m4v` were the only two families
+coming back empty. So the video path now probes first and says so:
+
+- **tools absent** - return immediately with a placeholder naming `ffprobe` /
+  `ffmpeg` and the install command for all three platforms. No doomed
+  subprocess calls.
+- **tools ran and produced nothing** - append a placeholder naming the recorded
+  failures (`failures` is now populated in each `except`, which previously only
+  printed). A corrupt file, a file with no audio stream, and an undecodable
+  codec are three situations that all need naming rather than silence.
+
+Both layers are needed and they cover **different states**: the probe covers
+"the tool is missing", the trailing `if not parts:` covers "the tool ran and
+found nothing". They are independent, which §20's TRAP 7 argues for.
+
+Measured before and after, same box, same fixtures:
+
+| | before | after |
+|---|---|---|
+| `.flv` | `('unsupported', 0 bytes)` | `('video', 406 bytes)` naming ffmpeg |
+| `.m4v` | `('unsupported', 0 bytes)` | `('video', 406 bytes)` naming ffmpeg |
+
+The assertions hold **with or without ffmpeg installed**: the first placeholder
+names `ffmpeg`, the second names `ffprobe`, and the check accepts either.
+
+> **Deliberately not asserted over all eight families.** `.gif`/`.webp`/`.tif`
+> legitimately return `''` with type `exif` (the EXIF reader ran, there is no
+> EXIF) and `.sqlite` returns `''` with type `sqlite`. That is a different and
+> pre-existing convention, and asserting against it here would be asserting
+> something this suite has not measured. Scope is part of the assertion.
+
+### 🔴 Three bugs in my own revert harness, which is §28's TRAP 12 recurring
+
+"Verified discriminating" is **two** measurements, and the first is about the
+harness. All three of these produced a confident wrong reading before I caught
+them:
+
+| bug | what it reported |
+|---|---|
+| cut the block with an indentation heuristic `\n {8}\)\n` | that line does not exist in one of the two blocks, so the regex ran on and **deleted `extract_media`**; the suite died on an `ImportError` - a red result for a reason unrelated to the behaviour under test |
+| `trial("A+B", *EMPTY, ...)` | the **label** said A+B, the **pattern** was EMPTY, so it ran revert B twice and printed the label as if it were the action |
+| `run_suite()` returned `None` for an unreadable summary, then `if not None` | True, so a suite that printed **nothing** was reported as "GUARD IS DECORATIVE" - TRAP 8's bug, in the tool written to catch TRAP 12's |
+
+The second is §26 verbatim: a fallback that fills in the value you meant to send
+is how a test reports the setting you did not use.
+
+Fixes now in place: deletion is by **text span with a match-count assertion**;
+every revert asserts its survivors are still present (`extract_media`,
+`extract_video`, `extract_audio_transcript`, `import shutil`) so a revert can
+never delete the code the suite imports; and an unreadable summary is an
+**INVALID run**, never a failure count.
+
+### A fourth, in the tool that counted the data awaiting deletion
+
+The read-only inventory script reported **1** Qdrant index where §21 had measured
+38 and the truth was **77**. It got there like this:
+
+```python
+canonical = {os.path.basename(p) for p in glob.glob(root + "/*/qdrant")}
+```
+
+`basename` of `.../<case_id>/qdrant` is the literal string `"qdrant"`, so every
+one of the 77 matches collapsed into a **1-element set**, and the script printed
+"1 case index" with no hesitation. The case id is the *parent* of the `qdrant`
+component.
+
+What made this worth writing down is not the mistake but that **a set is the
+wrong tool for "count what matched"** - it deduplicates, and the wrong component
+deduplicates everything to one. A count and a set differ whenever the pattern
+matches more than once per case, which is exactly the case where you wanted the
+number. The number was distrusted only because §21's figure (38) was already on
+record and disagreed.
+
+The corrected count is **backed by a second, independent measurement** - 77
+entries directly under the root, each holding one `qdrant` - because a lone
+measurement is what produced the wrong answer in the first place.
+
+### The measurement, and what layering means for it
+
+```
+=== 1. with the fix ===              161 passed, 0 failed
+=== revert A only: the tool probe === 161 passed, 0 failed
+=== revert B only: the placeholder === 161 passed, 0 failed
+=== revert A+B: the pre-fix state === 155 passed, 6 failed
+      FAIL  .flv is routed to an extractor, not 'unsupported'  got 'unsupported'
+      FAIL  .m4v is routed to an extractor, not 'unsupported'  got 'unsupported'
+      FAIL  .flv keeps the video type when the file cannot be read  got 'unsupported'
+      FAIL  .flv names the missing dependency instead of yielding nothing  got ''
+      FAIL  .m4v keeps the video type when the file cannot be read  got 'unsupported'
+      FAIL  .m4v names the missing dependency instead of yielding nothing  got ''
+VERDICT: guard is real
+```
+
+**Single reverts are expected green, and that is the point.** A only is covered
+by B and B only is covered by A, because the two layers cover different states
+and either alone satisfies the contract for this box. Only the pre-fix state -
+both layers gone - must be red, and it is, on assertions that all name the
+behaviour.
+
+> **So "verified discriminating" against a layered fix means the *combined*
+> revert.** A harness that requires every single-block revert to go red will
+> report a correct two-layer fix as decorative, and the obvious "fix" is to
+> delete the redundant layer - which would then leave a real hole if the other
+> layer's condition ever stops covering it.
+
+### Gate
+
+`verify_file_formats.py` 153 -> **161**. Full gate, servers stopped: **949
+passed, 0 failed across 15 scripts**, and the per-suite lines reconcile exactly
+(9 + 59 + 38 + 161 + 15 + 171 + 19 + 45 + 17 + 86 + 52 + 36 + 209 + 17 + 15).
+`npm run build` clean.
+
+### Read before touching these
+
+- **`media_extractor.py`** - the two video placeholders. Both are needed and they
+  cover different states; removing either is not automatically safe even though
+  the gate stays green (see the layering note above).
+- **`verify_file_formats.py` section F** - the routing assertion is kept, the
+  contract behind it is asserted on the two video families only, and the
+  `.aiff`/`.wma` pairing is what separates "the reader could not run" from "the
+  reader ran and produced nothing".
+- **`forensic_ingestion.py`** - the empty-result guard is still right. It is what
+  made this visible. It is the *caller's* choice of `unsupported` that was too
+  coarse, and the caller now gets a non-empty reason to pass through instead.

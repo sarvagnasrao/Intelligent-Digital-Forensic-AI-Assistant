@@ -324,9 +324,15 @@ export default function ProfilePage() {
                       Forensic Profile
                     </h3>
                     <div className="flex items-center gap-3">
-                      <span className="text-xs text-success">
-                        {profile.cited_sentence_count} cited sentences
-                      </span>
+                      <span
+                          className="text-xs text-success"
+                          title="How many distinct evidence files were linked to this profile. A count of files, not a measure of how well grounded the text is."
+                        >
+                          {profile.cited_sentence_count}
+                          {profile.cited_sentence_count === 1
+                           ? ' source'
+                           : ' sources'}
+                        </span>
                       <span className="text-xs text-ink-2">
                         {profile.related_artifact_count} related files
                       </span>

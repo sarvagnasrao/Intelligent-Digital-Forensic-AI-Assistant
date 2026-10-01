@@ -4,6 +4,11 @@ export const ACTION_META = {
   CASE_CLOSED:        { color: '#94a3b8', label: 'Case closed' },
   FILE_UPLOADED:      { color: '#818cf8', label: 'File uploaded' },
   FILE_INGESTED:      { color: '#34d399', label: 'File ingested' },
+  // An incomplete acquisition that still produced files. Amber, not green:
+  // the job completed and the evidence is Indexed, so this is the only signal
+  // that files were never copied -- and files that were never copied are
+  // indistinguishable from files that were never on the drive.
+  FILE_INGEST_PARTIAL:{ color: '#fbbf24', label: 'Ingest partial (image truncated)' },
   EVIDENCE_ARCHIVED:  { color: '#94a3b8', label: 'Evidence archived' },
   QUERY_MADE:         { color: '#a78bfa', label: 'Query made' },
   QUERY_FLAGGED:      { color: '#fb923c', label: 'Query flagged' },

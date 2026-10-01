@@ -13,6 +13,9 @@ const ACTION_COLORS = {
   CASE_CLOSED:     'text-gray-400 bg-gray-500/10',
   FILE_UPLOADED:   'text-accent bg-accent/10',
   FILE_INGESTED:   'text-success bg-success/10',
+  // Amber, not success: the job completed and the evidence is Indexed, so this
+  // is the only signal that files were never copied.
+  FILE_INGEST_PARTIAL: 'text-warning bg-warning/10',
   QUERY_MADE:      'text-purple-400 bg-purple-500/10',
   QUERY_FLAGGED:   'text-warning bg-warning/10',
   QUERY_DELETED:   'text-danger bg-danger/10',

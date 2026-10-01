@@ -568,6 +568,14 @@ def extract_text_from_bytes(
     # indexed nothing.
     ext = normalize_extension(filename)
 
+    # A FAT volume truncates every name to 8.3, so REPORT.DOCX arrives here as
+    # REPORT.DOC and the extension points a zip file at a reader that cannot
+    # open it. Correct the extension from the archive's own contents BEFORE
+    # anything is dispatched on it, so every downstream branch sees the truth.
+    real_office = _sniff_zip_office(data)
+    if real_office:
+        ext = "." + real_office
+
     # PDF files — check before text
     if ext in PDF_EXTENSIONS:
         try:
@@ -753,9 +761,176 @@ def extract_text_from_bytes(
             whisper_model=whisper_model,
             whisper_gpu=whisper_gpu)
         # extract_media returns (text, type)
+        #
+        # A failed extractor returns "" and the caller above has ALREADY been
+        # told the type, so the pair ('', 'docx') says "this is a Word document
+        # and it yielded nothing" -- a true-shaped label attached to content
+        # that was never extracted. Measured before this guard, on a FAT image
+        # where REPORT.DOCX arrives as REPORT.DOC:
+        #     [MEDIA] docx extraction error: no item named '[Content_Types].xml'
+        #     -> extraction_type='docx', extracted_text=''
+        # and the error went to a log nobody reads while the artifact list
+        # reported the file as a processed Word document.
+        #
+        # So an empty result is NOT allowed to keep the claimed type. Fall
+        # through to the content sniffer, which will identify the file from its
+        # bytes if it is recoverable that way, and otherwise says 'unsupported'
+        # -- which is the truth.
+        if not (result[0] or "").strip():
+            sniffed = _sniff_unknown_text(data)
+            if sniffed[0]:
+                return sniffed
+            return "", 'unsupported', {
+                '_claimed_extension': ext,
+                '_reason': f"{ext} reader produced no text from this file",
+            }
         return result[0], result[1], {}
 
-    return "", 'unsupported', {}
+    # The extension is not in any allowlist. Before discarding the content,
+    # decide from the bytes -- see the long note on _looks_like_text for why an
+    # extension allowlist is the wrong model for a FAT volume.
+    return _sniff_unknown_text(data)
+
+
+def _sniff_unknown_text(data: bytes) -> tuple:
+    """Fallback for files whose extension is not in any allowlist.
+
+    Kept separate from _looks_like_text so the dispatch is readable at the call
+    site, and so the fallback can be exercised on its own.
+
+    The extraction_type is 'text_sniffed', NOT 'text'. The distinction is the
+    whole point: an analyst looking at the artifact list needs to know this was
+    identified by content because the name said nothing, and a file truncated to
+    8.3 on a FAT volume is exactly the case where that distinction carries
+    information. Reporting it as plain 'text' would be a confident true-shaped
+    label that hides how the format was decided.
+    """
+    is_text, decoded = _looks_like_text(data)
+    if not is_text or not decoded.strip():
+        return "", 'unsupported', {}
+    return decoded[:50000], 'text_sniffed', {'_identified_by': 'content'}
+
+
+# ── content sniffing: the fallback that makes disk images usable ─────────────
+#
+# WHY THIS EXISTS
+# Extension dispatch is the wrong model for forensic disk images, and not by a
+# small margin. A FAT filesystem -- which is what `.001` raw images of older
+# laptops and most USB sticks actually are -- truncates every filename to 8.3.
+# So the evidence loses its extension:
+#
+#     MALCFG.JSON   -> MALCFG.JSO   (3 of 4 letters; not in any allowlist)
+#     EMPLOYEE.DAT  -> EMPLOYEE.DAT  (.dat is not a listed text extension)
+#     CONTACTS.VCF  -> CONTACTS.VCF  (nor is .vcf)
+#     LEDGER_DLL.REC-> _EDGERDL.REC
+#     REPORT.DOCX   -> REPORT.DOC    (then routed to the .doc reader, which
+#                                    cannot open a docx zip)
+#
+# Measured on a 32 MB FAT16 test image before this change: 12 files walked,
+# 12 readable, 4 of them -- including the employee record that names the
+# suspect and the malware config whose operator_handles field reads
+# ["nightowl", "m.webb"] -- silently indexed as ZERO bytes.
+#
+# That is B1/B10's defect class again, and the worst direction: the evidence
+# that ties the chat handle to a named employee was present, readable, and
+# discarded, so the investigator is told the disk contains nothing connecting
+# the two.
+#
+# So: when the extension says nothing, decide from the BYTES. This does not
+# weaken any existing branch -- it only runs where the function was about to
+# return 'unsupported', i.e. where the alternative was to throw the content away.
+#
+# WHAT IT WILL NOT DO
+# It requires the bytes to actually BE text. A binary blob, an image, an
+# archive or an encrypted payload fails the test and still returns
+# 'unsupported'. Nothing here invents text out of a file that has none.
+_NOISE = b'\x00'
+
+
+def _sniff_zip_office(data: bytes):
+    """Identify an OOXML document by what is inside the archive, not its name.
+
+    A docx, xlsx and pptx are all zip files, and each puts its parts under a
+    distinct top-level directory. That makes the format self-describing, which
+    matters because a FAT volume truncates the extension that would otherwise
+    tell us:
+
+        REPORT.DOCX -> REPORT.DOC    (routed to the .doc reader, which hands a
+                                     zip to python-docx; it raises, the error
+                                     goes to a log nobody reads, and the file
+                                     is indexed as ZERO bytes while still
+                                     labelled extraction_type='docx')
+
+    That last part is the defect worth naming: the label is true-shaped and
+    false, which is the failure mode this whole file is about. Measured on a
+    FAT image before this fix: "[MEDIA] docx extraction error: no item named
+    '[Content_Types].xml' in the archive", and the artifact contributed nothing.
+
+    Returns 'docx' | 'xlsx' | 'pptx' | None. None means "not an OOXML archive",
+    which is a real answer -- plenty of zips are not Office documents.
+    """
+    if not data.startswith(b"PK\x03\x04"):
+        return None
+    try:
+        import io
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            names = z.namelist()
+    except Exception:
+        # A truncated or corrupt zip is not an OOXML document. Say so rather
+        # than guessing -- a zip that cannot be opened is exactly the case where
+        # a fallback would otherwise hand it to the wrong reader.
+        return None
+    for kind, marker in (("docx", "word/"), ("xlsx", "xl/"), ("pptx", "ppt/")):
+        if any(n.startswith(marker) for n in names):
+            return kind
+    return None
+
+
+def _looks_like_text(data: bytes) -> tuple:
+    """Decide whether `data` is readable text, by content alone.
+
+    Returns (is_text, decoded_text). The test is deliberately conservative:
+
+      * a NUL byte means binary -- true of every real binary format, and no
+        encoding of text produces one;
+      * the bytes must decode under UTF-8 or cp1252/latin-1;
+      * a high proportion must be printable or ordinary whitespace.
+
+    The cp1252 fallback is what catches a Windows-authored file with a stray
+    CP-1252 byte in it, which is extremely common in old log and .dat files
+    lifted off a FAT drive.
+    """
+    if not data:
+        return False, ""
+    if _NOISE in data[:4096]:
+        return False, ""
+    # A 4 KB sample is enough to judge and keeps this O(1) on a 64 MB file.
+    sample = data[:4096]
+
+    for encoding in ("utf-8", "cp1252"):
+        try:
+            text = sample.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if not text:
+            continue
+        printable = sum(
+            1 for ch in text
+            if ch.isprintable() or ch in "\r\n\t\f\v"
+        )
+        ratio = printable / len(text)
+        # 0.85 is the same threshold class used for "is this a text file"
+        # elsewhere; below it the content is mostly control bytes, which is
+        # what a binary looks like once decoded with a permissive codec.
+        if ratio >= 0.85:
+            # Re-decode the WHOLE payload with whichever codec judged the
+            # sample, so the caller gets the whole file and not a 4 KB slice.
+            try:
+                return True, data.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                return True, text
+    return False, ""
 
 
 def _convert_gps(coord, ref) -> float:
@@ -1304,9 +1479,35 @@ def extract_file_content(
         entry = file_entry["entry"]
         size = file_entry["size"]
 
-        # Read file bytes
-        file_obj = entry.as_file()
-        data = file_obj.read_random(0, size)
+        # Read file bytes.
+        #
+        # The entry the walker yields is ALREADY a pytsk3.File -- it exposes
+        # read_random() directly. This called entry.as_file(), which does not
+        # exist on the object pytsk3 hands back, so EVERY file raised
+        # AttributeError, the handler below turned it into empty text, and the
+        # job finished "Completed - 0 artifacts" with the evidence marked
+        # Indexed. The investigator would have concluded the drive was clean.
+        #
+        # Verified against pytsk3 20260715: dir() on the yielded entry is
+        # ['as_directory', 'current_attr', 'info', 'max_attr', 'read_random'].
+        # No as_file(). There is nothing to unwrap.
+        data = entry.read_random(0, size)
+
+        # A short read means the declared size does not match what the
+        # filesystem returned -- a truncated image, or a cluster chain that runs
+        # past the end of the volume. Truncating silently would store a file
+        # whose bytes are not the file, and the SHA-256 would be computed over
+        # the short read, so the artifact would verify against a hash of
+        # itself while containing evidence that was never recovered.
+        if len(data) < size:
+            raise IOError(
+                f"short read: filesystem declared {size:,} B for "
+                f"{file_entry.get('internal_path') or file_entry.get('filename')}"
+                f" but only {len(data):,} B could be read -- the image is "
+                f"truncated or the cluster chain runs past the end of the "
+                f"volume. Refusing to store partial evidence as if it were "
+                f"complete."
+            )
 
         # Compute artifact hash
         artifact_hash = compute_sha256_bytes(data)
@@ -1365,6 +1566,23 @@ def extract_file_content(
             "is_viewable": viewable
         }
     except Exception as e:
+        # A per-file I/O failure must NOT be laundered into "no text".
+        #
+        # Returning {"extracted_text": ""} here is B10's exact shape in the
+        # forensic path: the caller does `if not enriched.get("extracted_text"):
+        # continue`, so a failure is indistinguishable from a genuinely empty
+        # file. When every file failed, the job reported "Completed - 0
+        # artifacts" and the evidence was marked Indexed -- which reads to an
+        # investigator as "the drive was clean". That is the exculpatory
+        # direction, and it is the one that matters most.
+        #
+        # I/O problems (short read, unreadable cluster, volume damage) raise so
+        # the per-file handler in _run_forensic_with_progress can count them and
+        # the pipeline can refuse to report success. Genuine content problems --
+        # a binary with no extractable text -- are NOT errors and still return
+        # empty text.
+        if isinstance(e, (IOError, OSError)):
+            raise
         return {
             **file_entry,
             "sha256_hash": "",

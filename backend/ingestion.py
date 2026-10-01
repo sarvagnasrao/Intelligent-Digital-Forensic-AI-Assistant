@@ -668,6 +668,9 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             artifact_count = 0
             total_chunks = 0
             all_chunk_texts = []
+            # Paired with all_chunk_texts so each artifact's own text is stored
+            # under its own filename. See the note at the store step.
+            all_chunk_names = []
 
             # Set up directory to save raw extracted files
             extracted_base_dir = os.path.join(
@@ -684,6 +687,16 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             print(f"[FORENSIC] Walking filesystem...")
 
             # Step 3 & 4: Walk and extract
+            #
+            # `read_failures` is load-bearing. extract_file_content raises on an
+            # I/O error rather than returning empty text (B10's shape), and the
+            # `continue` below skips anything with no text -- which is correct
+            # for a binary and catastrophic for a failed read. Without counting
+            # them, a drive where every read failed finished as
+            # "Completed - 0 artifacts" with the evidence marked Indexed, i.e.
+            # "this disk was clean". Measured on a good 32 MB FAT16 image:
+            # 12 files walked, 12 reads failed, 0 artifacts, status Indexed.
+            read_failures = []
             for file_info in file_generator:
                 try:
                     enriched = extract_file_content(
@@ -738,6 +751,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                         f"{enriched['extracted_text']}"
                     )
                     all_chunk_texts.append(tagged_text)
+                    all_chunk_names.append(enriched["filename"])
 
                     # Commit every 50 artifacts to avoid
                     # large in-memory transactions
@@ -761,10 +775,30 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                     if isinstance(e, StopIteration) or "stopped by user" in str(e).lower():
                         raise
                     print(f"[FORENSIC] File error: {e}")
+                    read_failures.append(
+                        f"{file_info.get('internal_path') or file_info.get('filename')}"
+                        f": {e}")
                     continue
 
             db.commit()
             print(f"[FORENSIC] {artifact_count} artifacts extracted")
+
+            # Every read failed. This is not a clean disk -- it is a disk the
+            # pipeline could not read, and the two must never look alike.
+            # Refusing here is what makes the difference visible; continuing
+            # would index nothing and mark the evidence searchable.
+            walked = artifact_count + len(read_failures)
+            if walked and artifact_count == 0:
+                first = read_failures[0]
+                raise RuntimeError(
+                    f"None of the {walked} files in this image could be read, "
+                    f"so 0 artifacts were recovered. This is a read failure, "
+                    f"not an empty disk -- treating it as 'clean' would tell the "
+                    f"investigator the opposite of the truth. First failure: "
+                    f"{first}"
+                    + (f" (+{len(read_failures) - 1} more)"
+                       if len(read_failures) > 1 else "")
+                )
 
             # Run anomaly detection on all artifacts
             _progress(60, "Step 4: Anomaly detection")
@@ -816,18 +850,53 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             _progress(70, "Step 5: Building vector index")
             governor.check_and_throttle()
             print(f"[FORENSIC] Building vector index...")
-            # Limit to 500 files for memory safety on M1 8GB
-            combined_text = "\n\n---\n\n".join(
-                all_chunk_texts[:500])
-            chunks = chunk_text(combined_text)
-            total_chunks = store_chunks(
-                chunks=chunks,
-                source_filename=filename,
-                evidence_id=evidence.id,
-                case_id=case_id,
-                qdrant_path=qdrant_path,
-                stop_check=governor._stop_check
-            )
+            # Per-artifact, NOT one concatenated blob.
+            #
+            # This used to join every extracted file into a single string with
+            # "\n\n---\n\n" and chunk that, attributing all of it to the IMAGE's
+            # filename. Measured on the 32 MB FAT16 test image: 11 artifacts,
+            # 18,363 B of text, 3 chunks -- each one an arbitrary ~6 KB window
+            # spanning several files, every one of them labelled NIGHTINGALE.001.
+            #
+            # Two consequences, and the second is the one that matters. The
+            # `[File: ...]` tag survives only at the head of each file's first
+            # chunk, so a citation to "chunk 2 of NIGHTINGALE.001" tells the
+            # investigator nothing about which of the eleven files supports a
+            # finding -- they would have to open the image and search it by
+            # hand. And a chunk that spans a file boundary mixes two documents
+            # in one embedding, so a query about one of them matches on the
+            # other's words.
+            #
+            # Storing per artifact fixes attribution, keeps chunk boundaries on
+            # file boundaries, and gives retrieval real granularity. It also
+            # removes the unbounded join, so the [:500] cap now bounds stored
+            # text rather than an intermediate string.
+            total_chunks = 0
+            stored_files = 0
+            # Every chunk, across every artifact. The entity graph and the
+            # credential scanner both need the full set; only the STORE is
+            # per-artifact, because that is what carries the filename.
+            indexed_chunks = []
+            for art_text, art_name in zip(
+                    all_chunk_texts, all_chunk_names):
+                if stored_files >= 500:
+                    print(f"[FORENSIC] Artifact cap reached at 500 files; "
+                          f"{len(all_chunk_texts) - 500} not indexed")
+                    break
+                art_chunks = chunk_text(art_text)
+                if not art_chunks:
+                    continue
+                indexed_chunks.extend(art_chunks)
+                total_chunks += store_chunks(
+                    chunks=art_chunks,
+                    source_filename=art_name,
+                    evidence_id=evidence.id,
+                    case_id=case_id,
+                    qdrant_path=qdrant_path,
+                    stop_check=governor._stop_check
+                )
+                stored_files += 1
+                governor.check_and_throttle()
 
             # Build entity graph
             # Was: 85, then immediately 75, then 90. The bar went backwards
@@ -836,7 +905,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             governor.check_and_throttle()
             print(f"[FORENSIC] Building entity graph...")
             entity_counts, extracted_entities = build_graph(
-                chunks=chunks,
+                chunks=indexed_chunks,
                 source_filename=filename,
                 evidence_id=evidence.id,
                 case_id=case_id,
@@ -894,7 +963,7 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             # ── Credential scanning ──────────────────────────────────────
             try:
                 from backend.modules.credential_scanner import scan_chunks as scan_for_creds
-                cred_findings = scan_for_creds(chunks, filename)
+                cred_findings = scan_for_creds(indexed_chunks, filename)
                 if cred_findings:
                     cred_db2 = SessionLocal()
                     cred_count2 = 0
@@ -978,9 +1047,34 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                     "entity_count": total_entities
                 }
             )
+            # A truncated image that still yielded files gets its OWN audit
+            # entry, because the FILE_INGESTED entry above reads as a clean
+            # success and the truncation is not one of its fields.
+            #
+            # Measured live on a 20 MB cut of a 32 MB volume: it recovered all
+            # 12 artifacts (FAT16 keeps its tables and the small files at the
+            # front of the volume), so the 0-artifact branch never ran and no
+            # audit entry mentioned truncation at all. The activity feed said
+            # "file ingested", the evidence row said Indexed, and the queue row
+            # said "Complete - 12 artifacts".
+            if truncation_warning:
+                _create_audit_log(
+                    db, case_id, "FILE_INGEST_PARTIAL",
+                    {
+                        "filename": filename,
+                        "type": "forensic_image",
+                        "reason": "truncated_image_partial_recovery",
+                        "detail": truncation_warning,
+                        "artifacts_extracted": artifact_count,
+                        "warning": (
+                            "The image is incomplete. Files that were never "
+                            "copied are indistinguishable from files that "
+                            "were never on the drive. Re-acquire before "
+                            "relying on an absence."),
+                    }
+                )
             db.commit()
 
-            
             _progress(100, "Complete")
             if job_id:
                 db2 = SessionLocal()
@@ -990,7 +1084,21 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                         j.status = "Completed"
                         j.progress_percent = 100
                         j.completed_at = datetime.utcnow()
-                        j.current_step = f"Complete — {artifact_count} artifacts"
+                        # Say so on the row itself. The pre-flight already
+                        # writes a clear message to evidence.notes, but notes is
+                        # not rendered anywhere in the Evidence page, so on its
+                        # own it is a fact stored where nobody reads it. The
+                        # queue row is the one surface that is always shown, so
+                        # a completion that hides a truncated acquisition is
+                        # stated here rather than only in a database column.
+                        j.current_step = (
+                            f"Complete — {artifact_count} artifacts "
+                            f"⚠ IMAGE TRUNCATED — only part of the volume was "
+                            f"present; re-acquire before treating missing "
+                            f"files as absent"
+                            if truncation_warning else
+                            f"Complete — {artifact_count} artifacts"
+                        )
                         db2.commit()
                 finally:
                     db2.close()

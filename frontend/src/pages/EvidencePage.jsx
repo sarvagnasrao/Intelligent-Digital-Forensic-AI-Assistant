@@ -5,7 +5,7 @@ import {
   Database, Music, Video,
   Image, Mail, Table, MessageSquare,
   CheckCircle, Clock,
-  AlertCircle, RefreshCw,
+  AlertCircle, AlertTriangle, RefreshCw,
   Info, Shield, Archive, ArchiveRestore, Eye, EyeOff,
   Play, Loader, X, Cpu,
   ChevronDown, ChevronUp,
@@ -1253,6 +1253,31 @@ export default function EvidencePage() {
                         <AlertCircle size={13} className="text-danger shrink-0 mt-0.5" />
                         <p className="text-[11px] text-danger leading-snug break-words">
                           {ev.error_message}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                  {/* Notes banner. Amber, not red, and NOT conditioned on
+                      status: the two things written here both accompany a
+                      SUCCESSFUL ingest.
+
+                      - a truncated forensic image whose pre-flight warning says
+                        the volume is only partly present. It recovers the
+                        files that were copied, so the job reads Completed and
+                        the evidence reads Indexed -- and files that were never
+                        copied look exactly like files that were never on the
+                        drive. Before this the note existed in the API response
+                        and in the database and was rendered nowhere.
+                      - "Combined from N split files", i.e. an E01/E02/E03 set
+                        arrived as ONE evidence item. The investigator uploaded
+                        three files and sees one row with no sign that anything
+                        was merged. */}
+                  {ev.notes && ev.status !== 'Failed' && (
+                    <div className="px-4 pb-4">
+                      <div className="bg-warning/10 border border-warning/30 rounded-lg px-3 py-2 flex items-start gap-2">
+                        <AlertTriangle size={13} className="text-warning shrink-0 mt-0.5" />
+                        <p className="text-[11px] text-warning leading-snug break-words">
+                          {ev.notes}
                         </p>
                       </div>
                     </div>

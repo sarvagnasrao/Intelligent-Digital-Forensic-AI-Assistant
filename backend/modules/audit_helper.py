@@ -33,6 +33,13 @@ SEVERITY_MAP = {
     "ENTITY_FLAGGED":      "warning",
     "QUERY_FLAGGED":       "warning",
     "WATCHLIST_HIT":       "warning",
+    # An incomplete acquisition that still yielded files. Deliberately a
+    # warning and NOT info: the job completes and the evidence reads Indexed,
+    # so without this the only trace that files were never copied is a column
+    # nothing renders. It is also deliberately not an error -- partial recovery
+    # is the intended behaviour (AGENTS.md 6), and marking it Failed would
+    # discard the files that were recovered.
+    "FILE_INGEST_PARTIAL": "warning",
 
     # Error / Critical — security events
     "ACCOUNT_LOCKED":      "error",

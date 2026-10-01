@@ -17,6 +17,7 @@ single bad file never breaks the pipeline.
 
 import os
 import json
+import shutil
 import tempfile
 import subprocess
 from datetime import datetime
@@ -532,6 +533,45 @@ def extract_video(data: bytes,
     metadata = {}
     tmp_path = None
     audio_tmp = None
+    failures = []
+
+    # ---- can this reader run at all? -----------------------------------
+    #
+    # Measured on a box with no ffmpeg: every step below raised
+    #     [MEDIA] ffprobe error: [WinError 2] The system cannot find the file
+    #     [MEDIA] Video audio extraction error: [WinError 2] ...
+    # both were PRINTED and execution continued, so extract_video returned
+    # ''. The caller was then told nothing about why.
+    #
+    # That empty string is the §18 defect: a video that uploads successfully and
+    # yields no text, with the reason in a log nobody reads. It is also what
+    # forced a false label downstream -- the empty-result guard in
+    # forensic_ingestion has to choose a type, and 'unsupported' is wrong,
+    # because .flv IS an accepted upload and IS in the estimator's video set.
+    # "My reader could not run" and "this format is not supported" are
+    # different facts and the app must not report the second when it means the
+    # first (§16: never report a value you did not measure).
+    #
+    # So probe first and, when the tools are absent, say so in the artifact
+    # text with the install command. This mirrors what
+    # extract_audio_transcript has always done for a missing Whisper -- which is
+    # why .aiff and .wma come back with 84 bytes of honest placeholder and keep
+    # their type, and only the two video formats were coming back empty.
+    missing = [t for t in ('ffprobe', 'ffmpeg')
+               if shutil.which(t) is None]
+    if missing:
+        return (
+            f"[Video file: {filename}. No video could be read: "
+            f"{' and '.join(missing)} "
+            f"{'are' if len(missing) > 1 else 'is'} not on PATH, so no "
+            f"container metadata and no audio track were extracted and "
+            f"nothing was transcribed. The file is a supported type and was "
+            f"stored in full -- it simply was not read. "
+            f"Install: winget install Gyan.FFmpeg (Windows) | "
+            f"apt install ffmpeg (Debian/Ubuntu) | brew install ffmpeg (macOS) "
+            f"-- then re-ingest to extract the audio track.]",
+            {}
+        )
 
     try:
         ext = os.path.splitext(
@@ -632,6 +672,7 @@ def extract_video(data: bytes,
 
         except Exception as e:
             print(f"[MEDIA] ffprobe error: {e}")
+            failures.append(f"ffprobe could not read the container: {e}")
 
         # Step 2: Extract audio → transcribe
         if WHISPER_AVAILABLE:
@@ -669,9 +710,12 @@ def extract_video(data: bytes,
                 print(
                     f"[MEDIA] Video audio "
                     f"extraction error: {e}")
+                failures.append(
+                    f"the audio track could not be extracted: {e}")
 
     except Exception as e:
         print(f"[MEDIA] Video extraction error: {e}")
+        failures.append(f"the video could not be processed: {e}")
     finally:
         # Clean up temp files in all cases
         for p in [tmp_path, audio_tmp]:
@@ -680,6 +724,19 @@ def extract_video(data: bytes,
                     os.remove(p)
                 except Exception:
                     pass
+
+    # The tools ran and still produced nothing. That is a real measurement, and
+    # it needs to reach the investigator too -- an artifact whose text is empty
+    # reads as "nothing of interest here" rather than "we could not read it".
+    if not parts:
+        detail = ("; ".join(failures) if failures else
+                  "ffprobe reported no streams and no audio track was found")
+        parts.append(
+            f"[Video file: {filename}. The video tools ran but produced "
+            f"nothing: {detail}. The file is stored in full and is a supported "
+            f"type, but nothing could be read from it. It may be corrupt, may "
+            f"carry no audio stream, or may use a codec this build cannot "
+            f"decode.]")
 
     return '\n'.join(parts), metadata
 

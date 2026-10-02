@@ -11,10 +11,12 @@ spacy==3.7.4
 pdfminer.six==20221105
 networkx==3.3
 rapidfuzz==3.9.3
-# NOTE: torch / sentence-transformers are intentionally ABSENT.
-# Embeddings are served by Ollama (see backend/modules/ollama_client.py).
-# Commit 0be7d9a removed them to stop PyTorch OOM crashes on this
-# hardware. Do not re-add without reading AGENTS.md section 6 (B4).
+# NOTE: torch / sentence-transformers are intentionally optional here.
+# The backend imports them lazily for local all-MiniLM-L6-v2 embeddings, so
+# startup and health checks work without them. Indexing and semantic search
+# require the embedding stack; install a compatible build deliberately after
+# reading AGENTS.md sections 15 and 31. Do not switch to Ollama embeddings
+# without a full 384-dimensional index migration.
 # --- Forensic disk image support ---
 # pyewf and pytsk3 are C extensions requiring libewf and
 # TSK (The Sleuth Kit) system libraries. On Debian/Ubuntu:

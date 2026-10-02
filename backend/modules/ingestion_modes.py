@@ -43,19 +43,8 @@ from backend.modules.hardware_probe import get_hardware_spec
 # knob is a single edit and the UI can render whatever the mode says instead
 # of hardcoding labels that drift out of sync.
 #
-#   chunk_size      characters per chunk fed to the vector store. Larger =
-#                  fewer chunks to embed (faster) but coarser retrieval.
-#                  THIS IS THE DOMINANT ACCURACY LEVER, and it was set far
-#                  too high for a long time. A query retrieves whole chunks
-#                  and then trims them to the prompt budget, so what reaches
-#                  the model is the budget divided by chunk_size - not the
-#                  chunk. At 20,000 chars against a 16,384-token window only
-#                  ~26% of each retrieved chunk survives the trim (measured
-#                  for 468c78f3: 299 chunks). Halving chunk_size roughly
-#                  doubles the evidence per answer; it costs only embedding
-#                  time, because dimensionality is fixed at 384-dim and
-#                  therefore existing collections stay VALID. Benefit still
-#                  requires a re-ingest, so sizes were cut once, together.
+#   chunk_size      characters per chunk fed to the vector store. THIS IS NOW A
+#                  GLOBAL SETTING, not a per-profile one — see CHUNK_SIZE below.
 #   chunk_overlap   characters repeated between adjacent chunks so a
 #                  sentence spanning a boundary is still retrievable.
 #   embed_batch     chunks per embedding round-trip. Larger = better
@@ -69,6 +58,61 @@ from backend.modules.hardware_probe import get_hardware_spec
 #                  Substantially slower, materially more complete.
 #   max_parallel    upper bound on files ingested at once by the worker.
 
+# ---------------------------------------------------------------------------
+# Chunking: 700 characters, global
+# ---------------------------------------------------------------------------
+# THE NUMBER IS THE EMBEDDING MODEL'S ATTENTION WINDOW, not a taste choice.
+#
+# `all-MiniLM-L6-v2` has `max_seq_length = 256` tokens, which measures out at
+# 513 characters on dense log lines and 788 on prose (§31.3). Anything beyond
+# that window in a chunk is **never encoded** — it sits in a chunk, with a
+# vector, and is unreachable by any search.
+#
+# So chunk_size was never a retrieval-granularity lever, which is how it was
+# documented for most of this file's life. It is a COVERAGE setting, and it was
+# set roughly an order of magnitude too high. Measured coverage of the corpus
+# that was actually indexed:
+#
+#     profile      chunk chars    embedded    coverage
+#     accurate           3,000     513-788      19.7 %
+#     normal             6,000     513-788       9.1 %
+#     fastest           12,000     513-788       4.6 %
+#
+# A 33,810-character firewall log — one file of twelve — had 95.4 % of itself
+# unreachable under `fastest`, with nothing anywhere reporting it. 42 distinct
+# facts in that corpus sat past the window: present in the index, invisible to
+# every search.
+#
+# At 700/120 that same file reaches 88.5 % coverage, and every profile does.
+#
+# GLOBAL, NOT PER-PROFILE
+# ----------------------
+# This was the last remaining reason the profile *was* the chunk size, and that
+# made a case's index a mosaic: index a case under `fastest`, add a document
+# under `accurate`, and it holds 12,000-char and 3,000-char passages side by
+# side — a case presented in the UI as one consistent index, which is precisely
+# the kind of unearned-uniformity claim §16 is about.
+#
+# Making it global means one re-index serves all three profiles, and the
+# profiles differ only in what genuinely differs: transcription model, OCR,
+# deleted-file recovery, embedding batch size. `index_provenance` records the
+# scheme and accumulates rather than overwriting, so a case indexed across the
+# change reports itself as mixed rather than quietly becoming `match`.
+#
+# The cost is real and is not hidden: the stride falls from ~5,800 characters to
+# ~580, so ~10x as many chunks to embed for the same text. §31.3 measured this
+# at ~3.2x the encoded characters and ~3.7x the embedding wall clock, and
+# `EMBEDDING_OVERHEAD_PER_MB` in `time_estimator` has been rescaled to admit
+# it. The profiles no longer buy speed by discarding evidence, which is the
+# honest arrangement: `fastest` is now honestly the fastest because it skips
+# OCR and deleted-file recovery, not because it throws away 95 % of each file.
+#
+# 120 of overlap is 17 % — enough that a fact spanning a boundary survives in
+# two chunks, and small enough that the duplicated text stays a rounding error
+# against a 580-character stride.
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 120
+
 MODES: Dict[str, Dict[str, Any]] = {
     "fastest": {
         "key": "fastest",
@@ -76,14 +120,16 @@ MODES: Dict[str, Dict[str, Any]] = {
         "tagline": "Quick triage",
         "description": (
             "No OCR, no deleted-file recovery and the smallest "
-            "transcription model. Chunks are large, so there is less to "
-            "embed. Use this to see what a piece of evidence contains "
-            "before committing to a full pass."
+            "transcription model. Retrieval granularity is the same as "
+            "every other profile — this one is faster because it skips "
+            "whole classes of work, not because it discards evidence. Use "
+            "this to see what a piece of evidence contains before "
+            "committing to a full pass."
         ),
         "accuracy": "Lowest",
         "speed": "Fastest",
-        "chunk_size": 12000,
-        "chunk_overlap": 0,
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
         "embed_batch": 256,
         "ocr": False,
         "whisper_model": "tiny",
@@ -102,8 +148,8 @@ MODES: Dict[str, Dict[str, Any]] = {
         ),
         "accuracy": "Balanced",
         "speed": "Balanced",
-        "chunk_size": 6000,
-        "chunk_overlap": 200,
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
         "embed_batch": 128,
         "ocr": True,
         "whisper_model": "base",
@@ -116,15 +162,15 @@ MODES: Dict[str, Dict[str, Any]] = {
         "label": "Accurate",
         "tagline": "Forensic depth",
         "description": (
-            "Adds deleted-file recovery from disk images, the large "
-            "transcription model on the GPU, and small overlapping "
-            "chunks for precise citation. Markedly slower, and the most "
-            "complete result. Use before producing a report."
+            "Adds deleted-file recovery from disk images and the large "
+            "transcription model on the GPU. Markedly slower on those two "
+            "axes, and the most complete result. Use before producing a "
+            "report."
         ),
         "accuracy": "Highest",
         "speed": "Slowest",
-        "chunk_size": 3000,
-        "chunk_overlap": 300,
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
         "embed_batch": 64,
         "ocr": True,
         "whisper_model": "small",

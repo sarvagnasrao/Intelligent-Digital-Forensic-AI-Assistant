@@ -136,12 +136,36 @@ def build_graph(chunks: list[str],
         "organizations": 0, "ips": 0
     }
 
-    # To guarantee < 1 min ingestion for large files, limit entity extraction to first 10 chunks
-    docs = list(nlp.pipe(chunks[:10], batch_size=32))
+    # A CHARACTER budget, not a chunk count.
+    #
+    # This was `chunks[:10]` with the comment "to guarantee < 1 min ingestion for
+    # large files" — a count standing in for an amount of text, which is only a
+    # proxy while every chunk is the same size. Chunking is now 700 characters
+    # globally (§31.7 item 5), so the same 10 chunks is 7 KB where it used to be
+    # 30 KB: a silent 4.3x cut in the evidence NER sees, landing the same way a
+    # deliberate smaller budget would and looking like nothing at all.
+    #
+    # Measured NER throughput is ~42 KiB/s single-threaded, so 30 KB is ~0.7 s
+    # and this budget keeps that. The < 1 min figure it was protecting was never
+    # a hardware limit but a workaround for spaCy running in-process with no
+    # `n_process` pool; that is item 7 and it is where the real parallelism
+    # belongs.
+    #
+    # Chunks are taken whole rather than sliced, so a document boundary is never
+    # cut mid-passage and the entity graph does not gain a partial document.
+    NER_BUDGET_CHARS = 30_000
+    budgeted, budget_used = [], 0
+    for c in chunks or []:
+        if budgeted and budget_used + len(c) > NER_BUDGET_CHARS:
+            break
+        budgeted.append(c)
+        budget_used += len(c)
+
+    docs = list(nlp.pipe(budgeted, batch_size=32))
     all_extracted = []
 
     for i, doc in enumerate(docs):
-        chunk = chunks[i]
+        chunk = budgeted[i]
         if governor and i % 50 == 0:
             governor.check_and_throttle()
 

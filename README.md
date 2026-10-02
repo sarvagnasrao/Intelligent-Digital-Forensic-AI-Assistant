@@ -95,8 +95,8 @@ This project was developed as a semester-long final project exploring the inters
 
 ### Geographic Intelligence
 - EXIF GPS extraction from photographs
-- IP address geolocation (offline database)
-- Interactive map with clustered pin markers
+- IP entities are reported without geolocation; no external lookup is performed
+- The former interactive map route is retired until a vetted offline map/data bundle is available
 
 ### Keyword Watchlist
 - Define keywords per case (suspect names, IPs, financial terms, handles)
@@ -197,7 +197,7 @@ Evidence File Upload
         │
         ├──▶  Entropy + Timestamp Analysis  ──▶  Anomalies
         │
-        ├──▶  Chunking + Embedding (Ollama embeddings, 384-dim)  ──▶  Qdrant
+      ├──▶  Chunking + Embedding (local all-MiniLM-L6-v2, 384-dim)  ──▶  Qdrant
         │
         └──▶  Watchlist matching  ──▶  Hit counter update
 
@@ -228,7 +228,7 @@ Investigator Query
 | ORM | **SQLAlchemy 2.0** | Database models and query builder |
 | Database | **SQLite** (14 tables) | Persistent storage for cases, users, evidence, audit logs |
 | Vector DB | **Qdrant 1.9** (embedded) | Semantic search over chunked evidence text, per-case storage |
-| Embeddings | **Ollama** embedding model (384-dim) | Text-to-vector encoding — no PyTorch in the dependency set |
+| Embeddings | **SentenceTransformers** `all-MiniLM-L6-v2` (384-dim) | Local text-to-vector encoding; loaded lazily when indexing/searching |
 | LLM Runtime | **Ollama** | Local LLM serving (llama3.2:3b recommended) |
 | NLP | **spaCy 3.7** (`en_core_web_lg`) | Named entity recognition |
 | Graph Engine | **NetworkX 3.3** | Entity relationship graph construction |
@@ -249,7 +249,7 @@ Investigator Query
 | Realtime | **websockets** | Live ingestion progress and queue updates |
 | Server | **uvicorn 0.29** | ASGI server |
 
-> **Note on PyTorch:** `torch` and `sentence-transformers` are **deliberately absent** from `requirements.txt`. They were removed to stop out-of-memory crashes on modest forensic hardware, and embeddings are served by Ollama instead. Do not re-add them without reading `AGENTS.md` §6 (B4).
+> **Note on PyTorch:** `torch` and `sentence-transformers` are optional runtime dependencies for local embeddings and are imported lazily, so the backend can start without them. Do not replace this embedder with an Ollama embedding model without reading `AGENTS.md` §15: the current index format is 384-dimensional and a different embedder requires a deliberate migration and re-index.
 
 ### Frontend
 
@@ -564,7 +564,7 @@ Intelligent-Digital-Forensic-AI-Assistant/
 ├── setup_windows.bat           # Automated setup (Windows)
 ├── start.sh / start.bat        # Launch ollama + backend + frontend
 ├── start_windows.bat
-├── requirements.txt            # Python dependencies (no torch)
+├── requirements.txt            # Base dependencies; embedding stack is optional
 ├── vendor/                     # Air-gap kit: wheels + spaCy model
 ├── .env                        # Environment configuration
 │
@@ -598,7 +598,7 @@ Intelligent-Digital-Forensic-AI-Assistant/
 │   │   ├── forensic_ingestion.py  # pyewf/pytsk3 walk + per-file extraction
 │   │   ├── rag_engine.py          # Retrieval + prompt + citation processing
 │   │   ├── vector_store.py        # Qdrant wrapper (384-dim)
-│   │   ├── ollama_client.py       # Ollama HTTP client (LLM + embeddings)
+│   │   ├── ollama_client.py       # Ollama HTTP client (LLM generation)
 │   │   ├── graph_builder.py       # NetworkX entity graph
 │   │   ├── hardware_probe.py      # Live CPU/GPU/volume/NIC/chassis detection
 │   │   ├── resource_governor.py   # RAM/CPU throttling for the worker
@@ -659,7 +659,7 @@ Intelligent-Digital-Forensic-AI-Assistant/
 │           ├── EvidencePage · ArtifactsPage · ComparisonPage
 │           ├── InvestigatePage · ContradictionsPage · SummaryPage
 │           ├── EntityMapPage · ProfilePage
-│           ├── TimelinePage · AnomalyPage · GeoMapPage
+│           ├── TimelinePage · AnomalyPage · RetiredRoute (geomap)
 │           ├── WatchlistPage · CredentialsPage · NotesPage
 │           ├── AuditPage · ReportsPage · QueuePage
 │           ├── SystemHealthPage · SettingsPage
@@ -681,17 +681,16 @@ Intelligent-Digital-Forensic-AI-Assistant/
 | Limitation | Detail |
 |------------|--------|
 | **Truncated disk images** | A raw/EWF image shorter than the volume it declares cannot be walked — The Sleuth Kit needs the `$MFT`, which lives past EOF. The app now **detects this before starting** and reports the real TSK diagnostic instead of silently reporting "0 artifacts"; evidence in that state is marked `Failed`, not `Indexed`. Partial recovery is still attempted. The image itself must be re-acquired. |
-| **Stale import in `vector_store.py`** | `requirements.txt` intentionally omits `torch`/`sentence-transformers`, but `backend/modules/vector_store.py` still contains a top-level import of them. On a machine where those packages are absent, this raises `ImportError` at startup. It is masked on machines that happen to have them installed. Tracked in `AGENTS.md` §2 / B6. |
-| **Slow path when Ollama is offline** | A query issued while Ollama is not running waits for the generation timeout (~25 s) before reporting the problem. `GET /api/status` will tell you Ollama's state first. |
+| **Optional embedding stack** | The backend starts without `torch`/`sentence-transformers` because they are imported lazily. Indexing and semantic search require a compatible local `all-MiniLM-L6-v2` installation; missing dependencies are reported as an embedding error rather than a startup failure. |
 | **Local LLM quality** | Response accuracy is bounded by the capability of the selected Ollama model. Smaller models (3B parameters) may hallucinate or miss nuanced connections. |
 | **Windows commit limit** | If Ollama fails with `unable to allocate CUDA0 buffer` / `exit status 2`, the cause is usually a disabled or undersized **pagefile**, not VRAM. Enable *Automatic managed pagefile size* and reboot. |
 | **Single-node deployment** | The system is designed for a single investigator workstation. It is not load-balanced or horizontally scalable. |
 | **SQLite concurrency** | SQLite does not support high write concurrency. Heavy parallel ingestion jobs may queue. Suitable for teams of 1–5 investigators. |
 | **Disk image support** | `pyewf` and `pytsk3` require native C libraries. On macOS, installation can fail on certain configurations. On Linux, install `libewf-dev ewf-tools` first. Fallback to file-based evidence is automatic. |
-| **macOS GPU reporting** | The hardware probe reports no GPU on macOS rather than guessing. NVIDIA/AMD/Apple Silicon details come from Ollama and the System Information panel. |
+| **macOS GPU reporting** | The hardware probe reports no GPU on macOS rather than guessing. GPU availability for transcription is determined separately by the installed torch build. |
 | **No email notifications** | Password reset and workflow notifications rely on Admin action rather than SMTP email, by design (air-gapped deployment). |
 | **Whisper speed** | Audio transcription via Whisper is slow without a CUDA-capable GPU. Large audio files may take several minutes to ingest. |
-| **Map data** | The geographic map requires a Leaflet tile server or internet access for map tiles. In a fully air-gapped environment, a local tile server must be configured. |
+| **Geographic map** | The former map route is retired. EXIF coordinates remain available; IP entities are reported without external geolocation until a vetted offline map and local geolocation bundle are added. |
 | **spaCy NER accuracy** | NER quality depends on the language model. Highly technical forensic jargon, code, or non-English content may not be correctly classified. |
 
 ---
@@ -895,7 +894,7 @@ Digital forensics investigations traditionally require investigators to manually
 | **React + FastAPI** | Separation of concerns between presentation and computation; FastAPI's async capabilities suit the long-running ingestion pipeline. |
 | **Background worker** | Evidence ingestion can take minutes. A background queue prevents API timeouts and allows real-time progress reporting over WebSockets. |
 | **Role-based access** | Multi-user investigations require controlled access. The four-tier role model mirrors real-world forensics team structures (Admin / Investigator / Analyst / Viewer). |
-| **No PyTorch in the dependency set** | Local embedding models exhausted RAM on modest forensic hardware; Ollama serves embeddings instead, keeping the air-gap kit installable. |
+| **Lazy local embeddings** | `all-MiniLM-L6-v2` keeps the existing 384-dimensional index contract; PyTorch and SentenceTransformers load only when embedding is needed so the backend can start without them. |
 | **Live hardware detection over a static spec** | A forensics workstation gains and loses devices between cases, so hardware and attached volumes are re-probed whenever the device fingerprint changes. |
 
 ### Academic References

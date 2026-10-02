@@ -49,11 +49,38 @@ def check(label, cond, detail=""):
           f"{(' — ' + str(detail)) if detail else ''}")
 
 
-# The recorded per-query score ranges on this corpus. Section F asserts the
-# floor sits in the gap between the two clusters, so these are not decoration:
-# they are the reason the constant is what it is.
-OBSERVED_NOISE_MAX = 0.138   # "hi" / "hello", 7 chunks each
-OBSERVED_GENUINE_MIN = 0.395  # "suspect behind darknode.io", 7 chunks
+# The measured score distribution at the CURRENT chunking (700/120), on the
+# Nightingale raw-image corpus, with ground truth taken by CONTENT — every file
+# containing the needle, never a filename remembered by hand (§31.4: all six of
+# v1's fixture failures were a fact present in two files).
+#
+# These REPLACED a pair that pinned the floor into a gap between two clusters on
+# a different corpus. Re-measured, there is no gap: the regions overlap, and
+# 0.225 < 0.253 means a real question about the exfiltration volume scores
+# BELOW the gibberish string `asdf`. So the old §F could not be re-tuned to
+# stay true, only re-derived — §31.6 said so before the work started.
+#
+# 12 questions, 8 fillers, 12 artifacts. A small sample, and recorded as such.
+MEASURED_REAL_ANSWER_MIN = 0.225     # "How much data was exfiltrated...?"
+MEASURED_REAL_ANSWER_MAX = 0.636     # "How much money went to Halcyon...?"
+MEASURED_FILLER_MAX = 0.253          # "asdf"
+MEASURED_FILLER_MIN = 0.065          # "what is duck?"
+
+# The measured filler score that sits ABOVE every real answer-bearing chunk. This
+# one number is the whole argument for the lexical gate: if the floor were ever
+# raised above it, `asdf` would be accepted while a real question was rejected,
+# which is the filter working exactly backwards. Section F asserts the floor
+# stays below it.
+MEASURED_OVERLAP = MEASURED_FILLER_MAX
+
+# The three questions whose answer-bearing chunk shares NO content word with the
+# question, because the investigator's wording differs from the evidence's:
+#     "How much data was exfiltrated...?"  vs  "412.8 MB via exfil.darknode.io"
+# "exfiltrated" is not "exfil", so not one token matches. Their cosine scores
+# are 0.225 / 0.362 / 0.269 — all below MEASURED_FILLER_MAX, so a per-chunk
+# lexical gate would drop the answer and a cosine floor alone cannot catch them
+# either. They are the reason the gate is a query-level verdict.
+MEASURED_SYNONYM_COSINES = (0.225, 0.362, 0.269)
 
 
 def _chunks(scores, text="evidence excerpt"):
@@ -195,6 +222,8 @@ def main():
 
     def _fake(**kw):
         calls.update(kw)
+        # "noise" as query AND chunk text -> lexical coverage 1.0 (gate passes),
+        # but cosine 0.138 < floor 0.15 -> all dropped by the floor.
         return _chunks([0.138] * 8, text="noise")
 
     real_gc = rag_engine.get_graph_context
@@ -216,7 +245,7 @@ def main():
         rag_engine.ollama_diagnostic = lambda: {
             "running": True, "model_ready": True, "available": True, "models": []}
         r = rag_engine.run_rag_query(
-            query="hi", case_id="c", qdrant_path="irrelevant",
+            query="noise", case_id="c", qdrant_path="irrelevant",
             cases_dir="data/cases", evidence_id=None, asked_by="x",
             conversation_history=None)
     finally:
@@ -266,13 +295,16 @@ def main():
     # ── F. the constant is pinned to the measurement ─────────────────────
     print("\n=== F. the floor sits in the measured gap, and stays there ===")
     f = rag_engine.RETRIEVAL_SCORE_FLOOR
-    check("the floor is above every score the 'hi' queries produced "
-          f"(max {OBSERVED_NOISE_MAX})", f > OBSERVED_NOISE_MAX, f)
-    check("the floor is at or below every score a genuine match produced "
-          f"(min {OBSERVED_GENUINE_MIN})", f <= OBSERVED_GENUINE_MIN, f)
-    check("it is inside the gap rather than on a round number",
-          OBSERVED_NOISE_MAX < f < OBSERVED_GENUINE_MIN,
-          f"{OBSERVED_NOISE_MAX} < {f} < {OBSERVED_GENUINE_MIN}")
+    check("the floor is below the measured filler maximum "
+          f"({MEASURED_FILLER_MAX})", f < MEASURED_FILLER_MAX, f)
+    check("the floor is at or below the measured genuine minimum "
+          f"({MEASURED_REAL_ANSWER_MIN})", f <= MEASURED_REAL_ANSWER_MIN, f)
+    check("the measured ranges overlap: filler max > genuine min",
+          MEASURED_FILLER_MAX > MEASURED_REAL_ANSWER_MIN,
+          f"filler max {MEASURED_FILLER_MAX} > genuine min {MEASURED_REAL_ANSWER_MIN}")
+    check("the floor is below both, making it a backstop not a separator",
+          f < MEASURED_REAL_ANSWER_MIN and f < MEASURED_FILLER_MAX,
+          f"floor {f} < min({MEASURED_REAL_ANSWER_MIN}, {MEASURED_FILLER_MAX})")
     check("retrieval is wider than the floor could ever keep from one page",
           rag_engine.RETRIEVAL_TOP_K > 1, rag_engine.RETRIEVAL_TOP_K)
 

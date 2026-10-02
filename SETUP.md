@@ -120,10 +120,11 @@ python -m spacy download en_core_web_lg    # then move the tarball into vendor/p
 
 Without `vendor/`, setup installs from PyPI and needs internet.
 
-> `torch` is **not** in `requirements.txt` and is imported lazily, so the backend starts
-> and runs without it. It is only needed for the optional GPU-accelerated transcription
-> path. If you want that, install a **CUDA** build of torch yourself — the CPU build
-> cannot drive a GPU and the system-health page will tell you so.
+> `torch` and `sentence-transformers` are **not** in `requirements.txt` and are imported
+> lazily, so the backend starts and health checks run without them. Indexing and semantic
+> search require a compatible local `all-MiniLM-L6-v2` embedding stack. A CUDA build of
+> torch can also accelerate transcription; a CPU build cannot drive a GPU, and the
+> system-health page will report that honestly.
 
 ---
 

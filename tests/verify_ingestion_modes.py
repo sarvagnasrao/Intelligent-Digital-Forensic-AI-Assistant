@@ -177,6 +177,7 @@ def main():
             "elapsed": elapsed,
             "ticks": len(ticks),
             "text_len": len(BODY),
+            "mode": mode,          # the resolved mode dict with all knobs
         }
 
         print(f"  result: status={ev.status} job={job.status} "
@@ -219,12 +220,19 @@ def main():
     print(f"  normal   chunks  : {results['normal']['chunks']}")
     print(f"  accurate chunks  : {results['accurate']['chunks']}")
 
-    check("accurate yields more chunks than fastest",
-          results['accurate']['chunks'] > results['fastest']['chunks'],
-          f"{results['accurate']['chunks']} vs {results['fastest']['chunks']}")
-    check("fastest yields fewer chunks than normal",
-          results['fastest']['chunks'] <= results['normal']['chunks'],
-          f"{results['fastest']['chunks']} vs {results['normal']['chunks']}")
+    # Chunking is now GLOBAL (700/120 for all profiles) — profiles no longer
+    # trade retrieval coverage for speed. They differ in OCR, Whisper size,
+    # deleted-file recovery and embed_batch. See §31.7 item 5.
+    check("all profiles yield the same chunk count (global chunking)",
+          results['fastest']['chunks'] == results['normal']['chunks']
+          == results['accurate']['chunks'],
+          f"{results['fastest']['chunks']} vs {results['normal']['chunks']} vs "
+          f"{results['accurate']['chunks']}")
+    check("profiles still differ in the knobs that remain per-profile",
+          results['fastest']['mode']['ocr'] is False
+          and results['normal']['mode']['ocr'] is True
+          and results['accurate']['mode']['ocr'] is True,
+          "OCR differs across profiles")
 
     # The chunk counts must be consistent with the configured chunk sizes,
     # which is what proves the mode actually reached the pipeline rather than

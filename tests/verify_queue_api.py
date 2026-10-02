@@ -168,11 +168,16 @@ def main():
         check("default_mode is a valid key",
               r.json().get("default_mode") in
               ("fastest", "normal", "accurate"), r.json().get("default_mode"))
+        # Chunking is now global (700/120) — profiles differ in OCR, Whisper,
+        # deleted-file recovery, and embed_batch. The "least/most work" test
+        # must reflect the knobs that actually differ, not the old chunk-size proxy.
         check("fastest does the least work, accurate the most",
-              modes[0]["effective"]["chunk_size"] >
-              modes[2]["effective"]["chunk_size"],
-              f"{modes[0]['effective']['chunk_size']} vs "
-              f"{modes[2]['effective']['chunk_size']}")
+              modes[0]["effective"]["ocr"] is False
+              and modes[0]["effective"]["include_deleted"] is False
+              and modes[2]["effective"]["ocr"] is True
+              and modes[2]["effective"]["include_deleted"] is True
+              and modes[0]["effective"]["embed_batch"] > modes[2]["effective"]["embed_batch"],
+              "fastest: no OCR, no deleted-recovery, larger batch; accurate: OCR, deleted-recovery, smaller batch")
 
         # ── GET /queue/system-info ─────────────────────────────────────────
         print("\n=== GET /api/queue/system-info ===")

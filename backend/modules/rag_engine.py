@@ -182,21 +182,176 @@ def _elide(text: str, max_chars: int) -> tuple[str, int]:
 #     operators and hosts            0.465 - 0.476
 #     suspect behind darknode.io     0.395 - 0.476
 #
-# There is a GAP between 0.138 and 0.395 with nothing in it, and the floor
-# sits in that gap rather than on a round number. Two caveats, stated so the
-# next person does not treat this as settled:
+# There was a GAP between 0.138 and 0.395 on that corpus and the floor sat in
+# it. Measured on a second corpus the gap was GONE (see below), so this
+# constant has been re-derived rather than re-tuned.
 #
-#   * the sample is small and several entries are near-duplicates of "hi";
-#   * cosine similarity is not calibrated across embedding models, so this
-#     threshold is a property of `all-MiniLM-L6-v2` over this corpus and would
-#     need re-measuring if the embedder ever changes (it must not change
-#     casually anyway — see B15, 384-dim is load-bearing for every existing
-#     collection).
+# Re-measured at the current chunking (700/120), on the Nightingale raw-image
+# corpus, with ground truth by content rather than by remembered filename:
+#
+#     real answer-bearing chunk, best in file   0.225 - 0.636
+#     filler query, best chunk in the case      0.065 - 0.253
+#
+# The regions OVERLAP: 0.225 (a real question about the exfiltration volume)
+# is below 0.253 (`asdf`, four letters of nothing). So **no cosine threshold
+# separates them on this corpus** — at any value. That is §31.6's finding
+# confirmed under the new chunking, and it is why the floor is no longer the
+# primary filter.
+#
+# Note what the new chunking did to the numbers: the real-question minimum rose
+# from 0.119 to 0.225 and the genuine maximum fell from 0.587 to 0.636's
+# neighbourhood. Smaller chunks are more focused, so they score closer to the
+# question they actually answer. The distribution moves when the chunking
+# moves, which is why the floor had to be re-derived and not adjusted.
+#
+# So the floor is now a BACKSTOP and the filter proper is lexical
+# (`QUERY_TERM_FLOOR` below). 0.15 sits below every real answer-bearing chunk
+# the measurement found (min 0.225) with room for corpus-to-corpus variation,
+# and above the five filler queries whose best chunk scores 0.065-0.188. It
+# is deliberately NOT between the two clusters, because there are no two
+# clusters.
+#
+# Caveats, stated so nobody treats this as settled:
+#   * 12 questions and 8 fillers over 12 artifacts is a small sample;
+#   * cosine similarity is calibrated neither across embedding models nor
+#     across corpora, which is exactly the fragility that cost this constant
+#     its original justification. The lexical gate exists to carry the load
+#     precisely so that this number does not have to.
 #
 # It is exposed in `prompt_stats` so a surprising answer can be explained
 # rather than guessed at.
 RETRIEVAL_TOP_K = 14
-RETRIEVAL_SCORE_FLOOR = 0.25
+RETRIEVAL_SCORE_FLOOR = 0.15
+
+# ---------------------------------------------------------------------------
+# The lexical half of the filter
+# ---------------------------------------------------------------------------
+# What a cosine threshold cannot do is notice that a question and a corpus
+# share NO WORDS AT ALL. Cosine similarity between two embeddings is always
+# positive and always noisy, so "meaningless" never scores 0 — `asdf` scored
+# 0.253 against a case containing a firewall log and a deleted ledger. That is
+# why a floor anywhere near 0.25 accepted gibberish while rejecting a genuine
+# question at 0.225, i.e. the precise inversion of the filter's purpose.
+#
+# Measured over the same corpus, the two classes separate perfectly on a signal
+# that is not a calibrated threshold:
+#
+#     8 of 8 filler queries        lexical coverage 0.000, unanimously
+#     real answer-bearing chunk    lexical coverage 0.000 - 0.800
+#
+# So the threshold is ZERO SHARED TERMS, which is a statement about the query
+# and the evidence rather than a number fitted to one corpus. That robustness is
+# the whole argument for it: a cosine constant is a property of one corpus,
+# while "these two strings share no content word" is a fact about them.
+#
+# WHY IT IS A QUERY-LEVEL GATE AND NOT A PER-CHUNK ONE
+# ----------------------------------------------------
+# The obvious implementation — keep a chunk only if it shares a term with the
+# question — was measured before being written, and it is wrong. Of 12 real
+# questions, 3 have an answer-bearing chunk with lexical coverage of exactly
+# 0.000, because the investigator's words differ from the evidence's:
+#
+#     "How much data was exfiltrated, and through which host?"
+#         vs  "sent: spools/ledger_202411.zip 412.8 MB via exfil.darknode.io"
+#
+# Not one token matches: "exfiltrated" is not "exfil". A per-chunk gate drops
+# the answer, and a sweep over every (floor, min-coverage) pair confirmed there
+# is no setting that keeps all 12 while rejecting all 8 — the best trade costs
+# the exfiltration volume, the single most important fact in the case.
+#
+# At the query level the same three cases are fine, because the question as a
+# whole still overlaps *something* in the case. So the gate asks one question
+# of the whole retrieval — does this question share any content word with
+# anything the case holds? — and a "no" is an honest finding about the SEARCH,
+# not about the evidence: the app can say the wording shares nothing with the
+# indexed text, and must not say the evidence is clean.
+QUERY_TERM_FLOOR = 0.0
+
+# Stopwords, for the same reason `context()` trims conversation history: they
+# appear in nearly every chunk and so carry no discriminative signal at all. A
+# query made only of these — "hi", "what is it?" — has NO content terms, which
+# is a genuinely different state from "the query has terms and none of them
+# match". `query_lexical_stats` reports term_count == 0 for it and the gate
+# declines to fire, because declining to act when there is nothing to compare
+# is correct. Conflating the two states would make "hi" and "asdf"
+# indistinguishable, which is the same conflation that made a missing score
+# read as a failed one in `apply_relevance_floor`.
+_QUERY_STOPWORDS = frozenset("""
+    a an the is are was were be been being do does did has have had of in on at
+    to from by for with about into through over under and or but if then than
+    so as it its this that these those i you he she we they them his her their
+    our my me us who whom whose which what when where why how all any both each
+    more most other some such no not only own same too very can will just also
+    there here am up out down off again further once
+""".split())
+
+# Split on EVERY non-alphanumeric run. Evidence identifiers are full of
+# separators and a tokeniser that preserved them would fail to match a question
+# that spells the same name with spaces:
+#     operator_handles        -> operator, handles
+#     m.webb@northwind-corp.com -> webb, northwind, corp, com
+#     darknode.io             -> darknode, io
+# Single characters are dropped as noise, and purely numeric tokens with them:
+# a bare "4471" or a bare "412" is not what a question is asking about.
+_QUERY_TOKEN = re.compile(r"[^a-z0-9]+")
+
+
+def content_terms(text: str) -> set:
+    """Lowercase alphanumeric runs, minus stopwords, 1-char runs and bare digits.
+
+    Deliberately simple and inspectable. A cleverer scorer would be harder to
+    argue about the *shape* of, and easier to get wrong in a way that shows up
+    only as a threshold that happens to fit this corpus.
+    """
+    out = set()
+    for raw in _QUERY_TOKEN.split((text or "").lower()):
+        if len(raw) < 2 or raw in _QUERY_STOPWORDS or raw.isdigit():
+            continue
+        out.add(raw)
+    return out
+
+
+def lexical_coverage(query: str, chunk_text: str) -> tuple[float | None, int]:
+    """Fraction of the query's content terms that appear in the chunk.
+
+    The denominator is the QUERY's terms, never the chunk's. A chunk is 700
+    characters and a question is short, so a chunk-side denominator would score
+    every chunk near zero and the measure would say nothing at all.
+
+    Returns (fraction, query_term_count). `fraction` is None when the query has
+    no content terms — "unmeasurable", which is not the same claim as zero.
+    """
+    qt = content_terms(query)
+    if not qt:
+        return None, 0
+    ct = content_terms(chunk_text)
+    return len(qt & ct) / len(qt), len(qt)
+
+
+def query_lexical_stats(query: str, chunks: list) -> tuple[float, int]:
+    """(best coverage over `chunks`, query term count).
+
+    Best over the WHOLE retrieval, not per chunk, which is what makes the gate
+    a query-level verdict — see the note above the constant.
+    """
+    best, terms = 0.0, len(content_terms(query))
+    for c in chunks or []:
+        frac, n = lexical_coverage(query, (c or {}).get("text") or "")
+        if frac is not None and frac > best:
+            best = frac
+    return best, terms
+
+
+def query_shares_no_terms(query: str, chunks: list,
+                          floor: float = QUERY_TERM_FLOOR) -> tuple[bool, float, int]:
+    """True when the question shares no content word with anything retrieved.
+
+    Deliberately requires terms to exist: a stopword-only query has nothing to
+    compare, so the gate reports False (does not fire) rather than treating the
+    absence of terms as the absence of a match.
+    """
+    best, terms = query_lexical_stats(query, chunks)
+    return (terms > 0 and best <= floor), best, terms
 
 
 def _unanswered(answer: str,
@@ -206,14 +361,26 @@ def _unanswered(answer: str,
                 chunks_retrieved: int,
                 chunks_below_floor: int,
                 graph_ctx: str,
-                elapsed_ms: int) -> dict:
+                elapsed_ms: int,
+                lex_max: float | None = None,
+                lex_terms: int = 0) -> dict:
     """A result dict for a question that was never put to the model.
 
-    Both early returns in `run_rag_query` are this shape, and they exist for the
-    same reason: there is no evidence in hand, so there is nothing to ground an
-    answer in, and calling the model anyway produces prose that *looks* like a
+    All three early returns in `run_rag_query` are this shape, and they exist for
+    the same reason: there is no evidence in hand, so there is nothing to ground
+    an answer in, and calling the model anyway produces prose that *looks* like a
     finding. The honest statement is made here, in the app's own voice, and the
     model is not asked at all.
+
+    The three are genuinely different situations, and the caller must be able to
+    tell them apart, because each has a different next step for the operator:
+    the search faulted; the search ran and the floor dropped everything; or the
+    question shares no vocabulary with the case at all. Collapsing any two of
+    them would report "nothing matched" for a case whose evidence was never read.
+
+    `lex_max` / `lex_terms` are reported on every early return rather than only
+    the lexical one, so `prompt_stats` keeps a stable shape. A key present on
+    only one branch is a key a caller has to remember to check for.
 
     This is also the cheap path. A grounded answer costs a 13,000-token prefill
     on CPU — measured at 165 s — and this state is reached by exactly the
@@ -231,6 +398,8 @@ def _unanswered(answer: str,
             "relevance_floor": RETRIEVAL_SCORE_FLOOR,
             "retrieval_failed": retrieval_failed,
             "retrieval_error": retrieval_error,
+            "lexical_coverage_max": lex_max,
+            "query_terms": lex_terms,
             "excerpts": 0,
             "excerpts_trimmed": 0,
             "chars_elided": 0,
@@ -594,6 +763,20 @@ def run_rag_query(
     # the pre-floor count is what lets prompt_stats tell "retrieved nothing"
     # apart from "retrieved 14 and kept none", which are different findings.
     chunks_retrieved = len(chunks)
+
+    # The lexical half of the filter runs on the PRE-floor chunks, deliberately.
+    #
+    # Applying it after the floor would couple the two signals: the floor can
+    # empty the list, and an empty list has coverage 0.000, so a query whose
+    # answer chunk merely scored low would then be told its wording shares
+    # nothing with the case. That is a different finding, produced by the wrong
+    # measurement, and it is the §18 failure one layer down — a confident true-
+    # shaped message that is not what happened. Each filter reads the same
+    # retrieval, independently.
+    # returns all three, so it is called once; computing the stats separately and
+    # then again inside the gate would be two measurements of one thing.
+    lex_tripped, lex_max, lex_terms = query_shares_no_terms(query, chunks)
+
     chunks, chunks_below_floor = apply_relevance_floor(chunks)
 
     if retrieval_error:
@@ -614,6 +797,45 @@ def run_rag_query(
             chunks_below_floor=0,
             graph_ctx="",
             elapsed_ms=int((time.time() - start_time) * 1000),
+            lex_max=lex_max,
+            lex_terms=lex_terms,
+        )
+
+    if lex_tripped:
+        # The search RAN, and the reason there is nothing to answer from is not
+        # that the evidence is absent — it is that this question and the
+        # evidence share no content word whatsoever. Cosine cannot see that: two
+        # embeddings are never orthogonal, so gibberish scores somewhere around
+        # 0.25 against a real corpus and a floor cannot separate it (see
+        # QUERY_TERM_FLOOR above for the measurement).
+        #
+        # This must NOT be phrased as an absence of evidence. "The evidence
+        # contains nothing about X" is the sentence that clears a suspect, and
+        # the truth here is far narrower and much more fixable: the operator's
+        # wording is not the evidence's vocabulary.
+        shown = ", ".join(sorted(content_terms(query))[:8])
+        return _unanswered(
+            "Your question shares no wording with anything indexed in this "
+            f"case, so retrieval had nothing to match on. It was compared "
+            f"against {chunks_retrieved} passages and not one contained a "
+            f"single one of the {lex_terms} searchable terms in your "
+            f"question ({shown}).\n\n"
+            "This is not a finding that the case is clean — it is a finding "
+            "about the wording. Evidence usually holds the specific strings "
+            "worth asking about: a name, an email address, an IP, a domain, a "
+            "handle, a case number or a filename. Ask using those and the same "
+            "passages become searchable. The model was not asked, because "
+            "there was nothing grounded for it to read.\n\n"
+            "Nothing in this case has been examined against this question, and "
+            "nothing in it has been ruled out.",
+            retrieval_failed=False,
+            retrieval_error=None,
+            chunks_retrieved=chunks_retrieved,
+            chunks_below_floor=chunks_below_floor,
+            graph_ctx="",
+            elapsed_ms=int((time.time() - start_time) * 1000),
+            lex_max=lex_max,
+            lex_terms=lex_terms,
         )
 
     if not chunks:
@@ -662,6 +884,8 @@ def run_rag_query(
             chunks_below_floor=chunks_below_floor,
             graph_ctx="",
             elapsed_ms=int((time.time() - start_time) * 1000),
+            lex_max=lex_max,
+            lex_terms=lex_terms,
         )
 
     # Step 2: Get graph context
@@ -708,6 +932,13 @@ def run_rag_query(
         conv_context=conv_context,
         budget_tokens=budget
     )
+
+    # Reported on the success path too, so `prompt_stats` has one shape whichever
+    # way the query ended. §29's rule: a value recorded on some branches and not
+    # others is a value a caller cannot rely on.
+    prompt_stats["chunks_below_floor"] = chunks_below_floor
+    prompt_stats["lexical_coverage_max"] = lex_max
+    prompt_stats["query_terms"] = lex_terms
 
     # Step 6: Call Ollama.
     #

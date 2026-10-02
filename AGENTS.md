@@ -13,16 +13,28 @@
 > window, which was a reporting-only knob and never a control (B27)**,
 > **§21 a health probe that reported 0 indexes for indexed cases (B28)**,
 > **§23 an Archive button that worked perfectly and did nothing (B29)**,
-> **§24/§26/§29/§30 the raw-image test and the audit pass (B30–B33)**, and
-> **§31 the cross-platform performance + geo-map plan (PLANNED, NOTHING
-> APPLIED)**.
+> **§24/§26/§29/§30 the raw-image test and the audit pass (B30–B33)**,
+> **§31 the cross-platform performance + geo-map plan (measurement complete;
+> items 1–3 applied)**, and **§32 the provenance guard — the first product
+> change of that programme**.
 > See §6 and §12 for the forensic-image fixes.
 >
-> 🔴 **START AT §31.** It is the newest work, it is unapplied, and it carries a
-> retraction: §24's diagnosis of why the bot missed cross-file relationships
-> (§24 "the relevance floor") and its recommended fix (remove `t[:1000]`) were
-> both **wrong**, and §31.3 measures why. §31 also records six decisions the
-> operator took and **seven next actions in §31.7.**
+> 🔴 **START AT §31.7, then §32.** §31.7 is the ordered list of what is left and
+> what is done; §32 is what just landed. §31 carries a **retraction**: §24's
+> diagnosis of why the bot missed cross-file relationships (§24 "the relevance
+> floor") and its recommended fix (remove `t[:1000]`) were both **wrong**, and
+> §31.3 measures why. §31 also records six decisions the operator took.
+>
+> 🔴 **§31.4 and §31.6 are measurements that constrain your next decision, not
+> background.** §31.6 says the relevance floor has **no gap to sit in** on a real
+> corpus — it rejects a genuine evidence question and accepts `asdf`. That is a
+> decision waiting on the operator, and it is item 4.
+>
+> **Read §28 before writing "verified discriminating".** It is **two**
+> measurements — that the revert *applied*, and that the suite went red — and §32
+> records eleven instrument bugs, **five of them in a revert harness**, each of
+> which produced a confident wrong verdict. Two verdicts said the guard was
+> decorative when it was real.
 >
 > **Read §20 before touching `ollama_client`.** The window is now *sent* on every request.
 > `ollama_num_ctx` was a number that only fed the budget arithmetic, so raising it in `.env`
@@ -116,7 +128,8 @@ backend/
   modules/
     forensic_ingestion.py   ★ pyewf/pytsk3 walk + per-file extraction  (has bugs, §6)
     rag_engine.py           retrieval + prompt + citation processing
-    vector_store.py         Qdrant wrapper  (🔴 stale torch import, §2)
+    vector_store.py         Qdrant wrapper  (B10/B30, §32 provenance guard)
+    index_provenance.py   ★ per-case index signature — refuse a mismatch (§32)
     hardware_probe.py       ★ live hardware + device inventory (CPU/GPU/volumes/NICs)
     gpu_telemetry.py        ★ live GPU utilisation + VRAM via NVML/ctypes (§16)
     ollama_client.py        Ollama HTTP client
@@ -502,20 +515,107 @@ PYTHONPATH=. python tests/verify_vector_store.py       #  17 assertions, ~10 s
 PYTHONPATH=. python tests/verify_cpu_sampler.py        #   9 assertions, ~10 s
 PYTHONPATH=. python tests/verify_gpu_telemetry.py      # 171 assertions, ~20 s
 PYTHONPATH=. python tests/verify_eta.py                #  59 assertions, ~10 s
-PYTHONPATH=. python tests/verify_file_formats.py       # 153 assertions, ~15 s
+PYTHONPATH=. python tests/verify_file_formats.py       # 161 assertions, ~15 s
 PYTHONPATH=. python tests/verify_prompt_budget.py      #  85 assertions, ~30 s
 PYTHONPATH=. python tests/verify_service_health.py     # 209 assertions, ~40 s
+PYTHONPATH=. python tests/verify_provenance.py        #  79 assertions, ~30 s (§32)
+PYTHONPATH=. python tests/verify_gate_parser.py       #  15 assertions, <1 s (§21)
 PYTHONPATH=. python tests/verify_evidence_archive.py   #  38 assertions, ~15 s
+PYTHONPATH=. python tests/verify_retrieval_integrity.py # 36 assertions, ~30 s
+PYTHONPATH=. python tests/verify_identity_attribution.py # 19 assertions, ~15 s
 PYTHONPATH=. python tests/verify_live_stack.py         #  26 assertions, ~90 s
+PYTHONPATH=. python tests/verify_provenance_discriminating.py  # ~4 min, §32
 ```
 
 Windows: `$env:PYTHONPATH="."` then `venv\Scripts\python.exe tests\<name>.py`.
 
-The first **fourteen** are self-contained; **878 assertions total**. `verify_live_stack.py`
-is the exception — it needs `ollama serve`, uvicorn on `:8000` and Vite on
-`:3000` already running, and it is the only one that crosses a real socket
-(see §14). All of them clean up every row and per-case Qdrant directory they
-create, and are safe to re-run.
+### Run them all: `tests/run_gate.py`
+
+```bash
+PYTHONPATH=. python tests/run_gate.py     # servers STOPPED, ~6 min
+```
+
+`run_gate.py` runs **seventeen** suites and tests its own parser
+(`verify_gate_parser.py`, in the list below).
+
+**Use this rather than a shell one-liner.** §21 TRAP 8 was a bug in an ad-hoc gate:
+its summary regex fell through to a `FAILED: <description>` line — the *list of
+failures*, not the count — so `[int]` on an empty match gave `0`, and a suite with
+**15 failures printed as `0 passed / 0 failed`**. A red run came out green, and a
+status report was written from it before anyone noticed.
+
+> **A gate that reads 0 for a script which did not pass is worse than no gate: it
+> converts a red suite green.** A summariser is a program and has to be tested like
+> one.
+
+`run_gate.py` encodes four rules, each because its absence was a bug:
+
+| rule | why |
+|---|---|
+| both summary shapes parse explicitly | one alternation matched a *reason* line |
+| unreadable counts → `??`, never `0` | "not measured" is not "passed" |
+| non-zero exit + zero reported failures → `ERR` | a broken instrument reported as a pass |
+| **the total is refused if any script is invalid** | and the per-suite lines are printed so the total reconciles against its own parts |
+
+TRAP 8's fix was previously worth having but was never committed, so the trap it
+described could recur with the next one-liner. **It is now code, in the repo, with
+its own docstring explaining why each rule exists.**
+
+#### 🔴 The gate's own first run reported six healthy suites as broken
+
+Worth recording, because rule 4 earned its keep on its very first outing and for a
+reason nobody had designed for it.
+
+Six of the sixteen suites print `  9 passed, 0 failed` — **count first**, comma
+separated. The other ten print `PASSED: 209    FAILED: 0` — **word first**. The
+parser handled only the second shape, so on its first run it reported:
+
+```
+??  verify_cpu_sampler.py     0 passed  0 failed  <- summary unreadable
+??  verify_forensic_failure.py ...
+??  verify_gpu_telemetry.py   ...  ??  verify_job_stop.py   ...
+??  verify_prompt_budget.py   ...  ??  verify_vector_store.py ...
+GATE COULD NOT BE TOTALLED: <all six>
+```
+
+Every one of those six **passed**, and each had printed its count.
+
+> **A summariser that cannot read a summary reports exactly the same thing whether
+> the suite passed or crashed.** That is why `??` is a loud state and never `0` —
+> and the honest reading of that output is "six suites are broken", which would have
+> sent the next agent to debug six healthy scripts.
+
+This is §22's theme committed for the fourth time, now in the tool written to catch
+it. What made it recoverable is that rule 4 **refused to total** rather than
+reporting the ten it could read as a pass. §23's precedent was the mirror image: an
+ad-hoc gate converting red to green. Here the new code caught a defect in itself.
+
+The parser now collects every candidate summary with its position and takes the
+**last** one, because the summary is printed last — and it handles the two halves
+of shape B independently, because they are not guaranteed to share a line.
+
+**`tests/verify_gate_parser.py` (15 assertions) is in the gate, and the gate tests
+its own summariser.** That is the point of §21's rule taken literally. It covers
+both shapes, failures counted rather than swallowed, per-assertion `FAIL` lines not
+mistaken for a summary, and **the four inputs that must return `None` rather than
+`0`** — empty output, a traceback, a `FAIL` line with no summary, and a summary
+with no numbers.
+
+> The parser test itself shipped a bug on first contact: it split the gate source on
+> a comment that sits *above* `parse()`, so it truncated the wrong part and died with
+> `KeyError: 'parse'` while appearing to test the parser. Same class as the
+> count-first bug one layer up — a marker assumed to be on the right side of the
+> thing it marks. It now splits on the first function *after* the target.
+
+It excludes `verify_live_stack.py` (needs the servers up) and
+`verify_provenance_discriminating.py` — the latter **deliberately reverts
+`vector_store.py` four times**, so it must never run concurrently with suites
+reading that file. Both exclusions are printed, with the reason.
+
+The first **sixteen** are self-contained. `verify_live_stack.py` is the exception —
+it needs `ollama serve`, uvicorn on `:8000` and Vite on `:3000` already running, and
+it is the only one that crosses a real socket (see §14). All of them clean up every
+row and per-case Qdrant directory they create, and are safe to re-run.
 
 > **Run the self-contained ones with the servers stopped.** A backend already
 > running on the same `data/forensic.db` has its own worker thread, and that
@@ -3014,8 +3114,8 @@ For whoever picks this up next, with nothing hidden:
 | **`vendor/python/torch-*.whl`** | 152 MB of dead weight — but §8's caution stands: a CUDA build is what GPU transcription needs. |
 | **Chunk-size half of §19** | raising the window recovered 5.4×; smaller chunks recover the rest, and need a re-index per case. **Now measured and planned — §31.3, and it corrects §24's diagnosis.** |
 | **`cases.py:968`** | `author = "<imported> (imported)"` — the last client-influenced attribution, judged defensible (§24). |
-| 🔴 **§31 plan, unapplied** | cross-platform GPU/CPU/memory efficiency + geo map restoration. Six operator decisions taken, **nothing applied**. Seven ordered next actions in **§31.7**. A re-index of every case is required, and **§31.3 (index provenance) must land first** so a stale index is refused rather than silently searched. |
-| 🔴 **`bench_chunking.py` is red** | exits 1 on 6 fixture checks (§31.4) and reads a truncated corpus (§31.5). **Its recall table must not be quoted.** Fix it first — it gates the §31 decision. |
+| 🔴 **§31 plan, items 1–3 applied** | cross-platform GPU/CPU/memory efficiency + geo map restoration. Six operator decisions taken. **Items 1–2 were measurement (§31.4, §31.6); item 3 shipped the index provenance guard (§32), which is what makes the chunking migration safe.** Items 4–9 unstarted, in order, in **§31.7**. Item 4 (the relevance floor) **needs the operator**. |
+| 🔴 **`bench_chunking.py` is red** | exits 1 on 6 fixture checks (§31.4) and reads a truncated corpus (§31.5). **Its recall table must not be quoted.** Superseded by `bench_chunking2.py`, which exits 0 — use that one. |
 
 ---
 
@@ -3602,12 +3702,14 @@ passed, 0 failed across 15 scripts**, and the per-suite lines reconcile exactly
 
 ---
 
-## 31. Cross-platform hardware efficiency + geo map restoration — **PLAN ONLY, NOTHING APPLIED**
+## 31. Cross-platform hardware efficiency + geo map restoration — measurement complete, items 1–3 applied
 
-> **State of this section: no product code has been changed.** It records the six
-> decisions the operator took on 2026-10-02, the measurements taken to justify
-> them, and — importantly — **one claim of mine that the measurement falsified.**
-> A successor must start at §31.7, not at the plan.
+> **State of this section:** items 1 and 2 (§31.4, §31.6) were **read-only
+> measurement** and changed nothing. Item 3 shipped the index provenance guard and
+> **is product code — see §32.** Items 4 onward are unapplied. This section records
+> the six decisions the operator took on 2026-10-02, the measurements taken to justify
+> them, and — importantly — **one claim of mine that the measurement falsified.** A
+> successor must start at §31.7, not at the plan.
 
 ### 31.1 The operator's brief
 
@@ -3866,9 +3968,10 @@ re-index is fitted to the wrong distribution.
 
 ### 31.7 🔴 NEXT ACTIONS — in this order, for whoever picks this up
 
-**Items 1 and 2 are DONE** (§31.4, §31.6). The operator approved *measure first*,
-and the measurement is complete and **read-only** — nothing in the product has
-been changed. Items 3 onward are unstarted.
+**Items 1, 2 and 3 are DONE** (§31.4, §31.6, §31.10). The operator approved
+*measure first*, and the measurement is complete. Items 1 and 2 were read-only;
+**item 3 changed product code** — the first change of the §31 programme, and the
+one that makes every later step recoverable. Item 4 onward is unstarted.
 
 1. ~~**Fix the benchmark fixture**~~ ✅ **done** — `bench_chunking2.py` exits 0,
    "all fixture checks passed". Three instrument bugs fixed, two claims of mine
@@ -3876,14 +3979,10 @@ been changed. Items 3 onward are unstarted.
 2. ~~**Measure the floor under the new chunking**~~ ✅ **done** — and the answer
    is that **there is no gap at all**, so this is now a decision for the
    operator (option (a) or (b) in §31.6), not a measurement to redo.
-3. **Index provenance guard** — every Qdrant collection must record embedder id,
-   `max_seq_length`, dim, chunking scheme and model version; `search_chunks`
-   must **refuse a mismatch rather than answer from it**. Right now a collection
-   knows nothing about what produced it, and `get_client()` **creates** an empty
-   collection for a case that has none — so a stale case and a re-indexed case
-   are indistinguishable and the stale one returns confidently wrong results.
-   **This is small, safe, and it makes every later step recoverable.** It should
-   land before the migration, not after. **This is the next action.**
+3. ~~**Index provenance guard**~~ ✅ **done** — `backend/modules/index_provenance.py`,
+   wired into `vector_store.py`, surfaced by `service_health.py`, rendered by
+   `SystemHealthPage.jsx`, guarded by **79 assertions**. See §31.10.
+   **This was the next action; it is now the next action's prerequisite.**
 4. **Decide the floor** (§31.6) — re-measure on a large corpus, or move to a
    mechanism with a lexical component. Needs the operator.
 5. **Then** the chunking change (**~700 chars, overlap ~120, global rather than
@@ -3944,3 +4043,230 @@ was told this and chose the other three.
   image, scratch dir under `%TEMP%`, database never opened, **no Qdrant client**.
   Exits 0 with "all fixture checks passed", and self-asserts
   `FWLOGNOV.CSV > 10,000 chars` so a regression to the capped DB column is caught.
+
+---
+
+## 32. The provenance guard (item 3) — every index now says what wrote it
+
+> This is the **first product-code change of the §31 programme.** Items 1 and 2 were
+> read-only measurement. It is deliberately the boring, recoverable step: it changes
+> no retrieval behaviour for any current index, and it makes the chunking migration
+> (§31.7 item 5) *safe to attempt* rather than a leap of faith.
+
+### The gap it closes
+
+Before this, a Qdrant collection recorded **nothing about what produced it**. So:
+
+- a case indexed with a different embedder, or before a chunking change, was
+  **indistinguishable** from a current one;
+- `get_client()` **creates** the directory for a case that has no index, so the
+  search then 404s — an internal error dressed as a question about the evidence;
+- and §31.5's chunking change would have had **no way to tell** a re-indexed case
+  from a stale one, other than remembering which cases were touched.
+
+That last point is why this went first. A migration that cannot be verified is a
+migration whose failures are invisible, and the failure mode here is B30's: a
+confident, true-shaped answer built on an index that no longer matches the query.
+
+### Four states, and refusing to collapse any of them
+
+`index_provenance.compare()` returns exactly one of four, and **no default**:
+
+| state | meaning | what happens |
+|---|---|---|
+| `match` | written by this configuration | searched normally |
+| `mismatch` | a **hard** field differs (embedder id, dim, `max_seq_length`) | **refused**, with both values named |
+| `unattributed` | an index exists, nothing can vouch for it | **served**, with a warning **once per case** |
+| `never_indexed` | no index at all | refused, naming the action |
+
+The split between *refuse* and *serve* is the load-bearing decision:
+
+> **`unattributed` is served on purpose.** Every index written before this change
+> reads that way — **77 cases on this install**. Refusing would lock the operator out
+> of all of them, which is a far worse failure than an unvouched answer, and it would
+> make the obvious remedy ("delete and re-ingest everything") the only way out. It is
+> surfaced as a **count** on the health page instead, which is §22's distinction
+> between a known unknown and an unrecorded one.
+
+### The signature is measured from the loaded model, never read from a table
+
+`describe_embedder()` asks the loaded `SentenceTransformer` for
+`get_sentence_embedding_dimension()` and `max_seq_length`. `EMBEDDER_SPECS` is a
+**declaration**, and `check_declaration()` reports when the two disagree.
+
+This matters more than it looks. If the guard compared a stored record against
+`EMBEDDER_SPECS`, then the table and the model would be one source, and a drift
+between them would be invisible — you would be checking a build against itself.
+Assertion **C5** proves the guard consumes the *measurement*: it patches
+`EMBEDDER_SPECS` to say `1024`/`4096`, and requires that the verdict on both a
+current and a stale index **does not move**, while the disagreement is still
+reported. That test cannot be written against a table-driven implementation, which
+is why it exists rather than a "the table matches the model" assertion.
+
+### Hard fields refuse; the chunking scheme reports
+
+- **`HARD_FIELDS`** = embedder id, `vector_size`, `max_seq_length` → **refuse**.
+  These make vectors from two configurations non-comparable; the refusal is correct.
+- **Chunking scheme** → **report, never refuse**, and it **accumulates** into
+  `chunking_schemes` rather than being overwritten.
+
+Accumulation is the point. A case indexed partly before §31.7 item 5 and partly
+after holds a mosaic of granularities, which is *not broken* but is not the uniform
+index the UI presents it as. Overwriting the label would erase the evidence. Such a
+case reports as `unattributed` — never as `match` with no complaint — which is the
+`'consistent retrieval'` claim failing honestly.
+
+A **corrupt** sidecar and an **absent** one both read `unattributed` (with different
+reasons), never `match`. A record from a **different `signature_version`** reads
+`unattributed` too, because its fields cannot be compared.
+
+### No point total, deliberately
+
+There is **no running point count** in the record. Archiving deletes points while
+leaving the sidecar, so a retained total would drift — §29's `chunk_count` lesson,
+and the reason that column was redefined rather than kept as history.
+
+### 🔴 The guard had two `except: pass` holes in front of it
+
+Wiring a refusal into `search_chunks` does nothing if the callers swallow it. All
+four other call sites were checked:
+
+| site | verdict |
+|---|---|
+| `rag_engine.py:587` | catches, names it, sets `retrieval_failed` — B30's fix, correct |
+| `entities.py:377` | no try at all; propagates. Honest. |
+| `cases.py:466` | **`except Exception: pass`** → fixed |
+| `cases.py:687` | **bare `except: pass`** → fixed |
+
+Both `cases.py` sites fed a prompt builder whose empty-input fallback read
+**"No evidence indexed yet."** — indistinguishable from "this case is clean".
+
+> **This is B30's shape one layer up, and the guard made it reachable.** A refused
+> index fails all five searches, so a **fully indexed** case produced a case summary
+> asserting it had **no evidence**, and a contradiction report that had examined
+> nothing. The exculpatory direction, reached by adding a safety mechanism.
+
+Both now record the first fault and substitute an honest string that names it. The
+bare `except:` also swallowed `KeyboardInterrupt`/`SystemExit`, which is its own
+smaller bug. Note the ordering rule from §29 applied in reverse: **recording a fault
+without rendering it is the same defect**, so the recorded value is interpolated
+into the prompt text rather than logged.
+
+### The health page had to render it, or none of this is visible
+
+`probe_vector_store` gained a `provenance` survey — and `SystemHealthPage.jsx`
+rendered **none** of it, which would have shipped §32 as a record nobody reads.
+It now shows `Provenance: N of M verified`, plus `Unvouched`, `Mixed chunking` and
+`Will be refused` rows when those counts are non-zero.
+
+Two rules held:
+
+- **`null` renders as "not verified", never as `0` verified.** An unmeasured `0`
+  reads as "every index is current" — the opposite of the truth (§16 again).
+- **Only `mismatch` is red.** Unvouched indexes are still searched; showing them in
+  red would train the operator to dismiss the one row that matters. That is §29's
+  "a banner that fires on a whole image trains the operator to dismiss it".
+
+### Verification — 79 assertions, and discriminating by both measurements
+
+`verify_provenance.py` is outcome-only: a fake Qdrant client and a stubbed
+`describe_embedder`, so the provenance module itself is never stubbed. Covers the
+measured-vs-declared signature (A), the four states (B), store-side refusal and
+recording (C), search-side refusal (D), delete clearing the record (E), and the
+aggregate survey (F).
+
+```
+=== 1. with the guard ===                      79 passed, 0 failed
+=== revert search guard only                   0 passed,  9 failed
+=== revert store guard + record write          0 passed, 19 failed
+=== revert ALL (pre-guard state)               0 passed, 29 failed
+file restored after the reverts:               True
+VERDICT: guard is real
+```
+
+**Both of §28's TRAP 12 measurements, not one.** The harness asserts the revert
+**applied** — match-count on each block, the removed marker **absent** afterwards,
+eight symbols the suite imports **still present**, and a final check that the working
+tree was restored. It then requires the suite to go red, and requires the red run to
+contain **no traceback** — because a suite that died on an `ImportError` also prints
+a failure list, and reading that as evidence is §30's revert-deleted-the-code
+mistake.
+
+Per **§30's layering note**, the *partial* reverts are **expected to go red** here
+(the two guards cover different code paths), and the combined revert is the one that
+must be red. Only here does requiring *every* single-block revert to fail be correct.
+
+### Gate, servers stopped
+
+```
+GATE PASSED - 1043 passed, 0 failed across 17 scripts
+reconciliation: 9 + 59 + 38 + 161 + 15 + 15 + 171 + 19 + 45 + 17 + 86 + 79 + 52
+                 + 36 + 209 + 17 + 15 = 1043
+```
+
+The reconciliation line is printed by the gate itself and is the cheapest possible
+check that the summariser is summarising what it ran — §21's TRAP 8 was a total that
+did not agree with its own parts. Baseline before this work: 949 across 15.
+
+### 🔴 One real product bug the suite found, and eleven instrument bugs
+
+The suite found a **genuine hole**: `compare()` did `measured.get(key)`, so a build
+that cannot state its embedder raised `AttributeError` instead of a verdict.
+`service_health` guards the call site, so it was unreachable in production — but a
+guard that dies on its own absent input is one refactor from taking down the query
+path. Now returns `unattributed` with a reason, because an unverifiable index must
+never read as verified.
+
+**Every one of the eleven below was in the verification, none in the product**, and
+each produced a confident wrong reading. Six were in the suite, five in the revert
+harness:
+
+| # | bug | what it reported |
+|---|---|---|
+| 1 | asserted `measured != declared_signature(...)` | fails on a *correct* build — they agree by design |
+| 2 | `clients[stale].upserts == 0` | `KeyError`; the guard refused **earlier** than assumed |
+| 3 | same, for the search path | again — the product stopped sooner than the test assumed |
+| 4 | D5 wrote a **matching** record into the `unattr` fixture | fixture contradicted the claim; verdict correctly `match` |
+| 5 | F counted 1 unattributed | **2** is correct once D5 is fixed |
+| 6 | `rec and …` guarded the condition, `str(rec.get(...))` did not | **suite crashed** instead of reporting failures |
+| 7 | revert needles were **prefixes**, not whole blocks | caught by the harness's own absence check — good failure |
+| 8 | store guard reverted, `record_write` left behind | `NameError` → INVALID run. **A revert must reconstruct a shipped state** |
+| 9 | harness parsed two numbers; the suite prints one | `IndexError` **in the harness itself** |
+| 10 | harness matched failure *text* against a phrase list | **"GUARD IS DECORATIVE"** on a run that plainly named the behaviour |
+| 11 | harness crash-detector keyed on *absence* of `FAIL` | declared a **fully green** suite crashed |
+
+Three lessons, all of them this file's:
+
+- **#6 is the sharpest.** `rec and …` in a condition protects **half the line** and
+  reads as if it protects all of it. A safety idiom that only guards the boolean is
+  worse than none, because it is believed.
+- **#8 generalises the revert lesson.** A revert must reconstruct a state *somebody
+  shipped*. Deleting a guard while leaving its dependent call behind produces a
+  broken tree, and a broken tree is not evidence.
+- **#10 and #11 are §26 verbatim, in the tool built to catch §28.** Both verdicts
+  came from a filter reading the wrong thing: once on the assertion *text*, once on
+  the *absence* of a marker. A detector keyed on absence will fire on the healthy
+  case — that is `x or -1` on an idle GPU (§16) and TRAP 8's parser, again.
+
+### Read before touching these
+
+- **`vector_store.py`** — `EMBEDDER_ID`, `_load_embed_model()`,
+  `describe_embedder()`, and the guard at the **top** of `store_chunks` and
+  `search_chunks`. Both must keep re-raising `StopIteration` first (§15). The
+  refusal in `search_chunks` happens **before** `get_client()`, so a stale index
+  never even opens a lock.
+- **`index_provenance.py`** — stdlib only, no torch, no qdrant_client. That is load
+  bearing: the health page must not collide with the running app's exclusive
+  per-directory Qdrant lock (§15) or pay for the embedding stack to count folders.
+- **`describe_embedder()`** — must stay **lazy**. `import backend.main` must not
+  require torch or sentence-transformers (B15).
+- **`cases.py`** — the two retrieval sites. Do not reintroduce a silent fallback
+  string for `evidence_context` / `evidence_text`.
+- **`SystemHealthPage.jsx`** — `Provenance` row. `null` is "not verified", never `0`.
+
+### Still true after this change
+
+**Nothing is re-indexed.** All 77 existing cases read `unattributed` and are served
+as before; only a **mismatch** refuses, and no case can currently be in that state
+because nothing has changed the embedder yet. The guard becomes load-bearing at
+§31.7 item 5 — which is why the two must land in this order.

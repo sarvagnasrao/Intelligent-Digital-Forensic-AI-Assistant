@@ -11,6 +11,12 @@ from backend.dependencies import get_settings
 
 VECTOR_SIZE = 384
 
+# The model identifier written into every provenance record. One constant,
+# because a second literal in a second place is how a build ends up embedding
+# with one model while declaring another. The *measured* properties of the model
+# are read from the loaded instance by describe_embedder(); this names it.
+EMBEDDER_ID = 'all-MiniLM-L6-v2'
+
 # Chunks per embed call inside store_chunks. Purely a responsiveness knob:
 # smaller slices mean a shorter worst-case wait for a Stop, and more places
 # for the governor to throttle. The resulting vectors are identical.
@@ -164,47 +170,106 @@ _embed_model = None
 _embed_tried = False
 
 
+def _load_embed_model():
+    """
+    Construct the local embedding model once.
+
+    Extracted from `get_ollama_embeddings` so `describe_embedder()` can reach
+    the loaded model without embedding anything. The provenance guard has to
+    measure the model that is really in use: a signature read from a lookup
+    table would check the index against the build's opinion of itself, which is
+    the assumption already known to fail here (B8's hardcoded 8 GB, B27's knob
+    that only fed arithmetic).
+
+    Raises RuntimeError with the install instructions, unchanged.
+    """
+    global _embed_model, _embed_tried
+
+    if _embed_model:
+        return _embed_model
+    if _embed_tried:
+        raise RuntimeError(
+            "Local embedding model is unavailable. Install "
+            "sentence-transformers and torch, or migrate the vector store "
+            "to an Ollama embedder (which requires re-indexing, because it "
+            "is 768-dim rather than 384)."
+        )
+    _embed_tried = True
+    try:
+        import torch
+        from sentence_transformers import SentenceTransformer
+    except ImportError as e:
+        raise RuntimeError(
+            "Embedding requires torch and sentence-transformers, which "
+            f"are not installed ({e}). They are intentionally absent from "
+            "requirements.txt; see the note above this function."
+        ) from e
+
+    # This used to be torch.set_num_threads(4), hardcoded at import time
+    # and applied process-wide. It was wrong twice over: it ignored how
+    # many cores the machine actually has, and a global thread-pool
+    # override fights the resource governor, whose entire job is to cap
+    # CPU use at the ceiling the operator set. Sizing off the real core
+    # count leaves the governor in charge.
+    try:
+        torch.set_num_threads(max(1, (os.cpu_count() or 2)))
+    except Exception:
+        pass
+    _embed_model = SentenceTransformer(EMBEDDER_ID)
+    return _embed_model
+
+
+def describe_embedder() -> dict:
+    """
+    What this process will actually embed with, measured from the loaded model.
+
+    This is the value written into every provenance record and the value every
+    index is checked against. Deliberately NOT read from
+    `index_provenance.EMBEDDER_SPECS`: that table exists so the health page can
+    classify an index without importing torch, and consulting it here would make
+    the guard verify the build against itself.
+
+    `max_seq_length` is the load-bearing field and the one most likely to be
+    edited by hand someday. It decides how much of each chunk is ever encoded --
+    measured at 2.01-3.08 chars/token on real evidence, so 256 tokens is a
+    ~513-788 CHARACTER window, which is why chunk size is a coverage setting and
+    not a quality dial (AGENTS.md 31.3).
+
+    Loads the model if it is not loaded, which is free at both call sites
+    (`store_chunks` and `search_chunks` embed immediately after) and keeps the
+    guard from ever returning a partial signature.
+
+    Raises RuntimeError when the embedding stack is unavailable, naming the
+    install. That is deliberate and not a separate code path: a guard that
+    quietly degraded to "unknown, allow" whenever its dependency was missing
+    would be off exactly when it was needed.
+    """
+    model = _load_embed_model()
+    dim = model.get_sentence_embedding_dimension()
+    return {
+        "embedder_id": EMBEDDER_ID,
+        "vector_size": int(dim) if dim else None,
+        "max_seq_length": int(model.max_seq_length),
+    }
+
+
 def get_ollama_embeddings(texts: list[str]) -> list[list[float]]:
     """
     Embeds texts locally with all-MiniLM-L6-v2 and returns 384-dim vectors.
 
     Keeps the historical function name so existing imports do not break.
     """
-    global _embed_model, _embed_tried
+    model = _load_embed_model()
 
-    if not _embed_model:
-        if _embed_tried:
-            raise RuntimeError(
-                "Local embedding model is unavailable. Install "
-                "sentence-transformers and torch, or migrate the vector store "
-                "to an Ollama embedder (which requires re-indexing, because it "
-                "is 768-dim rather than 384)."
-            )
-        _embed_tried = True
-        try:
-            import torch
-            from sentence_transformers import SentenceTransformer
-        except ImportError as e:
-            raise RuntimeError(
-                "Embedding requires torch and sentence-transformers, which "
-                f"are not installed ({e}). They are intentionally absent from "
-                "requirements.txt; see the note above this function."
-            ) from e
-
-        # This used to be torch.set_num_threads(4), hardcoded at import time
-        # and applied process-wide. It was wrong twice over: it ignored how
-        # many cores the machine actually has, and a global thread-pool
-        # override fights the resource governor, whose entire job is to cap
-        # CPU use at the ceiling the operator set. Sizing off the real core
-        # count leaves the governor in charge.
-        try:
-            torch.set_num_threads(max(1, (os.cpu_count() or 2)))
-        except Exception:
-            pass
-        _embed_model = SentenceTransformer('all-MiniLM-L6-v2')
-
+    # This slice is redundant, and has been measured to be so: MiniLM-L6-v2
+    # truncates to max_seq_length internally, and encoding 73,600 characters
+    # returns a vector with cosine 1.000000 against encoding the first 1,000.
+    # It is NOT why cross-file relationships went missed -- chunk size relative
+    # to the 256-token window is (AGENTS.md 31.3). Left in place because
+    # removing it changes nothing measurable today and would be a behaviour
+    # change riding along on a provenance patch.
     truncated = [t[:1000] for t in texts]
-    embeddings = _embed_model.encode(truncated)
+    embeddings = model.encode(truncated)
     return embeddings.tolist()
 
 
@@ -333,7 +398,8 @@ def store_chunks(chunks: list[str],
                  evidence_id: str,
                  case_id: str,
                  qdrant_path: str,
-                 stop_check=None) -> int:
+                 stop_check=None,
+                 chunking=None) -> int:
     """
     Embeds and stores chunks in the case collection.
     Returns number of chunks stored.
@@ -350,10 +416,35 @@ def store_chunks(chunks: list[str],
     enough that an operator concludes the Stop button is broken. Slicing the
     embed also lets the resource governor throttle mid-batch, which it
     previously could not do at all.
+
+    `chunking` is the caller's `{chunk_size, chunk_overlap}`. It is recorded as
+    provenance and is NOT a control -- this function does not chunk. It has a
+    default so the existing call sites keep working, but every real caller
+    should pass it: the mixed-granularity check on the health page exists to
+    notice cases indexed under more than one profile, and a caller that omits
+    this is indistinguishable from one that indexed at 700 characters.
     """
     if not chunks:
         return 0
     try:
+        from backend.modules import index_provenance
+
+        # Measured before anything is written, so the record describes the
+        # vectors that are actually about to exist rather than the ones the
+        # build believes in.
+        measured = describe_embedder()
+
+        verdict = index_provenance.check_index(qdrant_path, measured)
+        if verdict["state"] == index_provenance.MISMATCH:
+            # Writing here would be worse than refusing. Qdrant accepts a
+            # same-dimensional upsert from a different embedder without
+            # complaint, so the collection would end up holding a mixture of
+            # two vector spaces and no record that it had.
+            raise VectorStoreError(
+                f"Refusing to index into case {case_id}: "
+                f"{verdict['reason']}"
+            )
+
         client = get_client(qdrant_path)
         collection = get_collection_name(case_id)
         ensure_collection(client, collection)
@@ -385,6 +476,22 @@ def store_chunks(chunks: list[str],
             collection_name=collection,
             points=points
         )
+
+        # After the upsert, not before: a record written first and lost to a
+        # failed upsert would attribute vectors that do not exist. A failure
+        # here is non-fatal to the store -- the points are written and usable,
+        # and the case simply reads as unattributed until the next write.
+        try:
+            index_provenance.record_write(
+                qdrant_path, measured,
+                chunking=chunking,
+                evidence_id=evidence_id,
+                source_filename=source_filename,
+                chunks=len(points))
+        except Exception as pe:
+            print(f"[VECTOR] could not record provenance for case {case_id}: "
+                  f"{type(pe).__name__}: {pe}")
+
         return len(points)
 
     except StopIteration:
@@ -400,6 +507,32 @@ def store_chunks(chunks: list[str],
             f"'{source_filename}' (evidence {evidence_id}): {type(e).__name__}: "
             f"{e}"
         ) from e
+
+
+# Cases already warned about, so an unattributed index says so once rather than
+# on every keystroke-driven query. Keyed by path, which is per case by
+# construction (B14's lesson: one directory, one case).
+_unattributed_warned = set()
+_unattributed_lock = threading.Lock()
+
+
+def _warn_unattributed_once(qdrant_path: str, case_id: str, reason: str):
+    """
+    Report an unvouched-for index, once per case per process.
+
+    Deduplicated because this is on the query path and an unrecorded index is a
+    permanent condition, not an event: without the guard this would print one
+    line per query for the life of the server. Set membership is guarded by a
+    lock because the backend serves requests on a thread pool, and an unbounded
+    set here would also be a slow leak across deleted and re-created cases -
+    bounded in practice by the number of cases the operator has opened.
+    """
+    with _unattributed_lock:
+        if qdrant_path in _unattributed_warned:
+            return
+        _unattributed_warned.add(qdrant_path)
+    print(f"[VECTOR] case {case_id} searched an index that cannot be "
+          f"vouched for: {reason}")
 
 
 def search_chunks(query: str,
@@ -425,8 +558,45 @@ def search_chunks(query: str,
 
     So it raises instead, exactly as `store_chunks` does. A caller that
     swallows this now has to work much harder to be wrong in the same way.
+
+    And it refuses an index it cannot vouch for. A collection built by a
+    different embedder, at a different dimensionality or truncated at a
+    different point inside each chunk, will still return a ranked list with
+    confident-looking scores -- from a comparison that means nothing. For a
+    forensic tool the failure is not a bad ranking, it is the sentence "nothing
+    in this case matched that question", which is what clears a suspect. So a
+    provenance mismatch is an error naming the case and the difference, not a
+    warning in a log.
     """
     try:
+        from backend.modules import index_provenance
+
+        measured = describe_embedder()
+        verdict = index_provenance.check_index(qdrant_path, measured)
+
+        if verdict["state"] == index_provenance.MISMATCH:
+            raise VectorStoreError(
+                f"Case {case_id} will not be searched: {verdict['reason']}"
+            )
+
+        if verdict["state"] == index_provenance.NEVER_INDEXED:
+            # Previously this reached Qdrant and came back as a 404 for a
+            # missing collection, wrapped with a status code and an HTTP
+            # library name. Same class of outcome, actionable message.
+            raise VectorStoreError(
+                f"Case {case_id} has no vector index, so it cannot be "
+                "searched. Ingest the evidence first."
+            )
+
+        if verdict["state"] == index_provenance.UNATTRIBUTED:
+            # Served, deliberately. Every index written before provenance
+            # existed reads this way, and refusing would lock the operator out
+            # of all of them - on this install that is 77 cases. The state is
+            # counted on the health page so it is visible rather than implied,
+            # which is the difference between a known unknown and an
+            # unrecorded one (B22's rule).
+            _warn_unattributed_once(qdrant_path, case_id, verdict["reason"])
+
         client = get_client(qdrant_path)
         collection = get_collection_name(case_id)
         query_vector = get_ollama_embeddings([query])[0]
@@ -494,4 +664,16 @@ def delete_case_collection(case_id: str,
         if "not found" not in str(e).lower():
             print(f"QDRANT DELETE ERROR: {e}")
     finally:
+        # The record goes with the collection. Left behind, it would carry the
+        # old chunking schemes into the next index and the health page would
+        # report granularities that no longer exist in the collection - the
+        # mixed-granularity check would be describing a mosaic that has been
+        # deleted.
+        try:
+            from backend.modules import index_provenance
+            index_provenance.clear_provenance(qdrant_path)
+            with _unattributed_lock:
+                _unattributed_warned.discard(qdrant_path)
+        except Exception as e:
+            print(f"QDRANT PROVENANCE ERROR: {e}")
         close_client(qdrant_path)

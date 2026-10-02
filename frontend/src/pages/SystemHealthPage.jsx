@@ -280,6 +280,31 @@ export default function SystemHealthPage() {
   // got one, and the reason line says which of the several reasons it was.
   const daemonAnswering = Array.isArray(ollama?.installed_models)
   const modelReady = ollama?.model_ready ?? null
+
+  // Index provenance: which embedder wrote each case's vectors, and whether this
+  // build can compare them against queries embedded now.
+  //
+  // Rendered because the guard's whole visibility story depends on it: without
+  // this row an operator never learns an index is stale except by hitting the
+  // refusal mid-question, which is the same defect as §32's truncation warning
+  // sitting unread in `evidence.notes`.
+  //
+  // `provenance` is null when the probe could not read the sidecars at all, and
+  // that renders as "not verified" - never as 0 verified. An unmeasured 0 would
+  // read as "every index is current", which is the opposite of the truth (§16).
+  const prov = vector?.provenance ?? null
+  const provCount = (k) => (typeof prov?.[k] === 'number' ? prov[k] : null)
+  const provMeasured = prov !== null && typeof prov.total === 'number'
+  const provRefused = provCount('mismatch')
+  const provUnvouched = provCount('unattributed')
+  const provVerified = provCount('match')
+  const provValue = !provMeasured
+    ? NOT_MEASURED
+    : `${provVerified ?? 0} of ${prov.total} verified`
+  // Only a mismatch is refused, so only a mismatch is an error. Unvouched
+  // indexes are still searched — showing them in red would train the operator
+  // to dismiss the row that actually matters.
+  const provAlarm = (provRefused ?? 0) > 0
   const ollamaValue = modelReady === false
     ? 'Cannot answer'
     : state('ollama') === 'ok'
@@ -372,8 +397,24 @@ export default function SystemHealthPage() {
                   value: showNumber(vector?.case_collections, (n) => String(n)),
                 },
                 { label: 'On disk', value: showMb(vector?.total_size_mb) },
+                { label: 'Provenance', value: provValue, alarm: provAlarm },
+                ...(provMeasured && (provUnvouched ?? 0) > 0
+                  ? [{
+                      label: 'Unvouched',
+                      value: `${provUnvouched} of ${prov.total} pre-guard`,
+                    }]
+                  : []),
+                ...(provMeasured && (provCount('mixed_chunking_cases') ?? 0) > 0
+                  ? [{
+                      label: 'Mixed chunking',
+                      value: `${prov.mixed_chunking_cases} case(s)`,
+                    }]
+                  : []),
+                ...(provMeasured && (provRefused ?? 0) > 0
+                  ? [{ label: 'Will be refused', value: `${provRefused}`, alarm: true }]
+                  : []),
               ]}
-              reason={reasonFor(vector)}
+              reason={reasonFor(vector) || prov?.reason}
               footnote="data/cases/<case_id>/qdrant/"
             />
 

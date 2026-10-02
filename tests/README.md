@@ -23,6 +23,8 @@ PYTHONPATH=. venv/bin/python tests/verify_prompt_budget.py
 PYTHONPATH=. venv/bin/python tests/verify_evidence_archive.py
 PYTHONPATH=. venv/bin/python tests/verify_retrieval_integrity.py
 PYTHONPATH=. venv/bin/python tests/verify_identity_attribution.py
+PYTHONPATH=. venv/bin/python tests/verify_provenance.py
+PYTHONPATH=. venv/bin/python tests/run_gate.py           # all of the above, totalled
 PYTHONPATH=. venv/bin/python tests/verify_live_stack.py   # needs the stack running
 
 # Windows
@@ -40,14 +42,26 @@ $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_prompt_budget.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_evidence_archive.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_retrieval_integrity.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_identity_attribution.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_provenance.py
+$env:PYTHONPATH="."; venv\Scripts\python.exe tests\run_gate.py
 $env:PYTHONPATH="."; venv\Scripts\python.exe tests\verify_live_stack.py
 ```
 
-Fourteen are self-contained — **941 assertions** (9 + 15 + 17 + 17 + 19 + 36 +
-38 + 45 + 52 + 59 + 86 + 153 + 171 + 209). `verify_live_stack.py` is the
-exception and needs `ollama serve`, uvicorn on `:8000` and the Vite dev server
-on `:3000` already running; it waits 90 s for the backend and skips cleanly if
-it never comes up.
+**Run `run_gate.py` rather than a shell one-liner.** It encodes four rules, each
+because its absence was a bug: both summary shapes parse explicitly; unreadable
+counts become `??` and never `0`; a non-zero exit reporting zero failures becomes
+`ERR`; and **the total is refused if any script is invalid**, with the per-suite
+lines printed so the total reconciles against its own parts. An earlier ad-hoc gate
+fell through to a `FAILED: <description>` line — the *list* of failures, not the
+count — and reported a suite with 15 failures as `0 passed / 0 failed`.
+
+Sixteen are self-contained (exact total: `run_gate.py`'s own output).
+`verify_live_stack.py` is the exception and needs `ollama serve`, uvicorn on `:8000`
+and the Vite dev server on `:3000` already running; it waits 90 s for the backend and
+skips cleanly if it never comes up. `verify_provenance_discriminating.py` is
+excluded from the gate for a different reason: it deliberately reverts
+`vector_store.py` four times, so it must never run concurrently with suites reading
+that file.
 
 Read the totals, not the exit code. A gate that reports `0 passed` for a script
 which did not run converts a red suite green, which is the one outcome these
@@ -79,6 +93,9 @@ scripts exist to prevent.
 | `verify_job_stop.py` | The Stop button actually stops. Drives the real `_process_job` on a worker thread, fires `stop_job()` from another thread exactly as the endpoint does, and requires that the job halts, is recorded `Stopped` rather than `Failed`, reverts the evidence to `Uploaded`, and **did not reach 100 %** — a stop that is acknowledged but ignored is otherwise indistinguishable from a job that simply finished. Also pins the HTTP contract, including that `DELETE /queue/{id}/cancel` still refuses a `Running` job. | ~20 s |
 | `verify_forensic_failure.py` | A failed **disk-image** ingest must be terminal and must never announce success. Drives the real `_process_job` on a worker thread with an image that has no mountable filesystem, and requires the job `Failed` with the TSK diagnostic and a terminal timestamp, the evidence `Failed` (never `Indexed`), `INGESTION_FAILED` broadcast **and `INGESTION_COMPLETE` not**. Part B requires a user stop inside the walk loop to reach the caller *as a `StopIteration`* — not laundered into a `RuntimeError` and reclassified by substring match — leaving the job `Stopped` and the evidence re-queueable. | ~30 s |
 | `verify_vector_store.py` | One Qdrant client **per case**, keyed on a normalised path, with real data isolation: indexing case B leaves case A's storage untouched. Plus the optional-dependency contract — `backend.main` and `backend.ingestion` import with `torch` and `sentence_transformers` blocked, and a stop request surfaces as `StopIteration` rather than an indexing failure. | ~10 s |
+| `verify_gate_parser.py` | The gate's own summariser. §21's rule is that a summariser is a program and has to be tested like one, and this suite exists because the first version of `run_gate.py` could not read six of the sixteen summaries — they print `9 passed, 0 failed`, count first, while the other ten print `PASSED: 209`, word first. It reported six **passing** suites as unreadable. Asserts both shapes, that failures are counted rather than swallowed, that per-assertion `FAIL` lines are not mistaken for a summary, and that the four unparseable inputs return `None` **never `0`**. | <1 s |
+| `verify_provenance.py` | Every index says **what wrote it**, and a stale one is refused rather than answered from. A Qdrant collection recorded nothing, so a case indexed with a different embedder was indistinguishable from a current one — and `get_client()` *creates* an empty collection for a case that has none, so the search then 404s, an internal error dressed as a question about the evidence. Asserts the four verdicts (`match` / `mismatch` / `unattributed` / `never_indexed`), that **hard** fields refuse while the chunking scheme only reports (and accumulates, so a mixed-granularity case cannot read as uniform), that a corrupt record and a foreign `signature_version` both read `unattributed` and never `match`, that deleting a case clears the record, and — the assertion that cannot be written against a table-driven implementation — that patching the declared spec to absurd values does **not** move the verdict, because the guard compares the *measured* model, not the table. | ~30 s |
+| `verify_provenance_discriminating.py` | Not a suite: a **harness** that reverts `vector_store.py` and requires the above to go red. Excluded from `run_gate.py` because it edits the file other suites are reading. Run it after changing the guard. §28's TRAP 12 — "verified discriminating" is **two** measurements (the revert *applied*, and the suite went red), and this asserts both. | ~4 min |
 | `verify_live_stack.py` | End-to-end over a real socket: uploads a file, queues it as `accurate`, and asserts monotonic `INGESTION_PROGRESS` frames actually arrive on `/ws/global` and land on a `Completed` row. | ~90 s |
 | `verify_cpu_sampler.py` | The CPU figure is a real measurement, not a primed constant. Burns all logical cores in **subprocesses** and requires the reported load to climb and then fall, and pins the forced re-scan's worst case below the 300 ms the old blocking sampler cost on every cache miss. | ~10 s |
 | `verify_gpu_telemetry.py` | The NVML ABI, end to end. Each entry point gets its own struct and the version handshake; the 32-bit misread is *refused*; a field-order misread is *refused*; both `used` conventions are accepted and normalised; the VRAM ratio divides by a denominator covering the same adapters as its numerator; sysfs byte values are converted; a failed NVML session recovers; and no unmeasurable metric ever becomes `0`. | ~20 s |

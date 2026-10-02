@@ -387,6 +387,14 @@ def _run_document_with_progress(
             batch = chunks[i:i+embed_batch]
             chunk_count += store_chunks(
                 chunks=batch,
+                # Recorded, never used to chunk here: this loop already chunked
+                # at line 368, so passing it through is provenance only.
+                # Without it a case indexed in `fastest` and later in `accurate`
+                # would present as one consistent index while holding two
+                # granularities, which is the same class of defect as an
+                # elapsed_seconds field that is never written.
+                chunking={"chunk_size": chunk_size,
+                          "chunk_overlap": chunk_overlap},
                 source_filename=filename,
                 evidence_id=evidence.id,
                 case_id=case_id,
@@ -581,6 +589,23 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
     mode_key = mode.get("key", "normal")
     include_deleted = bool(include_deleted or mode.get("include_deleted"))
     evidence_id = evidence.id
+
+    # The chunking this path actually uses.
+    #
+    # Read from the profile, and then *asserted equal* to what the store step
+    # below really does, because at the time of writing these two disagreed:
+    # the per-artifact call was `chunk_text(art_text)` with no arguments, so a
+    # disk image was chunked at text_parser's default 20000/0 no matter which
+    # profile the operator selected. `accurate` was documented as chunk_size
+    # 3000 and delivered 20000.
+    #
+    # That is worth stating plainly rather than only fixing: it means every
+    # forensic artifact indexed so far is at 20,000-character chunks, where
+    # the measured embedding window is ~513 characters - so roughly 2.5% of each
+    # chunk was ever encoded. The coverage table in AGENTS.md 31.4 does not
+    # apply to disk-image evidence at all.
+    chunk_size = int(mode.get("chunk_size") or 20000)
+    chunk_overlap = int(mode.get("chunk_overlap") or 0)
 
     def _progress(percent: int, step: str):
         # The 5-argument dispatcher, same contract as the document path. This
@@ -883,12 +908,22 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                     print(f"[FORENSIC] Artifact cap reached at 500 files; "
                           f"{len(all_chunk_texts) - 500} not indexed")
                     break
-                art_chunks = chunk_text(art_text)
+                # Now actually reads the profile, rather than defaulting to
+                # text_parser's 20000/0 behind every profile selector.
+                art_chunks = chunk_text(art_text, chunk_size=chunk_size,
+                                        overlap=chunk_overlap)
                 if not art_chunks:
                     continue
                 indexed_chunks.extend(art_chunks)
                 total_chunks += store_chunks(
                     chunks=art_chunks,
+                    # Provenance only; the chunking already happened above.
+                    # Recorded per artifact rather than once per image because
+                    # this is one call per artifact, so a case with artifacts
+                    # from two profiles is exactly the mosaic the health page
+                    # counts.
+                    chunking={"chunk_size": chunk_size,
+                              "chunk_overlap": chunk_overlap},
                     source_filename=art_name,
                     evidence_id=evidence.id,
                     case_id=case_id,

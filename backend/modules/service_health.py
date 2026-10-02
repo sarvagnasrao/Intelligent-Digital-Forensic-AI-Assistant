@@ -379,6 +379,10 @@ def probe_vector_store(cases_dir: str) -> dict:
         "size_walk_ms": None,
         "unmigrated_collections": None,
         "duplicate_collections": None,
+        # Provenance (AGENTS.md 31.7 item 3). None until the indexes below have
+        # actually been walked, for the same reason case_collections is: a 0
+        # here would claim a clean sweep that was never performed.
+        "provenance": None,
     }
 
     if not cases_dir:
@@ -538,6 +542,66 @@ def probe_vector_store(cases_dir: str) -> dict:
     out["size_walk_ms"] = round((time.perf_counter() - started) * 1000, 1)
     if not exhausted:
         out["total_size_mb"] = round(total / (1024 * 1024), 2)
+
+    # Provenance: what wrote each index, and whether this build may search it.
+    #
+    # Read from the sidecar files, NOT from a loaded embedding model. This probe
+    # deliberately imports neither torch nor qdrant_client - embedded mode holds
+    # an exclusive lock per directory, and the health page must not collide with
+    # the running application or pay for the embedding stack to count
+    # directories. index_provenance is stdlib-only for exactly that reason.
+    #
+    # A mismatch is the condition that matters: the case's vectors cannot be
+    # compared against queries embedded now, and search_chunks refuses it. Until
+    # the guard shipped, nothing recorded what produced an index and nothing
+    # checked, so a stale case and a current one were indistinguishable and the
+    # stale one answered with confident scores.
+    try:
+        from backend.modules import index_provenance
+        from backend.modules.vector_store import EMBEDDER_ID
+
+        declared = index_provenance.declared_signature(EMBEDDER_ID)
+        if declared is None:
+            out["provenance"] = {
+                "state": None,
+                "reason": f"no declared specification for embedder "
+                          f"{EMBEDDER_ID!r}, so no index can be classified",
+            }
+        else:
+            survey = index_provenance.survey(qdrant_dirs, declared)
+            survey["expected"] = declared
+            survey["reason"] = None
+            if survey.get(index_provenance.MISMATCH):
+                survey["reason"] = (
+                    f"{survey[index_provenance.MISMATCH]} case index/indices "
+                    "were built by a different embedding configuration and "
+                    "will be refused rather than searched; re-ingest that "
+                    "evidence to rebuild them"
+                )
+            elif survey.get(index_provenance.UNATTRIBUTED):
+                survey["reason"] = (
+                    f"{survey[index_provenance.UNATTRIBUTED]} case "
+                    "index/indices predate provenance recording, so nothing "
+                    "confirms which embedder wrote them; they are still "
+                    "searched, and shown here rather than assumed sound"
+                )
+            if survey.get("mixed_chunking_cases"):
+                extra = (
+                    f"{survey['mixed_chunking_cases']} case(s) hold an index "
+                    "built at more than one chunking granularity, so retrieval "
+                    "is coarse in places - they need a re-ingest to be uniform"
+                )
+                survey["reason"] = (
+                    f"{survey['reason']}; {extra}" if survey["reason"] else extra
+                )
+            out["provenance"] = survey
+    except Exception as e:
+        # A guard that could take the health page down would be the B15 defect.
+        # Reported as unmeasured, never as "all indexes verified".
+        out["provenance"] = {
+            "state": None,
+            "reason": f"provenance could not be read: {type(e).__name__}: {e}",
+        }
 
     writable, why = _probe_writable(cases_dir)
     out["writable"] = writable

@@ -460,6 +460,14 @@ def generate_case_summary(
     # Retrieve key evidence chunks from vector store
     qdrant_path = case_qdrant_path(case_id)
     key_chunks = []
+    # Recorded, not swallowed. This was `except Exception: pass`, so a failed
+    # retrieval left `evidence_context` empty and the summary prompt then read
+    # "No evidence indexed yet." - a sentence indistinguishable from "this case
+    # is clean". That is B30's shape one layer up, and the provenance guard
+    # made it reachable: a refused index (stale embedder, or no index at all)
+    # fails all five searches, so a case that is fully indexed produces a
+    # summary asserting it has no evidence. Exactly the exculpatory direction.
+    retrieval_fault = None
     if os.path.exists(qdrant_path):
         for term in ["suspect", "evidence", "timeline", "location", "communication"]:
             try:
@@ -470,8 +478,10 @@ def generate_case_summary(
                     top_k=2,
                 )
                 key_chunks.extend(chunks)
-            except Exception:
-                pass
+            except Exception as e:
+                # First fault wins; five identical ones would be noise.
+                if retrieval_fault is None:
+                    retrieval_fault = f"{type(e).__name__}: {e}"
 
     # Deduplicate chunks
     seen = set()
@@ -483,10 +493,21 @@ def generate_case_summary(
             unique_chunks.append(c)
     unique_chunks = unique_chunks[:8]
 
-    evidence_context = "\n\n".join([
-        f"[Evidence {i + 1} from {c['source']}]\n{c['text']}"
-        for i, c in enumerate(unique_chunks)
-    ]) or "No evidence indexed yet."
+    # A recorded fault that is never rendered is a record nobody reads (§29's
+    # truncation warning, which sat in `evidence.notes` and was invisible). So
+    # the three states get three different sentences rather than one fallback.
+    if retrieval_fault:
+        evidence_context = (
+            "RETRIEVAL FAILED - the evidence excerpts for this case could not "
+            "be retrieved, so this summary carries NO evidence context. Do not "
+            "read the absence of excerpts below as an absence of evidence. "
+            f"Cause: {retrieval_fault}"
+        )
+    else:
+        evidence_context = "\n\n".join([
+            f"[Evidence {i + 1} from {c['source']}]\n{c['text']}"
+            for i, c in enumerate(unique_chunks)
+        ]) or "No evidence indexed yet."
 
     SUMMARY_PROMPT = f"""You are a senior forensic analyst.
 Write a professional executive case summary report based on the information below.
@@ -676,6 +697,13 @@ def detect_contradictions(
     qdrant_path = case_qdrant_path(case_id)
 
     key_chunks = []
+    # Was a bare `except: pass`. A bare except also swallows KeyboardInterrupt
+    # and SystemExit, which is its own small bug, but the consequence here is
+    # the consequential one: five failed retrievals left `evidence_text` empty,
+    # and the contradiction prompt below was handed a case with no statements
+    # while presenting itself as having examined them. Nothing in the output
+    # distinguished "no contradictions found" from "nothing could be read".
+    retrieval_fault = None
     for term in [
         "date created modified",
         "timeline sequence",
@@ -691,8 +719,9 @@ def detect_contradictions(
                 top_k=3
             )
             key_chunks.extend(chunks)
-        except:
-            pass
+        except Exception as e:
+            if retrieval_fault is None:
+                retrieval_fault = f"{type(e).__name__}: {e}"
 
     # Deduplicate chunks
     seen = set()
@@ -706,6 +735,13 @@ def detect_contradictions(
 
     # Build evidence context
     evidence_text = ""
+    if retrieval_fault:
+        evidence_text += (
+            "\n[RETRIEVAL FAILED - no statements could be retrieved from this "
+            "case, so no contradiction below has been checked against "
+            "anything. Do not report this as an absence of contradictions. "
+            f"Cause: {retrieval_fault}]\n"
+        )
     for i, c in enumerate(unique_chunks, 1):
         evidence_text += (
             f"\n[Statement {i} from {c['source']}]\n"

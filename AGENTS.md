@@ -4,16 +4,25 @@
 > **Rule:** read this file *before* changing code. It records verified state, known bugs, and traps that are not
 > derivable from the code itself.
 >
-> Last verified against: `main3` @ the §23 commit (2026-09-30) —
+> Last verified against: `main3` @ commit `30e1f20` (2026-10-02, pushed).
 > §13 covers the ingestion rework, §14 the live end-to-end run and the three
 > further bugs it found (B10/B11/B12), **§15 the stop button, per-case
 > Qdrant isolation and the optional-dependency trap (B13/B14/B15)**,
 > §16/§17 the telemetry and per-job controls, **§18 the honesty pass
 > (B20–B25)**, **§19 the RAG prompt budget (B26)**, **§20 the context
-> window, which was a reporting-only knob and never a control (B27)**, and
-> **§21 a health probe that reported 0 indexes for indexed cases (B28)**, and
-> **§23 an Archive button that worked perfectly and did nothing (B29)**.
+> window, which was a reporting-only knob and never a control (B27)**,
+> **§21 a health probe that reported 0 indexes for indexed cases (B28)**,
+> **§23 an Archive button that worked perfectly and did nothing (B29)**,
+> **§24/§26/§29/§30 the raw-image test and the audit pass (B30–B33)**, and
+> **§31 the cross-platform performance + geo-map plan (PLANNED, NOTHING
+> APPLIED)**.
 > See §6 and §12 for the forensic-image fixes.
+>
+> 🔴 **START AT §31.** It is the newest work, it is unapplied, and it carries a
+> retraction: §24's diagnosis of why the bot missed cross-file relationships
+> (§24 "the relevance floor") and its recommended fix (remove `t[:1000]`) were
+> both **wrong**, and §31.3 measures why. §31 also records six decisions the
+> operator took and **seven next actions in §31.7.**
 >
 > **Read §20 before touching `ollama_client`.** The window is now *sent* on every request.
 > `ollama_num_ctx` was a number that only fed the budget arithmetic, so raising it in `.env`
@@ -3003,8 +3012,10 @@ For whoever picks this up next, with nothing hidden:
 | **~340 orphan case directories** | under `data/cases/`, from earlier runs. Left alone by the operator's choice. |
 | **Re-index required** | chunk sizes are cut, so a case ingested before this session still has 30,000-character chunks. Test1 and the Phantom Trace demo are re-indexed; nothing else is. |
 | **`vendor/python/torch-*.whl`** | 152 MB of dead weight — but §8's caution stands: a CUDA build is what GPU transcription needs. |
-| **Chunk-size half of §19** | raising the window recovered 5.4×; smaller chunks recover the rest, and need a re-index per case. |
+| **Chunk-size half of §19** | raising the window recovered 5.4×; smaller chunks recover the rest, and need a re-index per case. **Now measured and planned — §31.3, and it corrects §24's diagnosis.** |
 | **`cases.py:968`** | `author = "<imported> (imported)"` — the last client-influenced attribution, judged defensible (§24). |
+| 🔴 **§31 plan, unapplied** | cross-platform GPU/CPU/memory efficiency + geo map restoration. Six operator decisions taken, **nothing applied**. Seven ordered next actions in **§31.7**. A re-index of every case is required, and **§31.3 (index provenance) must land first** so a stale index is refused rather than silently searched. |
+| 🔴 **`bench_chunking.py` is red** | exits 1 on 6 fixture checks (§31.4) and reads a truncated corpus (§31.5). **Its recall table must not be quoted.** Fix it first — it gates the §31 decision. |
 
 ---
 
@@ -3588,3 +3599,348 @@ passed, 0 failed across 15 scripts**, and the per-suite lines reconcile exactly
 - **`forensic_ingestion.py`** - the empty-result guard is still right. It is what
   made this visible. It is the *caller's* choice of `unsupported` that was too
   coarse, and the caller now gets a non-empty reason to pass through instead.
+
+---
+
+## 31. Cross-platform hardware efficiency + geo map restoration — **PLAN ONLY, NOTHING APPLIED**
+
+> **State of this section: no product code has been changed.** It records the six
+> decisions the operator took on 2026-10-02, the measurements taken to justify
+> them, and — importantly — **one claim of mine that the measurement falsified.**
+> A successor must start at §31.7, not at the plan.
+
+### 31.1 The operator's brief
+
+> *"I want my software to use the GPU, CPU and memory of any system it runs on
+> efficiently so that the process is done properly and with time efficiency. Let
+> it be Linux, Windows or Mac OS. It must work efficiently on all platforms and
+> systems. And do reverse the geo map, as it is much needed for that project, no
+> worries if it becomes partially air-gapped. Discuss before applying."*
+
+"Discuss before applying" was explicit. All six decisions below were collected
+with the question tool before any edit.
+
+### 31.2 The six decisions (all six answered — do not re-ask)
+
+| # | Decision | Chosen | Rejected alternative |
+|---|---|---|---|
+| 1 | Chunking | **small chunks ~700 chars, one vector** | multi-window (N vectors per chunk) |
+| 2 | Embedder | **keep `all-MiniLM-L6-v2`, 384-dim** | `bge-small` 512-tok; Ollama `nomic-embed-text` 768-dim |
+| 3 | Parallelism | **NER over full document + OCR subprocess pool + hashing overlapped with extraction** | worker pool over files (**explicitly deferred**, highest risk) |
+| 4 | Geo basemap | **vendored offline raster tiles** | GeoJSON-only; opt-in online |
+| 5 | IP geolocation | **local GeoLite2 City + ASN `.mmdb`** | DB-IP Lite; online enrichment; EXIF-only |
+| 6 | Sequencing | **measure first, then build** | provenance-guard-first; build-and-gate |
+
+The **worker pool over files is deliberately out of scope.** Do not add it as
+"part of the parallelism work". §31.8 says why.
+
+### 31.3 🔴 THE MEASUREMENT THAT REFRAMES THE PLAN — and corrects §24's framing
+
+`vector_store.py:206` reads:
+
+```python
+truncated = [t[:1000] for t in texts]
+embeddings = _embed_model.encode(truncated)
+```
+
+I previously reported this as "only the first 1000 characters of each chunk are
+ever embedded". **That is true but badly misleading**, and the measurement
+below shows why. `all-MiniLM-L6-v2` has **`max_seq_length = 256` tokens**:
+
+| text style | measured chars/token | effective window |
+|---|---|---|
+| dense log/firewall lines | **2.39** | **~612 chars** |
+| prose chat log | **3.08** | **~788 chars** |
+
+And the decisive test — encode the same passage at increasing lengths, compare
+each vector to the first-1000 vector by cosine:
+
+| variant | chars | cosine vs first-1000 |
+|---|---|---|
+| first 1000 (what the product sends) | 1,000 | 1.000000 |
+| first 2,000 | 2,000 | **1.000000** |
+| first 4,000 | 4,000 | **1.000000** |
+| first 8,000 | 8,000 | **1.000000** |
+| whole passage | 73,600 | **1.000000** |
+
+> **`t[:1000]` is provably REDUNDANT.** Encoding 73,600 characters produces a
+> bit-identical vector to encoding 1,000, because the model truncates to 256
+> tokens internally. **Deleting that line on its own changes nothing at all.**
+
+Throughput confirms it — chunks/s is essentially flat in chunk size, because
+every chunk costs the same 256-token encode:
+
+| chunk chars | 1,000 | 3,000 | 6,000 | 12,000 |
+|---|---|---|---|---|
+| chunks/s | 16.45 | 16.17 | 15.96 | 14.48 |
+
+**So `chunk_size` is not a retrieval-granularity lever, which is how §13 and §19
+both documented it.** It is a **coverage** setting: it decides how much of each
+chunk is thrown away. Actual coverage on this corpus:
+
+| profile | chunk chars | embedded | **coverage** |
+|---|---|---|---|
+| `accurate` | 3,000 | ~612–788 | **21–26 %** |
+| `normal` | 6,000 | ~612–788 | **10–13 %** |
+| `fastest` | 12,000 | ~612–788 | **5–7 %** |
+
+**This corrects §24's diagnosis.** That section concluded the missed
+relationships were "the hardware was never given them" and recommended removing
+`t[:1000]` as the fix. The truncation is not the cause; the **chunk size
+relative to a 256-token window** is. And no GPU changes it — a bigger GPU
+embeds the same 612 characters.
+
+The elegant consequence: covering a 3,000-char chunk costs **4–5 windows of
+~700 chars**, or equivalently **4–5 chunks of ~700 chars** — one vector per point,
+no schema change, and **one re-index then serves all three profiles** (today the
+profile *is* the chunk size, so a case's index is a mosaic of granularities — a
+§16-class lie about "consistent retrieval").
+
+> 🔴 **CORRECTION — I first wrote that full coverage costs "exactly what
+> discarding it costs today". That is wrong, and §31.4 has the measurement.**
+> Full coverage means **encoding every character instead of the first ~513 of
+> each 3,000**, so it costs **~3.2× more encoded characters and ~3.7× the
+> embedding wall clock** (measured: 77 chunks / 7.06 s versus 24 chunks /
+> 1.91 s on the same corpus). That is the genuine price of coverage. It is a
+> one-off re-index cost plus a modest per-ingest increase, **not** a free win —
+> do not promise otherwise.
+
+### 31.4 🔴 v1 OF THE BENCHMARK WAS WRONG — three instrument bugs, and what v2 measured
+
+**v1** (`bench_chunking.py`) is **read-only** (DB opened `mode=ro`, **no Qdrant
+client created at all** — retrieval is numpy cosine over the same 384-dim
+normalised vectors, so it cannot take the §15 per-directory lock). It **exited
+1 with 6 of 10 fixture checks failing**, and its recall table must never be
+quoted:
+
+```
+[FAIL] target in the expected file: T2 nightowl identity   found in CONTACTS.VCF, expected EMPLOYEE.DAT
+[FAIL] target in the expected file: T3 nightowl join       found in CHATLOG2.TXT,  expected MALCFG.JSO
+[FAIL] target in the expected file: T4 VPN approver        found in EMPLOYEE.DAT, expected VPNEXCPT.TXT
+[FAIL] target in the expected file: T6 C2 host             found in DNSQRY.LOG,    expected SECMEMO.TXT
+[FAIL] target in the expected file: M2 buried firewall line found in DNSQRY.LOG,  expected FWLOGNOV.CSV
+[FAIL] target in the expected file: M3 takedaon            found in _EDGERDL.REC,  expected PAYMENTS.CSV
+```
+
+**Cause: I asserted each target's filename from memory, and the lookup takes the
+FIRST file containing the needle in `ORDER BY filename` order.** Every one of
+those facts is present in *more than one* file — `m.webb@northwind-corp.com` is
+in `CONTACTS.VCF` **and** `EMPLOYEE.DAT`; `Raghunathan` is in `EMPLOYEE.DAT`
+**and** `VPNEXCPT.TXT`. §26 verbatim, in the instrument rather than the product.
+
+> **Correct ground truth for "did the answer-bearing evidence get retrieved" is
+> ALL files containing the needle**, not the one I remembered.
+
+The second v1 bug is in §31.5. The third was a plain `len(off)` on an int, which
+**crashed rather than reporting a wrong number** — the good failure.
+
+**v2** (`bench_chunking2.py`) fixes all three: ground truth is every matching
+file, the corpus is extracted from the raw image with the product's own
+extractor rather than the capped DB column, and it exits **0 with "all fixture
+checks passed"**. It also asserts `FWLOGNOV.CSV > 10,000 chars`, so a regression
+to the DB column is caught rather than silent. Results:
+
+**Window, measured on the real text — tighter than estimated:**
+
+| text | chars/token | window |
+|---|---|---|
+| `FWLOGNOV.CSV` (dense log lines) | **2.01** | **~513 chars** |
+| `CHATLOG2.TXT` (prose chat) | 3.08 | ~788 chars |
+
+**Coverage per artifact — this is the real finding, and it is a per-file property:**
+
+| artifact | chars | accurate | normal | fastest | **700/120** |
+|---|---|---|---|---|---|
+| **`FWLOGNOV.CSV`** (firewall log) | 33,810 | **19.7 %** | **9.1 %** | **4.6 %** | **88.5 %** |
+| `CHATLOG2.TXT` | 1,947 | 26.3 % | 26.3 % | 26.3 % | **89.7 %** |
+| `SECMEMO.TXT` | 1,016 | 50.5 % | 50.5 % | 50.5 % | **93.4 %** |
+| `EMPLOYEE.DAT` | 929 | 55.2 % | 55.2 % | 55.2 % | 92.8 % |
+| `VPNEXCPT.TXT` | 729 | 70.4 % | 70.4 % | 70.4 % | 90.8 % |
+| the eight files under 600 chars | — | 87–100 % | same | same | same |
+
+**42 occurrences across the corpus sit beyond the window today** — present in the
+index, in a chunk, with a vector, and **never encoded**. A search cannot find
+them, and nothing reports their absence.
+
+**Recall@5 (correct ground truth):**
+
+| scheme | total | note |
+|---|---|---|
+| accurate 3000/300 (now) | **8/10** | |
+| normal 6000/200 (now) | **8/10** | |
+| fastest 12000/0 (now) | **9/10** | |
+| **proposed 700/120** | **9/10** | |
+| proposed 1000/150 | 8/10 | |
+
+**`T3 operator_handles` is the discriminating case**: the only occurrence is
+`MALCFG.JSO@632` — past the 513-char window — and it is a **MISS in every scheme
+except `700/120`**. It does not flip at `1000/150`. That is the measurement
+behind the operator's choice of 700 over 1000, and it is the only target where
+chunk size is demonstrably the cause of the miss.
+
+**Two claims of mine, retracted:**
+
+1. *"Those facts were never in the index. No amount of GPU will fix this."* —
+   **wrong for this corpus.** `M3 takedaon` sits at `_EDGERDL.REC@444`, inside
+   the window, and **is retrieved in all five schemes including all three current
+   ones**. `M4 T-90333@380` likewise. **Those were model misses, not retrieval
+   misses.** §29's attribution of them to retrieval is retracted.
+2. *"Full coverage costs exactly what discarding it costs."* — **wrong.** v2
+   measures **~3.2× more encoded characters, ~3.7× the embedding wall clock**
+   (77 chunks / 7.06 s versus 24 / 1.91 s). See the correction in §31.3.
+
+**And one miss that coverage will NOT fix — say so before anyone promises it
+will.** `M1 exfil volume` (`412.8`, the single most important fact in the case,
+in `_EDGERDL.REC@260`) is a **MISS in every scheme including `700/120`**. It sits
+well inside the window and there is exactly one occurrence in the corpus, so this
+is a **semantic** limit of a 3B-parameter embedding model, not a coverage one.
+§29's `412.8 MB / exfil.darknode.io` line will still need the investigator — or a
+larger embedder, which decision 2 declined for now.
+
+**Do not over-read the 8→9 headline.** On a 12-artifact synthetic corpus, recall
+moves by one target. The *coverage* table is the durable result, and it is
+unambiguous: **a 34 KB firewall log has 4.6 % of itself encoded under the
+default-ish `fastest` profile.**
+
+### 31.5 A 10,000-char cap that is **not** a coverage loss — and it contaminated the benchmark
+
+Grepping for the `FWLOGNOV.CSV` length discrepancy turned up two `[:10000]`
+slices. **Neither limits what gets indexed**, and believing otherwise would have
+sent the next agent to "fix" a non-bug:
+
+| location | what it caps | effect on the index |
+|---|---|---|
+| `ingestion.py:724-725` | the `ForensicArtifact.extracted_text` **DB column** | **none** — `all_chunk_texts` (line 753) holds the **full** `extracted_text`, and that list is what `store_chunks` receives |
+| `forensic_ingestion.py:717` | the **EXIF branch only** (max 20 keys, so ~20 lines) | none — harmless |
+| `ingestion.py:881` | `all_chunk_texts[:500]` — **500 *artifacts*, not chunks** | real, but generous; overflow is reported **only in a log line** (884: `f"{len(all_chunk_texts) - 500} not indexed"`) |
+
+**But the benchmark read the DB column**, so it measured `FWLOGNOV.CSV` as
+10,000 chars when the file on disk is 33,810. The corpus under test was
+therefore a truncated view of one of its twelve files. Any successor re-running
+this **must chunk from the extracted text, not from `forensic_artifacts`**.
+
+### 31.6 🔴 The relevance floor has **no gap to sit in** on this corpus — worse than "will fail"
+
+§24 pinned `RETRIEVAL_SCORE_FLOOR = 0.25` between two measured clusters
+(0.138 / 0.395) on 12 queries, and §F of `verify_retrieval_integrity.py` fails if
+it moves outside that gap. v2 measures the distributions on the Nightingale
+corpus, with correct ground truth:
+
+| scheme | real questions (best score in an answer-bearing file) | filler | 0.25 sits |
+|---|---|---|---|
+| accurate 3000/300 | **0.119 – 0.587** | 0.065 – 0.253 | **inside the spread** |
+| normal 6000/200 | 0.119 – 0.587 | 0.065 – 0.253 | inside the spread |
+| fastest 12000/0 | 0.119 – 0.587 | 0.065 – 0.253 | inside the spread |
+| **proposed 700/120** | **0.225 – 0.636** | 0.065 – 0.253 | **inside the spread** |
+| proposed 1000/150 | 0.119 – 0.587 | 0.065 – 0.253 | inside the spread |
+
+**There is no gap in any scheme.** A real question scores as low as **0.119**
+while the gibberish string `asdf` scores **0.253 — above the floor.** So the
+floor does not merely sit awkwardly in the spread; on this corpus **it rejects a
+genuine evidence question and accepts `asdf`**, which is the precise inversion of
+its purpose.
+
+> **The floor's justification does not generalise.** §24's gap was measured on a
+> *different* corpus (§20's 6.3 MB Phantom Trace demo). §24 already warned that
+> "cosine similarity is not calibrated across embedding models"; v2 shows it is
+> also not calibrated **across corpora**. A single global cosine threshold is a
+> property of one corpus, and this repo currently ships it as a constant.
+
+**Two honest options, and this is a decision, not a patch:**
+
+- **(a) Re-measure the gap on a large real corpus** and pin the floor there.
+  Keeps §F meaningful. Requires a corpus big enough to show a gap — the
+  Nightingale set cannot, at 12 artifacts.
+- **(b) Reconsider the mechanism.** A better-grounded alternative is to filter on
+  **query–chunk lexical overlap as well as cosine**, so `asdf` is rejected for
+  sharing no terms with any chunk rather than for scoring 0.003 too high. That is
+  a real design change and needs its own measurement.
+
+**Whatever is chosen: do not weaken §F to keep the gate green.** §F failing after
+a chunking change is the suite doing its job. Note also that §F will need its
+expected gap **re-derived from evidence**, not edited until it passes.
+
+**Treat the chunking change and the floor as one task, not two** — the score
+distribution moves when the chunking moves, so a floor fitted before the
+re-index is fitted to the wrong distribution.
+
+### 31.7 🔴 NEXT ACTIONS — in this order, for whoever picks this up
+
+**Items 1 and 2 are DONE** (§31.4, §31.6). The operator approved *measure first*,
+and the measurement is complete and **read-only** — nothing in the product has
+been changed. Items 3 onward are unstarted.
+
+1. ~~**Fix the benchmark fixture**~~ ✅ **done** — `bench_chunking2.py` exits 0,
+   "all fixture checks passed". Three instrument bugs fixed, two claims of mine
+   retracted. See §31.4.
+2. ~~**Measure the floor under the new chunking**~~ ✅ **done** — and the answer
+   is that **there is no gap at all**, so this is now a decision for the
+   operator (option (a) or (b) in §31.6), not a measurement to redo.
+3. **Index provenance guard** — every Qdrant collection must record embedder id,
+   `max_seq_length`, dim, chunking scheme and model version; `search_chunks`
+   must **refuse a mismatch rather than answer from it**. Right now a collection
+   knows nothing about what produced it, and `get_client()` **creates** an empty
+   collection for a case that has none — so a stale case and a re-indexed case
+   are indistinguishable and the stale one returns confidently wrong results.
+   **This is small, safe, and it makes every later step recoverable.** It should
+   land before the migration, not after. **This is the next action.**
+4. **Decide the floor** (§31.6) — re-measure on a large corpus, or move to a
+   mechanism with a lexical component. Needs the operator.
+5. **Then** the chunking change (**~700 chars, overlap ~120, global rather than
+   per-profile** — v2 confirms 700 and not 1000, via `T3`), and move together:
+   `graph_builder.py:140` `chunks[:10]` (measured NER cost **42 KiB/s
+   single-threaded** → ~150 s for a 6.3 MB corpus on one core, **~25 s across 6
+   processes**; the "<1 min" cap is a workaround for a missing process pool, not a
+   hardware limit) and the `MODE_TIME_FACTOR` table (0.85 / 1.5 / 3.6 — calibrated
+   when smaller chunks cost more; chunk count no longer changes cost).
+   **Expect ~3.2× the embedding work per ingest** (§31.3 correction) and re-state
+   `MODE_TIME_FACTOR` from that, not from the old table.
+6. **Device resolver** — `vector_store.py:204` constructs
+   `SentenceTransformer('all-MiniLM-L6-v2')` with **no `device=` argument**, so
+   it is CPU-only even where a GPU exists. Needs CUDA / **ROCm
+   (`torch.version.hip`, which is a real gap — ROCm does not set
+   `torch.version.cuda`)** / **MPS (`torch.backends.mps.is_available()`, often
+   *slower* than CPU at small batch and missing some ops, so it needs
+   `PYTORCH_ENABLE_MPS_FALLBACK=1` and a benchmark-based fallback)** / CPU.
+   Also benchmark `set_num_threads`: line 201 uses `os.cpu_count()` = **8 on a
+   4C/8T box**, and hyperthreaded siblings usually *hurt* BLAS throughput.
+7. **NER `n_process`, OCR subprocess pool, hashing overlapped with extraction**
+   (measured 291 MB/s, so a 635 MB image costs ~2.2 s of serial time today).
+8. **Geo** — `GET /api/cases/{id}/geomap` **still works** (EXIF coords +
+   `ip_geolocation` state object); **`GeoMapPage.jsx` was deleted** and
+   `hiddenRoutes.js` retired the route over
+   `tile.openstreetmap.org`. `main.jsx:35` still imports Leaflet CSS for a page
+   that no longer exists. So restoration is frontend-heavy, backend-light.
+   Precedence: **EXIF (already offline) → local `.mmdb` → online only if
+   explicitly enabled.** Keep §24's protection: **never geolocate the operator's
+   own IP.** Every state honest (`exif` / `offline_hit` / `offline_miss` /
+   `online_disabled` / `unavailable`), **never a pin at (0,0)** (§16).
+
+### 31.8 Why the worker pool stays out of scope
+
+The loop is strictly sequential (`job_worker._worker_loop:347`). The good news is
+that Qdrant's exclusive lock is **per-directory per-process**, so N threads in
+one backend process sharing one client is safe — which is what makes it
+*feasible*. The bad news is that **Stop semantics, the per-job governors and the
+`EtaTracker` duty cycle all assume one running job** (§15, §18 B24, §17). A
+failure there is exactly the class of bug this file exists to catch. The operator
+was told this and chose the other three.
+
+### 31.9 Read before touching these
+
+- **`vector_store.py:206`** — `t[:1000]`, **provably a no-op** (cosine 1.000000).
+  Deleting it alone fixes nothing. The defect is `chunk_size` vs a 256-token
+  window.
+- **`ingestion.py:753` vs `:724`** — the indexed text is the **full** text; the
+  DB column is capped at 10,000. Do not "fix" the cap expecting a coverage win.
+- **`ingestion.py:881`** — `all_chunk_texts[:500]`, the only real indexing cap,
+  and it overflows to a **log line only**.
+- **`rag_engine.py:198-199`** — `RETRIEVAL_TOP_K = 14`,
+  `RETRIEVAL_SCORE_FLOOR = 0.25`. §F of the integrity suite pins the floor
+  between measured clusters and **must fail** after a chunking change.
+- **`bench_chunking.py`** (v1) — **broken, exits 1** on 6 fixture checks, reads a
+  truncated corpus. **Its recall table must not be quoted.** Superseded by v2.
+- **`bench_chunking2.py`** — the valid one. **Read-only**: pytsk3 on the raw
+  image, scratch dir under `%TEMP%`, database never opened, **no Qdrant client**.
+  Exits 0 with "all fixture checks passed", and self-asserts
+  `FWLOGNOV.CSV > 10,000 chars` so a regression to the capped DB column is caught.

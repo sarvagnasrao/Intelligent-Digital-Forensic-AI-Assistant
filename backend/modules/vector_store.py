@@ -8,6 +8,7 @@ import requests
 from typing import Optional
 
 from backend.dependencies import get_settings
+from backend.modules.device_resolver import resolve_device, apply_device_config
 
 VECTOR_SIZE = 384
 
@@ -209,13 +210,11 @@ def _load_embed_model():
     # and applied process-wide. It was wrong twice over: it ignored how
     # many cores the machine actually has, and a global thread-pool
     # override fights the resource governor, whose entire job is to cap
-    # CPU use at the ceiling the operator set. Sizing off the real core
-    # count leaves the governor in charge.
-    try:
-        torch.set_num_threads(max(1, (os.cpu_count() or 2)))
-    except Exception:
-        pass
-    _embed_model = SentenceTransformer(EMBEDDER_ID)
+    # CPU use at the ceiling the operator set. The device resolver now
+    # measures and picks the best (device, thread_count) once per process.
+    device_str, thread_count = resolve_device()
+    apply_device_config(device_str, thread_count)
+    _embed_model = SentenceTransformer(EMBEDDER_ID, device=device_str)
     return _embed_model
 
 

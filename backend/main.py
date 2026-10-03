@@ -79,6 +79,7 @@ from backend.routers import (
     cases, evidence, queries, entities,
     notes, audit, reports, watchlist,
     auth_router, credentials, case_access,
+    storage_router,
 )
 from backend.routers import queue_router
 
@@ -95,6 +96,7 @@ app.include_router(reports.router)
 app.include_router(watchlist.router)
 app.include_router(credentials.router)
 app.include_router(case_access.router)
+app.include_router(storage_router.router)
 
 
 # ── WebSocket connection manager ─────────────────────────────────────────────

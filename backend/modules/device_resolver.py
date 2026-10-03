@@ -155,7 +155,6 @@ def _benchmark_cpu_thread_counts() -> tuple[int, float]:
     for threads in unique:
         try:
             torch.set_num_threads(threads)
-            model = torch.jit.load if False else None  # no-op to ensure import
             from sentence_transformers import SentenceTransformer
             model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 

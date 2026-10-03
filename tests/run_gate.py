@@ -74,6 +74,7 @@ SUITES = [
     "verify_queue_api.py",
     "verify_retrieval_integrity.py",
     "verify_service_health.py",
+    "verify_storage.py",
     "verify_vector_store.py",
     "verify_ws_progress.py",
 ]

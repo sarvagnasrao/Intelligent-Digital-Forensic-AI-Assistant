@@ -32,6 +32,7 @@ import RetiredRoute from './components/RetiredRoute'
 import ContradictionsPage from './pages/ContradictionsPage'
 import QueuePage from './pages/QueuePage'
 import SystemHealthPage from './pages/SystemHealthPage'
+import StoragePage from './pages/StoragePage'
 import ChangePasswordPage from './pages/ChangePasswordPage'
 import TwoFactorPage from './pages/TwoFactorPage'
 import { getStatus } from './api/client'
@@ -138,6 +139,9 @@ function AppLayout() {
               } />
               <Route path="/health" element={
                 <ProtectedRoute><SystemHealthPage /></ProtectedRoute>
+              } />
+              <Route path="/storage" element={
+                <ProtectedRoute><StoragePage /></ProtectedRoute>
               } />
               <Route path="/change-password" element={
                 <ProtectedRoute><ChangePasswordPage /></ProtectedRoute>

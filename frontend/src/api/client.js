@@ -346,6 +346,24 @@ export const downloadArtifactFile = (caseId, artifactId) =>
 export const getStorageStats = (caseId) =>
   api.get(`/cases/${caseId}/storage-stats`)
 
+// Storage Management (backend/routers/storage_router.py)
+// Distinct from getStorageStats above, which is the extracted-files-only
+// counter the Evidence page once fetched and never rendered.
+export const getStorageOverview = () => api.get('/storage/overview')
+
+export const getCaseStorage = (caseId, includeArchived = false) =>
+  api.get(`/storage/cases/${caseId}`, {
+    params: includeArchived ? { include_archived: true } : {},
+  })
+
+export const getCaseStorageFiles = (caseId, kind = 'all', includeArchived = false) =>
+  api.get(`/storage/cases/${caseId}/files`, {
+    params: {
+      kind,
+      ...(includeArchived ? { include_archived: true } : {}),
+    },
+  })
+
 export const getGlobalActivity = (params = {}) =>
   api.get('/activity', { params })
 

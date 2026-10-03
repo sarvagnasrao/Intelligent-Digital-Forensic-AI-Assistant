@@ -17,6 +17,7 @@ const NAV_TOP = [
   { icon: LayoutDashboard, label: 'Dashboard',    path: '/'            },
   { icon: Layers,          label: 'Queue',         path: '/queue'       },
   { icon: Activity,        label: 'System Health', path: '/health'      },
+  { icon: HardDrive,      label: 'Storage',       path: '/storage'     },
   { icon: ShieldCheck,    label: 'Logs & Activity', path: '/activity'  },
 ]
 

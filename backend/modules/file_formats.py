@@ -1,4 +1,4 @@
-"""
+﻿"""
 Single source of truth for which evidence file formats we accept.
 
 Why this module exists
@@ -34,6 +34,7 @@ therefore soft at run time and hard in ``tests/verify_file_formats.py``.
 """
 
 import os
+import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,69 @@ FORENSIC_IMAGE_EXTENSIONS = frozenset(
 _ROTATION_SUFFIXES = {f".{i}" for i in range(0, 30)}
 
 
+# ---------------------------------------------------------------------------
+# Split disk-image segments
+# ---------------------------------------------------------------------------
+#
+# A raw acquisition is one disk chopped into NAME.001, NAME.002, ... and an
+# EWF acquisition into NAME.E01, NAME.E02, ... . Those later segments used to
+# be refused by the upload gate, which made a complete split set impossible to
+# submit at all: SCHARDT.001 was accepted, SCHARDT.002 was not, so one request
+# carrying the set died with "Unsupported file type: none in SCHARDT.002", and
+# submitting only the first segment produced an image that was then correctly-
+# but uselessly reported as truncated.
+#
+# The reason is the rotation rule above. `_ROTATION_SUFFIXES` covers ".0" to
+# ".29", so normalize_extension peeled ".002" off "SCHARDT.002" as if it were
+# a rotated log, leaving no extension at all -- the same peel that correctly
+# turns "app.log.12" into ".log".
+#
+# The two namings do not actually collide. Log rotation is written with one or
+# two digits (".1", ".12"); split-image segments are written zero-padded to
+# three (".001", ".002", ".008"). So a zero-padded three-digit suffix is
+# treated as a segment and never peeled. This is the narrowest rule that keeps
+# "app.log.12" resolving to ".log" while letting "SCHARDT.002" resolve to
+# itself.
+SPLIT_SEGMENT_RE = re.compile(r"^\.(?:0\d{2}|[1-9]\d{2})$")
+
+# ".E01" is the first EWF segment; ".E02" and up are continuations.
+EWF_SEGMENT_RE = re.compile(r"^\.e(\d{2,})$", re.IGNORECASE)
+
+# How many segments a split set may have before the resolver stops looking.
+# Bounded so a pathological name cannot spin; 999 segments is already far
+# beyond any real acquisition (FD and Tableau default to 2 GB and 4 GB files).
+MAX_IMAGE_SEGMENTS = 999
+
+
+def is_split_segment_suffix(ext: str) -> bool:
+    """
+    True when ``ext`` names a continuation of a split image rather than the
+    first segment: ``.002``..``.999`` for raw, ``.E02``.. for EWF.
+    """
+    if not ext:
+        return False
+    low = ext.lower()
+    if SPLIT_SEGMENT_RE.match(low):
+        return low != ".001"          # .001 is the set's first segment
+    m = EWF_SEGMENT_RE.match(low)
+    return bool(m) and int(m.group(1)) > 1
+
+
+def is_image_segment_extension(ext: str) -> bool:
+    """
+    True for any split-image segment suffix, first segment included.
+
+    Used by the gate so a whole set can be submitted. Kept apart from
+    ``is_split_segment_suffix`` because "is this a segment at all" and "is this
+    a *continuation*" are different questions: the first segment of a raw set
+    is also a valid standalone upload, a continuation is not.
+    """
+    if not ext:
+        return False
+    low = ext.lower()
+    return bool(SPLIT_SEGMENT_RE.match(low)) or bool(EWF_SEGMENT_RE.match(low))
+
+
 def normalize_extension(filename: str) -> str:
     """
     Returns the lowercase, dot-prefixed extension to classify ``filename`` by.
@@ -257,6 +321,11 @@ def normalize_extension(filename: str) -> str:
 
     Only the leading segments are considered, and the loop is bounded, so a
     name like ``a.b.c.d.e`` cannot spin.
+
+    The rotation peel is skipped when the suffix is a split-image segment
+    (``SCHARDT.002``, ``case.E02``): those suffixes are zero-padded to three
+    digits, while rotation markers are one or two, so the two never collide
+    and ``app.log.12`` still resolves to ``.log``.
     """
     if not filename:
         return ""
@@ -271,6 +340,12 @@ def normalize_extension(filename: str) -> str:
 
     ext = os.path.splitext(name)[1]
 
+    # A split-image segment names itself. ".002" is the second raw segment and
+    # ".E02" the second EWF one; both would otherwise be peeled by the loop
+    # below and the segment refused by the upload gate.
+    if is_image_segment_extension(ext):
+        return ext
+
     # Peel rotation markers: app.log.1 -> .log, app.log.12 -> .log
     for _ in range(4):
         if ext and ext not in _ROTATION_SUFFIXES:
@@ -284,8 +359,19 @@ def normalize_extension(filename: str) -> str:
 
 
 def is_supported_upload(filename: str) -> bool:
-    """True when this filename's format is accepted by the upload gate."""
-    return normalize_extension(filename) in UPLOAD_EXTENSIONS
+    """
+    True when this filename's format is accepted by the upload gate.
+
+    Split-image continuation segments are accepted here even though only the
+    first segment (``.001``, ``.E01``) appears in ``UPLOAD_EXTENSIONS``. Listing
+    all 999 of them would put 999 near-identical entries in the API's format
+    guide and in the native file picker's ``accept`` attribute, so the range is
+    recognised by rule instead. Without this, a complete split set cannot be
+    submitted at all - the request is rejected wholesale on the *second*
+    segment.
+    """
+    ext = normalize_extension(filename)
+    return ext in UPLOAD_EXTENSIONS or is_image_segment_extension(ext)
 
 
 def category_for(filename: str) -> str:
@@ -294,12 +380,26 @@ def category_for(filename: str) -> str:
     accepted. Callers that need to know how a file will be *processed* should
     use this rather than testing against the groups themselves.
     """
-    return _EXTENSION_TO_CATEGORY.get(normalize_extension(filename), "")
+    ext = normalize_extension(filename)
+    if is_image_segment_extension(ext):
+        # A continuation segment is part of the disk image group. It is not a
+        # filesystem walk on its own - it only has meaning next to its first
+        # segment - but categorising it as anything else would hide it from
+        # the split-set grouping in the upload endpoint.
+        return "disk_image"
+    return _EXTENSION_TO_CATEGORY.get(ext, "")
 
 
 def is_forensic_image(filename: str) -> bool:
-    """True for the disk-image extensions, which take the pytsk3 walk path."""
-    return normalize_extension(filename) in FORENSIC_IMAGE_EXTENSIONS
+    """
+    True for the disk-image extensions, which take the pytsk3 walk path.
+
+    Split-image continuation segments count: ``ingest_raw`` hands ``.001`` to
+    pytsk3, which then follows ``.002``.. itself, so the whole set is walked by
+    the same code path as a ``.dd``.
+    """
+    ext = normalize_extension(filename)
+    return ext in FORENSIC_IMAGE_EXTENSIONS or is_image_segment_extension(ext)
 
 
 def accept_string() -> str:

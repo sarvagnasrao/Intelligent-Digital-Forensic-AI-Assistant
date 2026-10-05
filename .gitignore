@@ -84,6 +84,19 @@ logs/
 *.001
 *.vmdk
 
+# Split-image *continuation* segments. The *.001 rule above only ever covered
+# the first segment of a set, so SCHARDT.002 .. SCHARDT.008 were not ignored and
+# a `git add -A` would have staged a multi-gigabyte acquisition one slice at a
+# time. EnCase raw splits are zero-padded to three digits, so this cannot
+# collide with anything else; EWF sets number from .E02 up.
+*.00[2-9]
+*.0[1-9][0-9]
+*.E0[2-9]
+*.E[1-9][0-9]
+
+# Raw evidence staging folder used while ingesting a local acquisition.
+InputFiles/
+
 # ==========================================
 # Test evidence files
 # ==========================================

@@ -1,4 +1,4 @@
-from fastapi import (
+﻿from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
@@ -33,6 +33,8 @@ from backend.modules.file_store import (
 from backend.modules.file_formats import (
     UPLOAD_EXTENSIONS as ALLOWED_EXTENSIONS,
     FORENSIC_IMAGE_EXTENSIONS,
+    EWF_SEGMENT_RE,
+    SPLIT_SEGMENT_RE,
     accept_string,
     category_for,
     describe_groups,
@@ -290,6 +292,147 @@ async def upload_evidence(
 
 from typing import List
 
+# ---------------------------------------------------------------------------
+# Split-image segment handling
+# ---------------------------------------------------------------------------
+
+def _segment_key(filename: str):
+    """
+    Identifies which split set a segment belongs to, and where it sits in it.
+
+    Returns ``(set_id, sequence)`` for a segment - ``("raw:schardt", 1)`` for
+    ``SCHARDT.001``, ``("raw:schardt", 2)`` for ``SCHARDT.002`` - or ``None``
+    for anything that is not a segment, so unsplit images stay separate items.
+
+    The set id carries the container kind as well as the stem because ``.001``
+    and ``.E01`` are both sequence 1: a raw ``disk.001`` and an EWF ``disk.E01``
+    that share a stem are two different acquisitions in two different
+    containers, and concatenating them would produce a file that is neither.
+    The stem is lowercased so ``SCHARDT.001`` and ``schardt.002`` are recognised
+    as one set on a case-insensitive filesystem, where they are one on disk.
+    """
+    base = os.path.basename(filename or "")
+    ext = os.path.splitext(base)[1].lower()
+    stem = base[:-len(ext)] if ext else base
+    if not stem:
+        return None
+    if SPLIT_SEGMENT_RE.match(ext):
+        return (f"raw:{stem.lower()}", int(ext[1:]))
+    m = EWF_SEGMENT_RE.match(ext)
+    if m:
+        return (f"ewf:{stem.lower()}", int(m.group(1)))
+    return None
+
+
+def _group_image_segments(image_files: list) -> list:
+    """
+    Splits uploaded disk images into one group per artefact.
+
+    A split set becomes one group, ordered by segment sequence so ``.001``
+    leads. Unsplit images (``.dd``, ``.img``) are one group each, so uploading
+    three independent images still yields three evidence items rather than one
+    blob that cannot be mounted.
+
+    Grouping is by set id only - the sequence number is the sort key, never part
+    of the identity, or every segment of a set would land in its own group and
+    the set would never be reassembled.
+    """
+    groups = {}
+    order = []
+    for f in image_files:
+        key = _segment_key(f.filename or "")
+        gkey = key[0] if key is not None else ("file", (f.filename or "").lower())
+        if gkey not in groups:
+            groups[gkey] = []
+            order.append(gkey)
+        groups[gkey].append(f)
+
+    ordered = []
+    for gkey in order:
+        members = groups[gkey]
+        keys = [_segment_key(m.filename or "") for m in members]
+        if all(k is not None for k in keys):
+            members = [m for _, m in sorted(
+                zip(keys, members), key=lambda pair: pair[0][1])]
+        ordered.append(members)
+    return ordered
+
+
+async def _store_image_segment_set(
+        segment_files: list,
+        case_id: str,
+        db: Session,
+        settings,
+        current_user) -> models.Evidence:
+    """
+    Writes one disk image (split or not) as a single evidence item.
+
+    Each segment is stored under its own name with the item's id as prefix -
+    ``{evidence_id}_SCHARDT.001``, ``{evidence_id}_SCHARDT.002``, ... - because
+    that is exactly the naming the image readers resolve against, and the
+    prefix keeps the files under one evidence item in the case directory.
+
+    ``file_path`` points at the first segment, which is what the walk opens.
+    ``file_size_bytes`` is the sum of the set and ``sha256_hash`` the digest of
+    the segments in order, so the recorded size and hash describe the whole
+    image rather than one slice of it.
+    """
+    evidence_id = str(uuid.uuid4())
+    ev_dir = os.path.join(settings.cases_dir, case_id, "evidence")
+    os.makedirs(ev_dir, exist_ok=True)
+
+    total = 0
+    digest = hashlib.sha256()
+    stored_names = []
+
+    for f in segment_files:
+        original = f.filename or "unknown"
+        safe = f"{evidence_id}_{original}"
+        path = os.path.join(ev_dir, safe)
+        async with aiofiles.open(path, "wb") as out_file:
+            while True:
+                chunk = await f.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                await out_file.write(chunk)
+                digest.update(chunk)
+                total += len(chunk)
+        stored_names.append(safe)
+
+    head = stored_names[0]
+    head_path = os.path.join(ev_dir, head)
+    ext = normalize_extension(segment_files[0].filename or "")
+    is_split = len(segment_files) > 1 or \
+        _segment_key(segment_files[0].filename or "") is not None
+
+    notes = None
+    if len(segment_files) > 1:
+        notes = (f"Split acquisition: {len(segment_files)} segments "
+                 f"({segment_files[0].filename} .. "
+                 f"{segment_files[-1].filename}) stored as one image; the "
+                 f"walk opens {head} and resolves the rest by name.")
+    elif is_split:
+        notes = (f"Single segment of a split acquisition. The remaining "
+                 f"segments are not present, so this image is incomplete.")
+
+    item = models.Evidence(
+        id=evidence_id,
+        case_id=case_id,
+        filename=head,
+        original_filename=segment_files[0].filename or "unknown",
+        file_type=ext.lstrip("."),
+        file_size_bytes=total,
+        file_path=head_path,
+        sha256_hash=digest.hexdigest(),
+        ingested_at=datetime.utcnow(),
+        ingested_by=current_user.username,
+        status="Uploaded",
+        notes=notes,
+    )
+    db.add(item)
+    return item
+
+
 @router.post("/upload_multi", response_model=schemas.EvidenceResponse, status_code=201)
 async def upload_multi_evidence(
     case_id: str,
@@ -300,9 +443,10 @@ async def upload_multi_evidence(
     """
     Upload several files at once.
 
-    Split disk-image segments (.001, .002, ...) are concatenated into a
-    single image, because a split set is one artefact and the pytsk3 walk
-    needs it whole. Everything else is stored as its own evidence item.
+    Split disk-image segments (SCHARDT.001/.002/..., case.E01/E02/...) are
+    stored as one evidence item: each segment keeps its own name and sequence
+    suffix under the item's id, and the walk resolves the set from the first
+    segment. Everything else is stored as its own evidence item.
 
     This endpoint used to concatenate unconditionally, so selecting three
     log files produced one .dd blob and handed it to the forensic walk - which
@@ -312,8 +456,8 @@ async def upload_multi_evidence(
     worker could not open the file it was asked to ingest and the
     chain-of-custody check reported the evidence as missing.
 
-    Returns the combined image when there is one, otherwise the first stored
-    item, so the response shape is unchanged.
+    Returns the image when there is one, otherwise the first stored item, so
+    the response shape is unchanged.
     """
     try:
         settings = get_settings()
@@ -354,55 +498,25 @@ async def upload_multi_evidence(
 
         created = []
 
-        # --- split disk image segments -> one combined image ---
+        # --- split disk image segments -> one evidence item, staged natively ---
+        #
+        # A split set is stored segment by segment, under one evidence id and
+        # keeping each segment's own sequence suffix. pytsk3 (raw) and libewf
+        # (EWF) both resolve ``.002`` and up by name beside the file they are
+        # handed, so the set walks as one image with no second full-size copy on
+        # disk.
+        #
+        # This replaces a concatenation that wrote ``NAME_combined.dd``: for an
+        # 8-segment 4.5 GB acquisition that doubled the evidence footprint to
+        # 9 GB, held the whole set in the request body at once, and produced a
+        # file whose bytes no longer matched any acquisition artefact.
         if image_files:
-            # Sorted so .001, .002 ... reassemble in the right order.
-            sorted_images = sorted(
-                image_files, key=lambda f: f.filename or "")
+            groups = _group_image_segments(image_files)
 
-            evidence_id = str(uuid.uuid4())
-            base_name = sorted_images[0].filename or "unknown"
-            name_no_ext, _ = os.path.splitext(base_name)
-            final_filename = f"{name_no_ext}_combined.dd"
-
-            safe_filename = f"{evidence_id}_{final_filename}"
-            file_path = os.path.join(
-                settings.cases_dir, case_id, "evidence", safe_filename
-            )
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-
-            file_size_bytes = 0
-            sha256 = hashlib.sha256()
-
-            # Stream chunks to avoid loading gigabytes into RAM
-            async with aiofiles.open(file_path, "wb") as out_file:
-                for f in sorted_images:
-                    while True:
-                        chunk = await f.read(1024 * 1024 * 4)  # 4MB chunks
-                        if not chunk:
-                            break
-                        await out_file.write(chunk)
-                        sha256.update(chunk)
-                        file_size_bytes += len(chunk)
-
-            combined = models.Evidence(
-                id=evidence_id,
-                case_id=case_id,
-                filename=final_filename,
-                original_filename=final_filename,
-                file_type="dd",
-                file_size_bytes=file_size_bytes,
-                file_path=file_path,
-                sha256_hash=sha256.hexdigest(),
-                ingested_at=datetime.utcnow(),
-                ingested_by=current_user.username,
-                status="Uploaded",
-                notes=(
-                    f"Combined from {len(sorted_images)} split files"
-                ),
-            )
-            db.add(combined)
-            created.append(combined)
+            for segment_files in groups:
+                item = await _store_image_segment_set(
+                    segment_files, case_id, db, settings, current_user)
+                created.append(item)
 
         # --- everything else -> one evidence item per file ---
         for f in plain_files:
@@ -1041,7 +1155,7 @@ def get_evidence(
 
 
 # ---------------------------------------------------------------------------
-# DELETE /api/cases/{case_id}/evidence/{evidence_id}  — soft archive
+# DELETE /api/cases/{case_id}/evidence/{evidence_id}  â€” soft archive
 # ---------------------------------------------------------------------------
 
 @router.delete("/{evidence_id}", response_model=schemas.SuccessResponse)
@@ -1114,7 +1228,7 @@ def archive_evidence(
                 ).model_dump(),
             )
 
-        # Qdrant cleanup — remove this evidence's vectors before archiving.
+        # Qdrant cleanup â€” remove this evidence's vectors before archiving.
         #
         # This was wrapped in `except Exception: print(...)` and marked
         # non-fatal, which made the archive a lie in the one direction that
@@ -1154,7 +1268,7 @@ def archive_evidence(
             raise HTTPException(
                 status_code=500,
                 detail=schemas.ErrorResponse(
-                    error="Archive aborted — search index not cleaned",
+                    error="Archive aborted â€” search index not cleaned",
                     detail=(
                         f"The vectors for {db_evidence.original_filename} could "
                         f"not be removed ({_e}), so its text would still be "
@@ -1168,7 +1282,7 @@ def archive_evidence(
         # Captured before it is zeroed below, so the audit trail records how
         # much was removed. The embedded client's delete() does not report how
         # many points its filter matched on this version, so this is the
-        # pre-archive figure rather than a measured delete count — stated as
+        # pre-archive figure rather than a measured delete count â€” stated as
         # such rather than presented as something the delete confirmed.
         removed_chunks = db_evidence.chunk_count or 0
 
@@ -1177,21 +1291,21 @@ def archive_evidence(
         #
         # Making archive actually delete vectors is what created this problem:
         # from here on, chunk_count would count chunks that no longer exist.
-        # Four consumers read it without checking status — the case export
+        # Four consumers read it without checking status â€” the case export
         # (cases.py), the PDF report and its generator, and the queue's
-        # evidence row — so a stale value means a report and an export that
+        # evidence row â€” so a stale value means a report and an export that
         # over-count an archived case's index.
         #
         # The alternative was to keep the number as history and teach all four
         # readers that "Archived" means the figure is historical. A value that
         # is only correct in some states, read by code that does not know about
-        # the others, is the §18 failure one layer down; the count of how many
+        # the others, is the Â§18 failure one layer down; the count of how many
         # chunks were removed is recorded in the audit entry below anyway.
         #
         # So the invariant is the simple one: chunk_count is the number of
         # vectors this evidence currently has in the search index. entity_count
         # is untouched because entities live in the database and archiving
-        # never removed them — it is still true.
+        # never removed them â€” it is still true.
         db_evidence.chunk_count = 0
         db.commit()
 
@@ -1227,7 +1341,7 @@ def archive_evidence(
 
 
 # ---------------------------------------------------------------------------
-# POST /api/cases/{case_id}/evidence/{evidence_id}/restore  — undo an archive
+# POST /api/cases/{case_id}/evidence/{evidence_id}/restore  â€” undo an archive
 # ---------------------------------------------------------------------------
 
 @router.post("/{evidence_id}/restore", response_model=schemas.SuccessResponse)
@@ -1250,7 +1364,7 @@ def restore_evidence(
     deliberate and it is the only honest option:
 
       * archiving DELETED this evidence's vectors from Qdrant, so it is no
-        longer indexed, and saying otherwise would be the §15/B14 failure --
+        longer indexed, and saying otherwise would be the Â§15/B14 failure --
         a row that looks searchable and returns nothing
       * 'Uploaded' is exactly the state of a file that is on disk and not yet
         ingested, and it is the state the normal Queue button already
@@ -1312,7 +1426,7 @@ def restore_evidence(
         # for any row archived by this code the value is already 0. It is
         # repeated because a row archived by an EARLIER version of the endpoint
         # still carries its old count, and a restored item that claims chunks
-        # it does not have is the searchable-as-empty failure from §15/B14.
+        # it does not have is the searchable-as-empty failure from Â§15/B14.
         db_evidence.chunk_count = 0
         db_evidence.ingestion_job_id = None  # the old job is not this item's
         db_evidence.error_message = None
@@ -1334,7 +1448,7 @@ def restore_evidence(
         return schemas.SuccessResponse(
             message=(
                 f"Evidence {evidence_id} restored. Its search index was "
-                "removed when it was archived, so it is now 'Uploaded' — "
+                "removed when it was archived, so it is now 'Uploaded' â€” "
                 "queue it again to re-index it."
             )
         )

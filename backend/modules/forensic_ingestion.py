@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import hashlib
 import json
@@ -18,7 +18,7 @@ from backend.modules.file_store import (
 from backend.modules.text_parser import decode_text_bytes
 from backend.modules.file_formats import normalize_extension
 
-# These imports are conditional —
+# These imports are conditional â€”
 # wrap in try/except for graceful failure
 try:
     import pyewf
@@ -122,7 +122,7 @@ VIDEO_EXTENSIONS = {
 EMAIL_EXTENSIONS = {'.eml', '.msg'}
 
 # Skip system/binary/archive files
-# Audio and video are NO LONGER skipped —
+# Audio and video are NO LONGER skipped â€”
 # they are processed by media_extractor.
 SKIP_EXTENSIONS = {
     '.exe', '.dll', '.sys', '.bin',
@@ -232,7 +232,7 @@ def is_supported_file(filename: str,
                 return True
         except ImportError:
             pass
-        return False  # Unknown extensionless file — skip
+        return False  # Unknown extensionless file â€” skip
     # All other files: max 50 MB
     if size > MAX_FILE_SIZE:
         return False
@@ -576,7 +576,7 @@ def extract_text_from_bytes(
     if real_office:
         ext = "." + real_office
 
-    # PDF files — check before text
+    # PDF files â€” check before text
     if ext in PDF_EXTENSIONS:
         try:
             tmp_path = os.path.join(
@@ -592,7 +592,7 @@ def extract_text_from_bytes(
         except Exception:
             return "", 'pdf', {}
 
-    # SQLite databases — check before text
+    # SQLite databases â€” check before text
     if ext in DB_EXTENSIONS:
         try:
             from backend.modules.media_extractor import extract_browser_history
@@ -643,7 +643,7 @@ def extract_text_from_bytes(
         except Exception:
             return "", 'sqlite', {}
 
-    # HTML files — check before text (.html is in both sets)
+    # HTML files â€” check before text (.html is in both sets)
     if ext in HTML_EXTENSIONS:
         try:
             soup = BeautifulSoup(data, 'lxml')
@@ -653,7 +653,7 @@ def extract_text_from_bytes(
         except Exception:
             return "", 'html', {}
 
-    # Image files — try OCR first,
+    # Image files â€” try OCR first,
     # then fall through to EXIF below
     if ext in IMAGE_EXTENSIONS:
         if not run_ocr:
@@ -722,12 +722,12 @@ def extract_text_from_bytes(
                 pass
         return "", 'exif', {}
 
-    # RTF — a Word export that decodes to control-word noise,
+    # RTF â€” a Word export that decodes to control-word noise,
     # so it gets a real stripper rather than a raw read.
     if ext in RTF_EXTENSIONS:
         return _extract_rtf(data)
 
-    # Apple property lists — binary or XML, parsed with plistlib
+    # Apple property lists â€” binary or XML, parsed with plistlib
     # (stdlib) and flattened to searchable key/value text.
     if ext in PLIST_EXTENSIONS:
         return _extract_plist(data)
@@ -738,7 +738,7 @@ def extract_text_from_bytes(
         return _extract_subtitle(data)
 
     # Plain text files
-    # (txt, log, csv, json, py, js, md, yaml, sql…)
+    # (txt, log, csv, json, py, js, md, yaml, sqlâ€¦)
     if ext in TEXT_EXTENSIONS:
         text, encoding = decode_text_bytes(data)
         if not text.strip():
@@ -811,7 +811,7 @@ def _sniff_unknown_text(data: bytes) -> tuple:
     return decoded[:50000], 'text_sniffed', {'_identified_by': 'content'}
 
 
-# ── content sniffing: the fallback that makes disk images usable ─────────────
+# â”€â”€ content sniffing: the fallback that makes disk images usable â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
 # WHY THIS EXISTS
 # Extension dispatch is the wrong model for forensic disk images, and not by a
@@ -963,7 +963,7 @@ def _convert_gps(coord, ref) -> float:
 
 
 # ---------------------------------------------------------------------------
-# EWFImageInfo — bridge between pyewf and pytsk3
+# EWFImageInfo â€” bridge between pyewf and pytsk3
 # ---------------------------------------------------------------------------
 
 if PYTSK3_AVAILABLE:
@@ -1176,6 +1176,111 @@ def _declared_volume_bytes(boot: bytes,
     return part_sectors * 512
 
 
+def image_segment_paths(image_path: str) -> list:
+    """
+    The ordered segment paths of the split image ``image_path`` belongs to.
+
+    An acquisition above the segment size limit is one disk written as
+    ``NAME.001``, ``NAME.002``, ... (raw/EnCase-E01 style) or ``NAME.E01``,
+    ``NAME.E02``, ... (EWF style). pytsk3 and libewf both resolve the sibling
+    segments by name next to the file they are handed, so the set is one image
+    to every layer - but only if the first segment is passed, and only if the
+    siblings are actually there.
+
+    Returns every segment found, in sequence order, starting with
+    ``image_path`` when it is a first segment. Returns ``[image_path]`` alone
+    when the file is not a split first segment (a ``.dd``, or a lone ``.001``
+    with no siblings staged beside it - which is exactly the case the caller
+    needs to be able to report).
+
+    The stored evidence name carries an ``{evidence_id}_`` prefix; matching is
+    done on the full basename, so a prefixed set resolves just as a bare one
+    does.
+    """
+    from backend.modules.file_formats import (
+        SPLIT_SEGMENT_RE, EWF_SEGMENT_RE, MAX_IMAGE_SEGMENTS)
+
+    directory = os.path.dirname(os.path.abspath(image_path))
+    basename = os.path.basename(image_path)
+    suffix = os.path.splitext(basename)[1].lower()
+    stem = basename[:-len(suffix)] if suffix else basename
+    if not stem:
+        # A bare ".001" with no name to extend - nothing to resolve against.
+        return [image_path]
+
+    if SPLIT_SEGMENT_RE.match(suffix):
+        # Raw split set: .001 is the first segment, whatever this file is.
+        first = os.path.join(directory, stem + ".001")
+    elif EWF_SEGMENT_RE.match(suffix):
+        first = os.path.join(directory, stem + ".E01")
+    else:
+        return [image_path]          # a .dd / .img is one whole file
+
+    if not os.path.exists(first):
+        # A continuation whose first segment was never supplied. The
+        # continuation on its own has no partition table.
+        return [image_path]
+
+    segments = []
+    for i in range(1, MAX_IMAGE_SEGMENTS + 1):
+        tail = (f".{i:03d}" if SPLIT_SEGMENT_RE.match(suffix)
+                else f".E{i:02d}")
+        candidate = os.path.join(directory, stem + tail)
+        if not os.path.exists(candidate):
+            break
+        segments.append(candidate)
+
+    return segments
+
+
+def missing_image_segments(image_path: str) -> list:
+    """
+    The segment suffixes that would follow ``image_path`` but are absent.
+
+    Only meaningful when the file is a split *first* segment; a continuation
+    segment has no successors to be missing, so an empty list is returned for
+    it and for unsplit images.
+    """
+    from backend.modules.file_formats import (
+        SPLIT_SEGMENT_RE, EWF_SEGMENT_RE, MAX_IMAGE_SEGMENTS)
+
+    basename = os.path.basename(os.path.abspath(image_path))
+    suffix = os.path.splitext(basename)[1].lower()
+    # Only a *first* segment can be missing successors. A continuation has
+    # nothing after it, and an unsplit image (.dd/.img) is not a set at all.
+    if suffix not in (".001", ".e01"):
+        return []
+
+    directory = os.path.dirname(os.path.abspath(image_path))
+    stem = basename[:-len(suffix)]
+    if not stem:
+        return []
+
+    tail = "{:03d}" if SPLIT_SEGMENT_RE.match(suffix) else "E{:02d}"
+    # Only *holes* are reportable. A set that stops at .003 is complete - we
+    # cannot tell "this acquisition was 3 segments" from "the rest is missing",
+    # and listing .004...999 for every healthy set would bury a real gap. A
+    # hole is unambiguous: a later segment exists, so this one is absent.
+    seen = 2
+    missing = []
+    while seen <= MAX_IMAGE_SEGMENTS:
+        exists = os.path.exists(
+            os.path.join(directory, stem + "." + tail.format(seen)))
+        if not exists:
+            # Peek past the gap: if nothing later exists, this is the end of
+            # the set, not a hole.
+            later = any(
+                os.path.exists(
+                    os.path.join(directory, stem + "." + tail.format(j)))
+                for j in range(seen + 1,
+                               min(seen + 32, MAX_IMAGE_SEGMENTS + 1)))
+            if not later:
+                break
+            missing.append("." + tail.format(seen))
+        seen += 1
+    return missing
+
+
 def inspect_raw_image(image_path: str) -> dict:
     """
     Parses the MBR and per-partition boot sectors of a
@@ -1186,9 +1291,19 @@ def inspect_raw_image(image_path: str) -> dict:
     (for NTFS the $MFT usually sits past EOF), and the
     resulting TSK error is actively misleading.
 
+    A split acquisition is measured as the *set*, not as the first segment.
+    ``SCHARDT.001`` alone is 635 MB of a disk whose partition table claims
+    4.5 GB, so measuring the segment reports a complete 8-segment acquisition
+    as truncated and tells the investigator to re-acquire it - a confident and
+    completely wrong accusation, which is worse than no diagnosis. When the
+    siblings are present the segments are summed, because that is the size the
+    filesystem actually spans.
+
     Returns a dict:
       {
-        'file_size': int,
+        'file_size': int,          # size of the set, not one segment
+        'segments': [str, ...],    # every segment found, in order
+        'missing_segments': [str], # suffixes absent from the set
         'has_mbr': bool,
         'partitions': [ {index, offset, sectors, type,
                          fs_type, declared_bytes,
@@ -1199,14 +1314,21 @@ def inspect_raw_image(image_path: str) -> dict:
     """
     result = {
         "file_size": 0,
+        "segments": [],
+        "missing_segments": [],
         "has_mbr": False,
         "partitions": [],
         "truncated": False,
         "summary": "",
     }
 
+    segments = image_segment_paths(image_path)
+    result["segments"] = segments
+    result["missing_segments"] = missing_image_segments(image_path)
+    is_split = len(segments) > 1
+
     try:
-        file_size = os.path.getsize(image_path)
+        file_size = sum(os.path.getsize(p) for p in segments)
     except OSError as e:
         result["summary"] = f"Cannot stat image: {e}"
         return result
@@ -1270,7 +1392,28 @@ def inspect_raw_image(image_path: str) -> dict:
         return result
 
     bad = [p for p in result["partitions"] if p["truncated"]]
-    if bad:
+    # A split set whose tail segments are absent is missing data, not a
+    # truncated acquisition, and the two need different remedies: upload the
+    # remaining segments versus re-acquire the disk. Naming the missing
+    # segments is the actionable form of that.
+    set_incomplete = bool(result["missing_segments"]) and \
+        len(result["segments"]) == 1
+
+    if bad and set_incomplete:
+        p = bad[0]
+        missing = ", ".join(result["missing_segments"][:6])
+        if len(result["missing_segments"]) > 6:
+            missing += f", ... (+{len(result['missing_segments']) - 6} more)"
+        result["summary"] = (
+            f"SPLIT IMAGE SET IS INCOMPLETE - {os.path.basename(image_path)} "
+            f"is the first segment of a split acquisition, but segments "
+            f"{missing} are not beside it. "
+            f"Partition {p['index']} ({p['fs_type']}) declares "
+            f"{_human_bytes(p['declared_bytes'])} while the set present holds "
+            f"{_human_bytes(file_size)}. Upload the whole segment set - "
+            f"a lone first segment cannot be walked."
+        )
+    elif bad:
         result["truncated"] = True
         p = bad[0]
         pct = (100.0 * p["present_bytes"] / p["declared_bytes"]) \
@@ -1284,9 +1427,12 @@ def inspect_raw_image(image_path: str) -> dict:
             f"fully walked - re-acquire the complete image."
         )
     else:
+        tail = ""
+        if is_split:
+            tail = (f" across {len(result['segments'])} split segments")
         result["summary"] = (
             f"Layout OK - {len(result['partitions'])} partition(s), "
-            f"all fully contained in {_human_bytes(file_size)}."
+            f"all fully contained in {_human_bytes(file_size)}{tail}."
         )
 
     return result
@@ -1436,10 +1582,27 @@ def ingest_raw(image_path: str,
     """
     Opens a raw (.dd / .img / .raw / .001) image.
     Yields file info dicts.
+
+    A split set is opened by its *first* segment: pytsk3 resolves ``.002`` and
+    up by name beside the file it is handed, so the whole set is walked by one
+    ``Img_Info`` without concatenating the segments into a second full-size
+    copy. If the caller passed a continuation segment, the walk is redirected
+    to the set's first segment rather than failing, because the continuation
+    alone has no partition table and mounts as nothing.
     """
     if not PYTSK3_AVAILABLE:
         raise RuntimeError(
             "pytsk3 not installed.")
+
+    from backend.modules.file_formats import is_split_segment_suffix
+
+    if is_split_segment_suffix(os.path.basename(image_path)):
+        head = image_segment_paths(image_path)
+        if len(head) > 1:
+            print(f"[FORENSIC] {os.path.basename(image_path)} is a "
+                  f"continuation segment - opening the set via "
+                  f"{os.path.basename(head[0])}")
+            image_path = head[0]
 
     # Pre-flight: refuse to pretend a partial image is fine.
     report = inspect_raw_image(image_path)
@@ -1447,6 +1610,8 @@ def ingest_raw(image_path: str,
         print(f"[FORENSIC] WARNING: {report['summary']}")
         print("[FORENSIC] Attempting partial recovery anyway - "
               "results will be incomplete.")
+    elif report["missing_segments"]:
+        print(f"[FORENSIC] {report['summary']}")
 
     img_info = pytsk3.Img_Info(image_path)
 

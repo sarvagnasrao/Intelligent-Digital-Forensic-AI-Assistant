@@ -19,9 +19,9 @@ import useWebSocket from '../hooks/useWebSocket'
 // ─── Status config ────────────────────────────────────────────────────────────
 const STATUS_CONFIG = {
   Running: {
-    color: '#6366f1',
-    bg: 'rgba(99,102,241,0.1)',
-    border: 'rgba(99,102,241,0.25)',
+    color: '#0284c7',
+    bg: 'rgba(2,132,199,0.1)',
+    border: 'rgba(2,132,199,0.25)',
     icon: RefreshCw,
     spin: true,
     label: 'Processing',
@@ -255,7 +255,7 @@ function JobSettingsPanel({ job, modes, ramMaxMb, onSave, onClose, saving }) {
             type="range" min="10" max="100" step="5"
             value={cpu}
             onChange={e => setCpu(Number(e.target.value))}
-            style={{ flex: 1, accentColor: '#6366f1' }}
+            style={{ flex: 1, accentColor: '#0284c7' }}
           />
           <span style={{ ...value, minWidth: 34, textAlign: 'right' }}>{cpu}%</span>
         </div>
@@ -285,7 +285,7 @@ function JobSettingsPanel({ job, modes, ramMaxMb, onSave, onClose, saving }) {
               type="range" min="0" max={ramMaxMb} step="128"
               value={Math.min(ram, ramMaxMb)}
               onChange={e => setRam(Number(e.target.value))}
-              style={{ flex: 1, accentColor: '#6366f1' }}
+              style={{ flex: 1, accentColor: '#0284c7' }}
             />
             <span style={{ ...value, minWidth: 52, textAlign: 'right' }}>
               {ram} MB
@@ -497,7 +497,7 @@ function JobRow({ job, onRetry, onDelete, onSaveSettings, onForceStart, onStop, 
               <div style={{
                 height: '100%',
                 width: `${progress}%`,
-                background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                background: 'linear-gradient(90deg, #0284c7, #2563eb)',
                 borderRadius: 2,
                 transition: 'width 0.5s ease',
               }} />
@@ -988,7 +988,7 @@ export default function QueuePage() {
         <StatCard
           label="Running"
           value={running}
-          color="#6366f1"
+          color="#0284c7"
           active={filter === 'running'}
           onClick={() => setFilter(f => f === 'running' ? 'all' : 'running')}
         />
@@ -1116,20 +1116,20 @@ export default function QueuePage() {
           gap: 8,
           marginTop: 12,
           padding: '8px 16px',
-          background: 'rgba(99,102,241,0.06)',
-          border: '1px solid rgba(99,102,241,0.15)',
+          background: 'rgba(2,132,199,0.06)',
+          border: '1px solid rgba(2,132,199,0.15)',
           borderRadius: 8,
         }}>
           <span style={{
             width: 6,
             height: 6,
             borderRadius: '50%',
-            background: '#6366f1',
-            boxShadow: '0 0 6px #6366f1',
+            background: '#0284c7',
+            boxShadow: '0 0 6px #0284c7',
             animation: 'pulse-glow 2s infinite',
             flexShrink: 0,
           }} />
-          <span style={{ fontSize: 12, color: '#818cf8' }}>
+          <span style={{ fontSize: 12, color: '#38bdf8' }}>
             {running} job(s) actively processing forensic evidence — page updates automatically every 3 s
           </span>
         </div>

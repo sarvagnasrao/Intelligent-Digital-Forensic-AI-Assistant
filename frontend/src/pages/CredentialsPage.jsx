@@ -350,7 +350,7 @@ export default function CredentialsPage() {
               setHideFP(e.target.checked)
               setTimeout(load, 0)
             }}
-            style={{ accentColor: '#6366f1' }}
+            style={{ accentColor: '#0284c7' }}
           />
           Hide false positives
         </label>

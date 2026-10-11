@@ -1,650 +1,354 @@
-  import React, { useState } from 'react'
-  import { useNavigate } from 'react-router-dom'
-  import { Shield, Network, Bot,
-           HardDrive, FileText,
-           Lock, Eye, EyeOff,
-           ChevronRight, Activity,
-           Search, AlertTriangle,
-           Key, Globe } from 'lucide-react'
-  import { useAuth } from '../context/AuthContext'
-  import { apiErrorMessage } from '../api/client'
-  import toast from 'react-hot-toast'
+import React, { useState, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Shield, Lock, Eye, EyeOff } from 'lucide-react'
+import { useAuth } from '../context/AuthContext'
+import { apiErrorMessage } from '../api/client'
+import toast from 'react-hot-toast'
 
-  const FEATURES = [
-    {
-      icon: HardDrive,
-      title: 'Forensic Ingestion',
-      desc: 'Parse .E01, .001, .dd disk images. Extract every file, email, browser history and registry entry automatically.',
-      color: '#6366f1',
-    },
-    {
-      icon: Bot,
-      title: 'AI Investigation',
-      desc: 'Ask questions in natural language. Every answer is grounded in evidence with full source citations.',
-      color: '#8b5cf6',
-    },
-    {
-      icon: Network,
-      title: 'Entity Relationship Graph',
-      desc: 'Visualise connections between people, locations, devices and IP addresses across all evidence.',
-      color: '#06b6d4',
-    },
-    {
-      icon: Shield,
-      title: 'Chain of Custody',
-      desc: 'SHA-256 integrity verification, full audit trail, and signed PDF reports for every action taken.',
-      color: '#10b981',
-    },
-    {
-      icon: Key,
-      title: 'Credential Scanner',
-      desc: 'Automatically detect passwords, API keys, private keys and tokens hidden within evidence files.',
-      color: '#f59e0b',
-    },
-    {
-      icon: Globe,
-      title: 'Geographic Intelligence',
-      desc: 'Plot GPS coordinates from EXIF metadata and geolocate IP addresses on an interactive map.',
-      color: '#ef4444',
-    },
-  ]
+export default function LoginPage() {
+  const { user, signIn } = useAuth()
+  const navigate = useNavigate()
+  const [form, setForm] = useState({ username: '', password: '' })
+  const [loading, setLoading] = useState(false)
+  const [showPass, setShowPass] = useState(false)
 
-  const STATS = [
-    { value: '15+', label: 'File formats' },
-    { value: 'AES', label: 'Encryption' },
-    { value: '100%', label: 'Air-gapped' },
-    { value: 'SHA-256', label: 'Integrity' },
-  ]
+  // If already authenticated, redirect immediately to the Dashboard
+  useEffect(() => {
+    if (user) {
+      navigate('/dashboard', { replace: true })
+    }
+  }, [user, navigate])
 
-  export default function LoginPage() {
-    const { signIn } = useAuth()
-    const navigate = useNavigate()
-    const [form, setForm] = useState({ username: '', password: '' })
-    const [loading, setLoading] = useState(false)
-    const [showPass, setShowPass] = useState(false)
-    const [showLogin, setShowLogin] = useState(false)
-
-    const handleLogin = async (e) => {
-      e?.preventDefault()
-      if (!form.username || !form.password) {
-        toast.error('Enter credentials')
+  const handleLogin = async (e) => {
+    e?.preventDefault()
+    if (!form.username || !form.password) {
+      toast.error('Enter credentials')
+      return
+    }
+    setLoading(true)
+    try {
+      const res = await signIn(form.username, form.password)
+      if (res?.requires2FA) {
+        navigate('/2fa')
         return
       }
-      setLoading(true)
-      try {
-        await signIn(form.username, form.password)
-        navigate('/')
-      } catch (e) {
-        // Not `e.response?.data?.detail || '...'`: with the
-        // backend down the proxy answers 500 with an empty
-        // body, so that fallback reported an unreachable
-        // server as bad credentials.
-        toast.error(apiErrorMessage(
-          e, 'Authentication failed'))
-      } finally {
-        setLoading(false)
-      }
+      navigate('/dashboard', { replace: true })
+    } catch (err) {
+      toast.error(apiErrorMessage(err, 'Authentication failed'))
+    } finally {
+      setLoading(false)
     }
+  }
 
-    return (
+  return (
+    <div style={{
+      minHeight: '100vh',
+      width: '100%',
+      background: 'var(--bg-app)',
+      color: 'var(--text-primary)',
+      fontFamily: 'Inter, system-ui, sans-serif',
+      position: 'relative',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: '28px 4vw',
+      overflowY: 'auto',
+      overflowX: 'hidden',
+      boxSizing: 'border-box',
+    }}>
+
+      {/* Ambient background decoration */}
       <div style={{
-        minHeight: '100vh',
-        background: 'var(--bg-app)',
-        color: 'var(--text-primary)',
-        fontFamily: 'Inter, system-ui, sans-serif',
-        position: 'relative',
-        overflow: 'hidden',
+        position: 'fixed', inset: 0,
+        zIndex: 0, pointerEvents: 'none',
       }}>
-
-        {/* Animated background blobs */}
+        {/* Dot grid */}
         <div style={{
-          position: 'fixed', inset: 0,
-          zIndex: 0, pointerEvents: 'none',
-        }}>
-          {/* Dot grid */}
-          <div style={{
-            position: 'absolute', inset: 0,
-            backgroundImage:
-              'radial-gradient(circle,' +
-              'rgba(255,255,255,0.045) 1px,' +
-              'transparent 1px)',
-            backgroundSize: '28px 28px',
-          }} />
-          {/* Blobs */}
-          <div style={{
-            position: 'absolute',
-            top: '-15%', left: '-10%',
-            width: '50%', height: '50%',
-            borderRadius: '50%',
-            background:
-              'radial-gradient(ellipse,' +
-              'rgba(79,70,229,0.2) 0%,' +
-              'transparent 70%)',
-            animation:
-              'blob-move-1 18s ease-in-out infinite',
-          }} />
-          <div style={{
-            position: 'absolute',
-            bottom: '-10%', right: '-5%',
-            width: '45%', height: '45%',
-            borderRadius: '50%',
-            background:
-              'radial-gradient(ellipse,' +
-              'rgba(6,182,212,0.15) 0%,' +
-              'transparent 70%)',
-            animation:
-              'blob-move-2 22s ease-in-out infinite',
-          }} />
-          {/* Vignette */}
-          <div style={{
-            position: 'absolute', inset: 0,
-            background:
-              'radial-gradient(ellipse at 50% 0%,' +
-              'transparent 40%,' +
-              'rgba(4,5,11,0.7) 100%)',
-          }} />
+          position: 'absolute', inset: 0,
+          backgroundImage:
+            'radial-gradient(circle,' +
+            'rgba(255,255,255,0.045) 1px,' +
+            'transparent 1px)',
+          backgroundSize: '28px 28px',
+        }} />
+        {/* Ambient Blue Blobs */}
+        <div style={{
+          position: 'absolute',
+          top: '-10%', left: '-5%',
+          width: '50%', height: '50%',
+          borderRadius: '50%',
+          background:
+            'radial-gradient(ellipse,' +
+            'rgba(2,132,199,0.18) 0%,' +
+            'transparent 70%)',
+          animation:
+            'blob-move-1 18s ease-in-out infinite',
+        }} />
+        <div style={{
+          position: 'absolute',
+          bottom: '-10%', right: '-5%',
+          width: '45%', height: '45%',
+          borderRadius: '50%',
+          background:
+            'radial-gradient(ellipse,' +
+            'rgba(6,182,212,0.15) 0%,' +
+            'transparent 70%)',
+          animation:
+            'blob-move-2 22s ease-in-out infinite',
+        }} />
+        {/* Vignette */}
+        <div style={{
+          position: 'absolute', inset: 0,
+          background:
+            'radial-gradient(ellipse at 50% 0%,' +
+            'transparent 40%,' +
+            'rgba(4,5,11,0.7) 100%)',
+        }} />
+      </div>
+
+      {/* Two-Column Responsive Wrapper */}
+      <div
+        className="w-full max-w-[1100px] grid grid-cols-1 lg:grid-cols-[1.1fr_0.9fr] gap-8 xl:gap-14 items-center relative z-10"
+        style={{
+          margin: 'auto 0',
+        }}
+      >
+        {/* Left Column: Heading and Application Name Only */}
+        <div style={{ textAlign: 'left', padding: '16px 0' }}>
+          <h1 style={{
+            fontSize: 'clamp(32px, 3.8vw, 50px)',
+            fontWeight: 800,
+            letterSpacing: '-0.03em',
+            lineHeight: 1.15,
+            marginBottom: 16,
+          }}>
+            <span style={{
+              background: 'linear-gradient(135deg, var(--text-primary) 40%, #0284c7 100%)',
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+              backgroundClip: 'text',
+            }}>
+              Digital Forensics
+            </span>
+            <br />
+            <span style={{
+              background: 'linear-gradient(135deg, #0284c7 0%, #2563eb 100%)',
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+              backgroundClip: 'text',
+            }}>
+              Powered by AI
+            </span>
+          </h1>
+
+          <p style={{
+            fontSize: 17,
+            fontWeight: 600,
+            color: 'var(--text-secondary)',
+            letterSpacing: '-0.01em',
+            margin: 0,
+            lineHeight: 1.4,
+          }}>
+            Intelligent Digital Forensic AI Assistant
+          </p>
         </div>
 
-        {/* Top nav */}
-        <nav style={{
-          position: 'relative', zIndex: 10,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '24px 6vw',
-          borderBottom: '1px solid rgba(255,255,255,0.05)',
-          background: 'rgba(4,5,11,0.6)',
-          backdropFilter: 'blur(10px)',
-        }}>
+        {/* Right Column: Dedicated Login Card (Without Registration Option) */}
+        <div
+          className="animate-scale-in"
+          style={{
+            width: '100%',
+            maxWidth: 420,
+            background: 'var(--surface-1)',
+            border: '1px solid var(--line-DEFAULT)',
+            borderRadius: 18,
+            padding: '32px 30px',
+            boxShadow: '0 25px 60px rgba(0,0,0,0.3)',
+            justifySelf: 'center',
+          }}
+        >
+          {/* Header */}
           <div style={{
             display: 'flex',
-            alignItems: 'center', gap: 10,
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            marginBottom: 26,
           }}>
-            <div style={{
-              width: 32, height: 32,
-              borderRadius: 9,
-              background: 'linear-gradient(135deg, #4f46e5, #7c3aed)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              boxShadow: '0 4px 16px rgba(99,102,241,0.4)',
-            }}>
-              <Shield size={16} color="white"/>
-            </div>
-            <div>
-              <span style={{
-                fontSize: 20,
-                fontWeight: 700,
-                letterSpacing: '-0.02em',
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{
+                width: 38,
+                height: 38,
+                borderRadius: 10,
+                background: 'linear-gradient(135deg, #0284c7, #2563eb)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 4px 12px rgba(2,132,199,0.35)',
+                flexShrink: 0,
               }}>
-                IDF AI
-              </span>
-              <span style={{
-                fontSize: 13,
-                color: 'var(--color-white-3)',
-                marginLeft: 8,
-              }}>
-                Intelligent Digital Forensic AI Assistant
-              </span>
+                <Shield size={18} color="white" />
+              </div>
+              <div>
+                <p style={{
+                  fontSize: 19,
+                  fontWeight: 700,
+                  color: 'var(--text-primary)',
+                  lineHeight: 1.2,
+                  margin: 0,
+                }}>
+                  Sign In
+                </p>
+                <p style={{
+                  fontSize: 12.5,
+                  color: 'var(--text-secondary)',
+                  marginTop: 2,
+                  marginBottom: 0,
+                }}>
+                  IDF AI Assistant
+                </p>
+              </div>
             </div>
-          </div>
 
-          <div style={{
-            display: 'flex', gap: 8 }}>
             <div style={{
               display: 'flex',
               alignItems: 'center',
-              gap: 6,
-              padding: '6px 14px',
-              borderRadius: 20,
+              gap: 5,
+              padding: '3px 8px',
+              borderRadius: 12,
               background: 'rgba(16,185,129,0.1)',
-              border: '1px solid rgba(16,185,129,0.2)',
-              fontSize: 13,
-              color: '#34d399',
+              border: '1px solid rgba(16,185,129,0.25)',
+              fontSize: 11,
+              color: '#059669',
+              fontWeight: 500,
             }}>
               <span style={{
-                width: 6, height: 6,
+                width: 5, height: 5,
                 borderRadius: '50%',
                 background: '#10b981',
                 boxShadow: '0 0 6px #10b981',
-                animation: 'pulse-glow 2s ease infinite',
               }} />
-              Air-gapped · Local AI
+              Air-gapped
             </div>
-            <button
-              onClick={() => setShowLogin(true)}
-              style={{
-                padding: '9px 24px',
-                borderRadius: 8,
-                background: '#4f46e5',
-                border: 'none',
-                color: 'var(--color-white-full)',
-                fontSize: 15,
+          </div>
+
+          {/* Credentials Form */}
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 15,
+          }}>
+            <div>
+              <label style={{
+                fontSize: 13,
+                color: 'var(--text-primary)',
                 fontWeight: 500,
-                cursor: 'pointer',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
+                display: 'block',
+                marginBottom: 6,
               }}>
-              Sign In
-              <ChevronRight size={13} />
-            </button>
-          </div>
-        </nav>
-
-        {/* Hero section */}
-        <div style={{
-          position: 'relative', zIndex: 1,
-          maxWidth: '100%',
-          margin: '0 auto',
-          padding: '80px 6vw 60px',
-          display: 'flex',
-          gap: '8vw',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          flexWrap: 'wrap',
-        }}>
-          {/* Left Column: Copy & Actions */}
-          <div style={{ flex: '1 1 500px', textAlign: 'left' }}>
-            {/* Badge */}
-            <div style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 8,
-              padding: '6px 16px',
-              borderRadius: 20,
-              background: 'rgba(99,102,241,0.1)',
-              border: '1px solid rgba(99,102,241,0.25)',
-              fontSize: 13,
-              fontWeight: 500,
-              color: '#818cf8',
-              marginBottom: 28,
-            }}>
-              <Lock size={13} />
-              Secure · Local · Air-gapped
-            </div>
-
-            <h1 style={{
-              fontSize: 'clamp(56px, 7vw, 84px)',
-              fontWeight: 800,
-              letterSpacing: '-0.04em',
-              lineHeight: 1.1,
-              marginBottom: 24,
-            }}>
-              <span style={{
-                background: 'linear-gradient(135deg, #fff 0%, #c7d2fe 60%, #818cf8 100%)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-                backgroundClip: 'text',
-              }}>
-                Digital Forensics
-              </span>
-              <br />
-              <span style={{
-                background: 'linear-gradient(135deg, #06b6d4, #818cf8)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-                backgroundClip: 'text',
-              }}>
-                Powered by AI
-              </span>
-            </h1>
-
-            <p style={{
-              fontSize: 24,
-              color: 'var(--color-white-6)',
-              maxWidth: 700,
-              marginBottom: 56,
-              lineHeight: 1.6,
-            }}>
-              Ingest forensic disk images, extract evidence, map entity relationships, and conduct AI-assisted investigations — entirely offline, entirely under your control.
-            </p>
-
-            {/* CTA buttons */}
-            <div style={{
-              display: 'flex',
-              gap: 16,
-              marginBottom: 56,
-            }}>
-              <button
-                onClick={() => setShowLogin(true)}
+                Username
+              </label>
+              <input
+                type="text"
+                value={form.username}
+                onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
+                onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                placeholder="Enter username"
+                autoFocus
                 style={{
-                  padding: '18px 40px',
-                  borderRadius: 14,
-                  background: 'linear-gradient(135deg, #4f46e5, #7c3aed)',
-                  border: 'none',
-                  color: 'var(--color-white-full)',
-                  fontSize: 18,
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 12,
-                  boxShadow: '0 8px 30px rgba(99,102,241,0.4)',
-                }}>
-                <Lock size={20} />
-                Sign in to Investigate
-              </button>
-              <button
-                onClick={() => navigate('/register')}
-                style={{
-                  padding: '18px 36px',
-                  borderRadius: 14,
-                  background: 'var(--color-white-05)',
-                  border: '1px solid rgba(255,255,255,0.12)',
-                  color: 'var(--color-white-6)',
-                  fontSize: 18,
-                  fontWeight: 500,
-                  cursor: 'pointer',
-                }}>
-                Create account
-              </button>
-            </div>
-
-            {/* Stat pills */}
-            <div style={{
-              display: 'flex',
-              gap: 16, flexWrap: 'wrap',
-            }}>
-              {STATS.map(s => (
-                <div key={s.label} style={{
-                  padding: '12px 28px',
-                  borderRadius: 12,
-                  background: 'var(--color-white-03)',
-                  border: '1px solid rgba(255,255,255,0.08)',
-                }}>
-                  <p style={{
-                    fontSize: 32,
-                    fontWeight: 700,
-                    color: '#c7d2fe',
-                    lineHeight: 1.2,
-                  }}>
-                    {s.value}
-                  </p>
-                  <p style={{
-                    fontSize: 14,
-                    color: 'var(--color-white-4)',
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.07em',
-                    marginTop: 4,
-                  }}>
-                    {s.label}
-                  </p>
-                </div>
-              ))}
-            </div>
-            
-            {/* Bottom disclaimer for left column */}
-            <p style={{
-              fontSize: 15,
-              color: 'var(--color-white-2)',
-              marginTop: 48,
-              lineHeight: 1.5,
-            }}>
-              All processing is performed locally. No data leaves your machine. No cloud services. No external API calls for evidence.
-            </p>
-          </div>
-
-          {/* Right Column: Features Grid */}
-          <div style={{ flex: '1 1 500px' }}>
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(2, 1fr)',
-              gap: 16,
-            }}>
-              {FEATURES.map((f, i) => (
-                <div
-                  key={f.title}
-                  className="animate-fade-up"
-                  style={{
-                    background: 'rgba(255,255,255,0.025)',
-                    border: `1px solid ${f.color}20`,
-                    borderRadius: 16,
-                    padding: '28px',
-                    transition: 'all 0.2s',
-                    animationDelay: `${i * 80}ms`,
-                  }}
-                  onMouseEnter={e => {
-                    e.currentTarget.style.borderColor = `${f.color}50`
-                    e.currentTarget.style.background = `${f.color}08`
-                    e.currentTarget.style.transform = 'translateY(-2px)'
-                  }}
-                  onMouseLeave={e => {
-                    e.currentTarget.style.borderColor = `${f.color}20`
-                    e.currentTarget.style.background = 'rgba(255,255,255,0.025)'
-                    e.currentTarget.style.transform = 'translateY(0)'
-                  }}
-                >
-                  <div style={{
-                    width: 52, height: 52,
-                    borderRadius: 12,
-                    background: `${f.color}18`,
-                    border: `1px solid ${f.color}30`,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    marginBottom: 16,
-                  }}>
-                    <f.icon size={24} style={{ color: f.color }} />
-                  </div>
-                  <p style={{
-                    fontSize: 20,
-                    fontWeight: 600,
-                    color: 'var(--text-primary)',
-                    marginBottom: 8,
-                    letterSpacing: '-0.01em',
-                  }}>
-                    {f.title}
-                  </p>
-                  <p style={{
-                    fontSize: 16,
-                    color: 'var(--color-white-4)',
-                    lineHeight: 1.6,
-                  }}>
-                    {f.desc}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* Login modal overlay */}
-        {showLogin && (
-          <div
-            style={{
-              position: 'fixed', inset: 0,
-              background: 'rgba(0,0,0,0.7)',
-              zIndex: 50,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              padding: 20,
-            }}
-            onClick={e => {
-              if (e.target === e.currentTarget) setShowLogin(false)
-            }}
-          >
-            <div
-              className="animate-scale-in"
-              style={{
-                width: '100%', maxWidth: 400,
-                background: '#0e0f1a',
-                border: '1px solid rgba(255,255,255,0.1)',
-                borderRadius: 18,
-                padding: 32,
-                boxShadow: '0 25px 60px rgba(0,0,0,0.8)',
-              }}
-            >
-              {/* Modal header */}
-              <div style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 10, marginBottom: 28,
-              }}>
-                <div style={{
-                  width: 36, height: 36,
+                  width: '100%',
+                  background: 'var(--surface-2)',
+                  border: '1px solid var(--line-DEFAULT)',
                   borderRadius: 10,
-                  background: 'linear-gradient(135deg, #4f46e5, #7c3aed)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  boxShadow: '0 4px 12px rgba(99,102,241,0.4)',
-                }}>
-                  <Shield size={16} color="white" />
-                </div>
-                <div>
-                  <p style={{
-                    fontSize: 20,
-                    fontWeight: 700,
-                    color: 'var(--text-primary)',
-                    lineHeight: 1.2,
-                  }}>
-                    Sign In
-                  </p>
-                  <p style={{
-                    fontSize: 13,
-                    color: 'var(--color-white-4)',
-                  }}>
-                    Intelligent Digital Forensic AI Assistant
-                  </p>
-                </div>
-              </div>
+                  padding: '12px 14px',
+                  fontSize: 14.5,
+                  color: 'var(--text-primary)',
+                  outline: 'none',
+                  boxSizing: 'border-box',
+                }}
+                onFocus={e => { e.target.style.borderColor = 'var(--brand-primary)' }}
+                onBlur={e => { e.target.style.borderColor = 'var(--line-DEFAULT)' }}
+              />
+            </div>
 
-              {/* Form */}
-              <div style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 12,
+            <div>
+              <label style={{
+                fontSize: 13,
+                color: 'var(--text-primary)',
+                fontWeight: 500,
+                display: 'block',
+                marginBottom: 6,
               }}>
-                <div>
-                  <label style={{
-                    fontSize: 13,
-                    color: 'var(--color-white-5)',
-                    fontWeight: 500,
-                    display: 'block',
-                    marginBottom: 8,
-                  }}>
-                    Username
-                  </label>
-                  <input
-                    type="text"
-                    value={form.username}
-                    onChange={e => setForm(f => ({ ...f, username: e.target.value }))}
-                    onKeyDown={e => e.key === 'Enter' && handleLogin()}
-                    placeholder="Enter username"
-                    autoFocus
-                    style={{
-                      width: '100%',
-                      background: 'var(--color-white-05)',
-                      border: '1px solid rgba(255,255,255,0.1)',
-                      borderRadius: 10,
-                      padding: '14px 16px',
-                      fontSize: 15,
-                      color: 'var(--text-primary)',
-                      outline: 'none',
-                    }}
-                    onFocus={e => { e.target.style.borderColor = 'rgba(99,102,241,0.6)' }}
-                    onBlur={e => { e.target.style.borderColor = 'var(--color-white-1)' }}
-                  />
-                </div>
-
-                <div>
-                  <label style={{
-                    fontSize: 13,
-                    color: 'var(--color-white-5)',
-                    fontWeight: 500,
-                    display: 'block',
-                    marginBottom: 8,
-                  }}>
-                    Password
-                  </label>
-                  <div style={{ position: 'relative' }}>
-                    <input
-                      type={showPass ? 'text' : 'password'}
-                      value={form.password}
-                      onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
-                      onKeyDown={e => e.key === 'Enter' && handleLogin()}
-                      placeholder="Enter password"
-                      style={{
-                        width: '100%',
-                        background: 'var(--color-white-05)',
-                        border: '1px solid rgba(255,255,255,0.1)',
-                        borderRadius: 10,
-                        padding: '14px 40px 14px 16px',
-                        fontSize: 15,
-                        color: 'var(--text-primary)',
-                        outline: 'none',
-                      }}
-                      onFocus={e => { e.target.style.borderColor = 'rgba(99,102,241,0.6)' }}
-                      onBlur={e => { e.target.style.borderColor = 'var(--color-white-1)' }}
-                    />
-                    <button
-                      onClick={() => setShowPass(!showPass)}
-                      style={{
-                        position: 'absolute',
-                        right: 14,
-                        top: '50%',
-                        transform: 'translateY(-50%)',
-                        background: 'none',
-                        border: 'none',
-                        cursor: 'pointer',
-                        color: 'var(--color-white-4)',
-                        display: 'flex',
-                        padding: 0,
-                      }}>
-                      {showPass ? <EyeOff size={18} /> : <Eye size={18} />}
-                    </button>
-                  </div>
-                </div>
-
-                <button
-                  onClick={handleLogin}
-                  disabled={loading}
+                Password
+              </label>
+              <div style={{ position: 'relative' }}>
+                <input
+                  type={showPass ? 'text' : 'password'}
+                  value={form.password}
+                  onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
+                  onKeyDown={e => e.key === 'Enter' && handleLogin()}
+                  placeholder="Enter password"
                   style={{
                     width: '100%',
-                    padding: '14px',
-                    marginTop: 8,
+                    background: 'var(--surface-2)',
+                    border: '1px solid var(--line-DEFAULT)',
                     borderRadius: 10,
-                    background: loading ? 'rgba(79,70,229,0.5)' : 'linear-gradient(135deg, #4f46e5, #7c3aed)',
+                    padding: '12px 38px 12px 14px',
+                    fontSize: 14.5,
+                    color: 'var(--text-primary)',
+                    outline: 'none',
+                    boxSizing: 'border-box',
+                  }}
+                  onFocus={e => { e.target.style.borderColor = 'var(--brand-primary)' }}
+                  onBlur={e => { e.target.style.borderColor = 'var(--line-DEFAULT)' }}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPass(!showPass)}
+                  style={{
+                    position: 'absolute',
+                    right: 12,
+                    top: '50%',
+                    transform: 'translateY(-50%)',
+                    background: 'none',
                     border: 'none',
-                    color: 'var(--color-white-full)',
-                    fontSize: 16,
-                    fontWeight: 600,
-                    cursor: loading ? 'not-allowed' : 'pointer',
+                    cursor: 'pointer',
+                    color: 'var(--text-secondary)',
                     display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 8,
-                    boxShadow: loading ? 'none' : '0 4px 20px rgba(99,102,241,0.35)',
+                    padding: 0,
                   }}>
-                  {loading
-                    ? 'Authenticating...'
-                    : <><Lock size={16} /> Authenticate</>}
+                  {showPass ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
-
-                <div style={{ textAlign: 'center', paddingTop: 12 }}>
-                  <span style={{ fontSize: 14, color: 'var(--color-white-3)' }}>
-                    No account?{' '}
-                  </span>
-                  <button
-                    onClick={() => navigate('/register')}
-                    style={{
-                      background: 'none',
-                      border: 'none',
-                      color: '#818cf8',
-                      fontSize: 14,
-                      fontWeight: 500,
-                      cursor: 'pointer',
-                      fontFamily: 'inherit',
-                    }}>
-                    Register here
-                  </button>
-                </div>
               </div>
             </div>
+
+            <button
+              onClick={handleLogin}
+              disabled={loading}
+              style={{
+                width: '100%',
+                padding: '13px',
+                marginTop: 6,
+                borderRadius: 10,
+                background: loading ? 'rgba(2,132,199,0.5)' : 'linear-gradient(135deg, #0284c7, #2563eb)',
+                border: 'none',
+                color: '#ffffff',
+                fontSize: 14.5,
+                fontWeight: 600,
+                cursor: loading ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: 8,
+                boxShadow: loading ? 'none' : '0 4px 18px rgba(2,132,199,0.35)',
+              }}
+            >
+              {loading
+                ? 'Authenticating...'
+                : <><Lock size={15} /> Authenticate</>}
+            </button>
           </div>
-        )}
+        </div>
       </div>
-    )
-  }
+    </div>
+  )
+}

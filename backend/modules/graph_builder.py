@@ -278,18 +278,12 @@ def get_graph_context(query: str,
                            node.lower()) > 80):
                 for _, target, data in \
                         G.out_edges(node, data=True):
-                    context_lines.append(
-                        f"- {node} → "
-                        f"[{data.get('relationship',
-                        'RELATED')}] → {target}"
-                    )
+                    rel = data.get('relationship', 'RELATED')
+                    context_lines.append(f"- {node} → [{rel}] → {target}")
                 for source, _, data in \
                         G.in_edges(node, data=True):
-                    context_lines.append(
-                        f"- {source} → "
-                        f"[{data.get('relationship',
-                        'RELATED')}] → {node}"
-                    )
+                    rel = data.get('relationship', 'RELATED')
+                    context_lines.append(f"- {source} → [{rel}] → {node}")
 
     if not context_lines:
         return ""

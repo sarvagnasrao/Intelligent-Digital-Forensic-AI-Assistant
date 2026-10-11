@@ -93,9 +93,9 @@ export default function GeoMapPage() {
       const gpsIcon = L.divIcon({
         html:
           '<div style="width:14px;height:14px;' +
-          'background:#6366f1;border-radius:50%;' +
+          'background:#0284c7;border-radius:50%;' +
           'border:2.5px solid white;' +
-          'box-shadow:0 0 6px rgba(99,102,241,0.7);">' +
+          'box-shadow:0 0 6px rgba(2,132,199,0.7);">' +
           '</div>',
         iconSize: [14, 14],
         iconAnchor: [7, 7],
@@ -198,7 +198,7 @@ export default function GeoMapPage() {
             <div className="flex items-center gap-1.5">
               <span
                 className="inline-block w-3 h-3 rounded-full"
-                style={{ background: '#6366f1', boxShadow: '0 0 5px rgba(99,102,241,0.5)' }}
+                style={{ background: '#0284c7', boxShadow: '0 0 5px rgba(2,132,199,0.5)' }}
               />
               <span className="text-xs text-ink-2">
                 GPS ({data?.total_gps ?? 0})

@@ -160,7 +160,7 @@ function SummaryModal({ caseId, onClose }) {
     .replace(/^- (.+)$/gm,
       '<div style="display:flex;' +
       'gap:8px;margin:3px 0">' +
-      '<span style="color:#6366f1;' +
+      '<span style="color:#0284c7;' +
       'flex-shrink:0">•</span>' +
       '<span>$1</span></div>')
     .replace(/\n/g, '<br/>')

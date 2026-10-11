@@ -86,30 +86,30 @@
 }
 
 :root {
-  --surface-0: #f8fafc;
+  --surface-0: #fbfaf8;
   --surface-1: #ffffff;
-  --surface-2: #f1f5f9;
-  --surface-3: #e2e8f0;
-  --surface-4: #cbd5e1;
-  --surface-5: #94a3b8;
-  --ink-0: #0f172a;
-  --ink-1: #334155;
-  --ink-2: #64748b;
-  --ink-3: #94a3b8;
-  --line-DEFAULT: #e2e8f0;
-  --line-bright: #cbd5e1;
-  --bg-app: #f8fafc;
+  --surface-2: #f5f3ef;
+  --surface-3: #eae7df;
+  --surface-4: #dcd7cc;
+  --surface-5: #b8b2a5;
+  --ink-0: #1c1917;
+  --ink-1: #44403c;
+  --ink-2: #78716c;
+  --ink-3: #a8a29e;
+  --line-DEFAULT: #e7e4db;
+  --line-bright: #d6d1c4;
+  --bg-app: #fbfaf8;
   --bg-panel: #ffffff;
-  --bg-hover: rgba(0, 0, 0, 0.03);
-  --bg-active: rgba(0, 0, 0, 0.06);
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-muted: #94a3b8;
-  --border-subtle: rgba(0, 0, 0, 0.05);
-  --border-base: rgba(0, 0, 0, 0.1);
-  --brand-primary: #4f46e5;
-  --brand-light: #6366f1;
-  --brand-glow: rgba(99, 102, 241, 0.1);
+  --bg-hover: rgba(68, 64, 60, 0.04);
+  --bg-active: rgba(68, 64, 60, 0.08);
+  --text-primary: #1c1917;
+  --text-secondary: #57534e;
+  --text-muted: #8a847c;
+  --border-subtle: rgba(68, 64, 60, 0.06);
+  --border-base: rgba(68, 64, 60, 0.12);
+  --brand-primary: #b45309;
+  --brand-light: #d97706;
+  --brand-glow: rgba(180, 83, 9, 0.12);
   
   /* Legacy mappings */
   --color-white-03: rgba(0, 0, 0, 0.03);
@@ -135,30 +135,30 @@
 }
 
 .dark {
-  --surface-0: #08090e;
-  --surface-1: #0c0d14;
-  --surface-2: #14161f;
-  --surface-3: #191c28;
-  --surface-4: #1e2130;
-  --surface-5: #232638;
-  --ink-0: #e8eaf2;
-  --ink-1: #9399b2;
-  --ink-2: #5c6280;
-  --ink-3: #363a52;
-  --line-DEFAULT: #1f2235;
-  --line-bright: #2a2f48;
-  --bg-app: #04050b;
-  --bg-panel: rgba(255, 255, 255, 0.03);
+  --surface-0: #141210;
+  --surface-1: #1c1a17;
+  --surface-2: #24211d;
+  --surface-3: #2f2b26;
+  --surface-4: #3d3731;
+  --surface-5: #4d463e;
+  --ink-0: #ede8df;
+  --ink-1: #d6cfc2;
+  --ink-2: #a8a29e;
+  --ink-3: #78716c;
+  --line-DEFAULT: #332e28;
+  --line-bright: #443e37;
+  --bg-app: #141210;
+  --bg-panel: #1c1a17;
   --bg-hover: rgba(255, 255, 255, 0.05);
-  --bg-active: rgba(255, 255, 255, 0.08);
-  --text-primary: #e2e4f0;
-  --text-secondary: rgba(255, 255, 255, 0.6);
-  --text-muted: rgba(255, 255, 255, 0.3);
-  --border-subtle: rgba(255, 255, 255, 0.04);
-  --border-base: rgba(255, 255, 255, 0.07);
-  --brand-primary: #4f46e5;
-  --brand-light: #818cf8;
-  --brand-glow: rgba(99, 102, 241, 0.12);
+  --bg-active: rgba(255, 255, 255, 0.09);
+  --text-primary: #ede8df;
+  --text-secondary: #b5aea4;
+  --text-muted: #7e776e;
+  --border-subtle: rgba(255, 255, 255, 0.05);
+  --border-base: rgba(255, 255, 255, 0.09);
+  --brand-primary: #d97706;
+  --brand-light: #f59e0b;
+  --brand-glow: rgba(217, 119, 6, 0.16);
 
   /* Legacy mappings */
   --color-white-03: rgba(255, 255, 255, 0.03);
@@ -189,8 +189,8 @@ body {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   background: var(--bg-app);
   color: var(--text-primary);
-  font-size: 14px;
-  line-height: 1.6;
+  font-size: 15px;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
@@ -200,29 +200,29 @@ body {
 /* Scrollbar */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #1e2238 transparent;
+  scrollbar-color: var(--surface-4, #78716c) transparent;
 }
-::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar { width: 7px; height: 7px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-  background: #252840;
+  background: var(--surface-4, #78716c);
   border-radius: 99px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #5b5fcf;
+  background: var(--brand-primary, #b45309);
 }
 
 /* Focus */
 :focus-visible {
-  outline: 1.5px solid rgba(139, 92, 246, 0.7);
+  outline: 1.5px solid rgba(2, 132, 199, 0.7);
   outline-offset: 2px;
   border-radius: 4px;
 }
 
 /* Selection */
 ::selection {
-  background: rgba(99, 102, 241, 0.3);
-  color: #e2e4f0;
+  background: rgba(2, 132, 199, 0.25);
+  color: inherit;
 }
 
 /* Smooth transitions */
@@ -347,7 +347,7 @@ button, a {
 
 /* Animated line */
 .animated-line {
-  background: linear-gradient(90deg, transparent 0%, #6366f1 20%, #818cf8 50%, #06b6d4 80%, transparent 100%);
+  background: linear-gradient(90deg, transparent 0%, #0284c7 20%, #38bdf8 50%, #0ea5e9 80%, transparent 100%);
   background-size: 200% 100%;
   animation: shimmer 2.5s linear infinite;
 }

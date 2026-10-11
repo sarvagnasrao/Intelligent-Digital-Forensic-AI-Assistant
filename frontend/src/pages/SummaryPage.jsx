@@ -31,12 +31,12 @@ function renderMarkdown(text) {
     // Bullet points
     .replace(
       /^- (.+)$/gm,
-      '<div style="display:flex;gap:8px;margin:5px 0;padding-left:4px"><span style="color:#6366f1;flex-shrink:0;margin-top:3px">•</span><span>$1</span></div>'
+      '<div style="display:flex;gap:8px;margin:5px 0;padding-left:4px"><span style="color:#0284c7;flex-shrink:0;margin-top:3px">•</span><span>$1</span></div>'
     )
     // Numbered list items
     .replace(
       /^\d+\. (.+)$/gm,
-      '<div style="display:flex;gap:8px;margin:5px 0;padding-left:4px"><span style="color:#818cf8;flex-shrink:0;font-weight:600;min-width:16px">›</span><span>$1</span></div>'
+      '<div style="display:flex;gap:8px;margin:5px 0;padding-left:4px"><span style="color:#38bdf8;flex-shrink:0;font-weight:600;min-width:16px">›</span><span>$1</span></div>'
     )
     // Paragraph breaks
     .replace(/\n\n/g, '<div style="height:8px"></div>')

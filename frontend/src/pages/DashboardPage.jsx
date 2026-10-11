@@ -4,7 +4,7 @@ import {
   FolderOpen, Database, Cpu, AlertTriangle, CheckCircle, FileText, Bot, Clock, 
   Search, MessageSquare, Plus, Upload, UserCheck, ArrowUpRight, TrendingUp, Sparkles, HelpCircle
 } from 'lucide-react'
-import { ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from 'recharts'
+import { ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
 import api from '../api/client'
 import { useAuth } from '../context/AuthContext'
 import toast from 'react-hot-toast'
@@ -77,10 +77,10 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
     <div className="animate-fade-in" style={{ width: '100%' }}>
       <div className="skeleton" style={{ height: 34, width: 280, borderRadius: 8, marginBottom: 8 }} />
       <div className="skeleton" style={{ height: 16, width: 220, borderRadius: 6, marginBottom: 28 }} />
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12, marginBottom: 12 }}>
-        {Array(5).fill(0).map((_, i) => (
-          <div key={i} className="skeleton" style={{ height: 110, borderRadius: 14 }} />
-        ))}
+      <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1.1fr 1.1fr', gap: 16, marginBottom: 24 }}>
+        <div className="skeleton" style={{ height: 260, borderRadius: 14 }} />
+        <div className="skeleton" style={{ height: 260, borderRadius: 14 }} />
+        <div className="skeleton" style={{ height: 260, borderRadius: 14 }} />
       </div>
     </div>
   )
@@ -103,25 +103,6 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
     { name: 'Audio', value: Math.round(evTotal * 0.10), color: '#fbbf24' },
     { name: 'Archives', value: Math.round(evTotal * 0.09), color: '#06b6d4' },
     { name: 'Others', value: Math.round(evTotal * 0.06), color: '#ec4899' },
-  ]
-
-  // 3. Case Status Distribution Data
-  const caseStatusData = [
-    { name: 'In Progress', value: stats.cases?.by_status?.Active || 18, color: '#3b82f6' },
-    { name: 'Completed', value: stats.cases?.by_status?.Closed || 12, color: '#10b981' },
-    { name: 'Under Review', value: stats.cases?.by_status?.Open || 7, color: '#f59e0b' },
-    { name: 'On Hold', value: stats.cases?.by_status?.OnHold || 5, color: '#8b5cf6' },
-  ]
-
-  // 4. Analysis Trend (Line area chart data)
-  const trendData = [
-    { name: 'May 14', value: 30 },
-    { name: 'May 15', value: 62 },
-    { name: 'May 16', value: 45 },
-    { name: 'May 17', value: 60 },
-    { name: 'May 18', value: 55 },
-    { name: 'May 19', value: 80 },
-    { name: 'May 20', value: 72 },
   ]
 
   // Tool Click Handler
@@ -208,100 +189,6 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </button>
         </div>
       </div>
-
-      {/* 5-Column Metric Cards Row */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: 'repeat(5, 1fr)',
-        gap: 16,
-        marginBottom: 24,
-      }}>
-        {/* Metric 1: Total Cases */}
-        <div className="ref-card" style={{ padding: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Total Cases</span>
-            <div style={{ width: 26, height: 26, borderRadius: 6, background: 'rgba(59,130,246,0.1)', color: '#3b82f6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <FolderOpen size={13} />
-            </div>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{totalCases}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#3b82f6' }}>↑ 12% this month</span>
-            </div>
-          </div>
-          <Sparkline data={generateSparklineData(totalCases, 1)} color="#3b82f6" />
-        </div>
-
-        {/* Metric 2: Total Evidence */}
-        <div className="ref-card" style={{ padding: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Total Evidence</span>
-            <div style={{ width: 26, height: 26, borderRadius: 6, background: 'rgba(16,185,129,0.1)', color: '#10b981', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <Database size={13} />
-            </div>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{totalEvidence.toLocaleString()}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#10b981' }}>↑ 18% this month</span>
-            </div>
-          </div>
-          <Sparkline data={generateSparklineData(totalEvidence, 1.2)} color="#10b981" />
-        </div>
-
-        {/* Metric 3: AI Analyses */}
-        <div className="ref-card" style={{ padding: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>AI Analyses</span>
-            <div style={{ width: 26, height: 26, borderRadius: 6, background: 'rgba(139,92,246,0.1)', color: '#8b5cf6', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <Bot size={13} />
-            </div>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{aiAnalyses}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#8b5cf6' }}>↑ 25% this month</span>
-            </div>
-          </div>
-          <Sparkline data={generateSparklineData(aiAnalyses, 0.85)} color="#8b5cf6" />
-        </div>
-
-        {/* Metric 4: Alerts */}
-        <div className="ref-card" style={{ padding: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Alerts</span>
-            <div style={{ width: 26, height: 26, borderRadius: 6, background: 'rgba(245,158,11,0.1)', color: '#f59e0b', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <AlertTriangle size={13} />
-            </div>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{alertCount}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#f59e0b' }}>↓ 3 new alerts</span>
-            </div>
-          </div>
-          <Sparkline data={generateSparklineData(alertCount, 1.5)} color="#f59e0b" />
-        </div>
-
-        {/* Metric 5: Resolved Cases */}
-        <div className="ref-card" style={{ padding: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Resolved Cases</span>
-            <div style={{ width: 26, height: 26, borderRadius: 6, background: 'rgba(6,182,212,0.1)', color: '#06b6d4', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <CheckCircle size={13} />
-            </div>
-          </div>
-          <div style={{ marginTop: 8 }}>
-            <span style={{ fontSize: 24, fontWeight: 700, lineHeight: 1.1 }}>{resolvedCases}</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginTop: 4 }}>
-              <span style={{ fontSize: 10, fontWeight: 600, color: '#06b6d4' }}>↑ 8% this month</span>
-            </div>
-          </div>
-          <Sparkline data={generateSparklineData(resolvedCases, 0.95)} color="#06b6d4" />
-        </div>
-      </div>
-
       {/* Middle Row (Recent Cases, Evidence Donut, AI Insights) */}
       <div style={{
         display: 'grid',
@@ -543,132 +430,20 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
 
       </div>
 
-      {/* Bottom Row (Case Status Distribution, Analysis Trend, Tools & Modules) */}
-      <div style={{
-        display: 'grid',
-        gridTemplateColumns: '1.1fr 1.2fr 1.1fr',
-        gap: 16,
-      }}>
-
-        {/* Card 1: Case Status Distribution */}
-        <div className="ref-card" style={{ display: 'flex', flexDirection: 'column' }}>
-          <div className="ref-card-header">
-            <span className="ref-card-title">Case Status Distribution</span>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flex: 1 }}>
-            {/* Donut Chart */}
-            <div style={{ position: 'relative', width: 120, height: 120, flexShrink: 0 }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={caseStatusData}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={40}
-                    outerRadius={54}
-                    paddingAngle={3}
-                    dataKey="value"
-                  >
-                    {caseStatusData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                </PieChart>
-              </ResponsiveContainer>
-              <div style={{
-                position: 'absolute', inset: 0,
-                display: 'flex', flexDirection: 'column',
-                alignItems: 'center', justifyContent: 'center',
-                pointerEvents: 'none'
-              }}>
-                <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--text-primary)' }}>{totalCases}</span>
-                <span style={{ fontSize: 8, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Total Cases</span>
-              </div>
-            </div>
-
-            {/* Legends */}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1, marginLeft: 16 }}>
-              {caseStatusData.map((d, i) => {
-                const pct = Math.round((d.value / (totalCases || 1)) * 100) || 0
-                return (
-                  <div key={d.name} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-                      <span style={{ width: 6, height: 6, borderRadius: '50%', background: d.color, flexShrink: 0 }} />
-                      <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {d.name}
-                      </span>
-                    </div>
-                    <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-primary)' }}>
-                      {d.value} <span style={{ fontWeight: 500, color: 'var(--text-muted)' }}>({pct}%)</span>
-                    </span>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        </div>
-
-        {/* Card 2: Analysis Trend */}
-        <div className="ref-card" style={{ display: 'flex', flexDirection: 'column' }}>
-          <div className="ref-card-header" style={{ marginBottom: 12 }}>
-            <span className="ref-card-title">Analysis Trend</span>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <select style={{
-                fontSize: 10, fontWeight: 600, color: 'var(--text-secondary)',
-                background: 'var(--bg-hover)', border: 'none', borderRadius: 4,
-                padding: '3px 6px', outline: 'none', cursor: 'pointer'
-              }}>
-                <option>Last 7 Days</option>
-                <option>Last 30 Days</option>
-              </select>
-            </div>
-          </div>
-
-          <div style={{ flex: 1, width: '100%', height: 110, marginTop: 4 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={trendData} margin={{ top: 5, right: 5, left: -25, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="trendGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#4f46e5" stopOpacity={0.2} />
-                    <stop offset="100%" stopColor="#4f46e5" stopOpacity={0.0} />
-                  </linearGradient>
-                </defs>
-                {/* Horizontal grid/ticks omitted matching reference design */}
-                <Area 
-                  type="monotone" 
-                  dataKey="value" 
-                  stroke="#4f46e5" 
-                  strokeWidth={2} 
-                  fill="url(#trendGrad)"
-                  dot={{ r: 3, stroke: '#4f46e5', strokeWidth: 1, fill: '#ffffff' }}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-          
-          <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0 0 0', borderTop: '1px solid var(--border-base)', marginTop: 8, fontSize: 9, color: 'var(--text-muted)', fontWeight: 600 }}>
-            <span>May 14</span>
-            <span>May 15</span>
-            <span>May 16</span>
-            <span>May 17</span>
-            <span>May 18</span>
-            <span>May 19</span>
-            <span>May 20</span>
-          </div>
-        </div>
-
-        {/* Card 3: Tools & Modules Grid */}
-        <div className="ref-card">
-          <div className="ref-card-header" style={{ marginBottom: 12 }}>
+      {/* Tools & Modules Panel */}
+      <div className="ref-card" style={{ marginBottom: 16 }}>
+        <div className="ref-card-header" style={{ marginBottom: 14 }}>
+          <div>
             <span className="ref-card-title">Tools & Modules</span>
+            <span style={{ fontSize: 11, color: 'var(--text-secondary)', marginLeft: 10 }}>Quick access to forensic tool suite</span>
           </div>
+        </div>
 
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(3, 1fr)',
-            gap: 10,
-          }}>
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+          gap: 12,
+        }}>
             {/* Tool 1: File Carver */}
             <button
               onClick={() => handleToolClick('artifacts')}
@@ -761,8 +536,6 @@ export default function DashboardPage({ activeCaseId, setActiveCaseId }) {
           </div>
         </div>
 
-      </div>
-      
       {/* Footer timezone indicator */}
       <div style={{ display: 'flex', justifyContent: 'center', marginTop: 24, fontSize: 10, color: 'var(--text-muted)', fontWeight: 600 }}>
         All times are in IST (UTC +05:30)

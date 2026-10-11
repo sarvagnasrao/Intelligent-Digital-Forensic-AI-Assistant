@@ -34,13 +34,13 @@ export default function StatusBar() {
 
   return (
     <div style={{
-      height: 54,
+      height: 44,
       background: 'var(--bg-panel)',
       borderBottom: '1px solid var(--border-base)',
       display: 'flex',
       alignItems: 'center',
       justifyContent: 'space-between',
-      padding: '0 24px',
+      padding: '0 16px',
       flexShrink: 0,
       position: 'sticky',
       top: 0,
@@ -56,7 +56,7 @@ export default function StatusBar() {
       <div style={{
         display: 'flex',
         alignItems: 'center',
-        gap: 18,
+        gap: 12,
       }}>
         {/* Theme Switcher Button */}
         <button
@@ -211,12 +211,12 @@ export default function StatusBar() {
             width: 32,
             height: 32,
             borderRadius: '50%',
-            background: 'linear-gradient(135deg, #4f46e5 0%, #6366f1 100%)',
-            border: '1.5px solid rgba(79, 70, 229, 0.25)',
+            background: 'linear-gradient(135deg, #0284c7 0%, #2563eb 100%)',
+            border: '1.5px solid rgba(2, 132, 199, 0.25)',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            boxShadow: '0 2px 6px rgba(79,70,229,0.15)',
+            boxShadow: '0 2px 6px rgba(2, 132, 199, 0.15)',
           }}>
             <span style={{ fontSize: 11, fontWeight: 700, color: '#ffffff' }}>
               {initial}

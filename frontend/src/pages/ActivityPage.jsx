@@ -93,12 +93,12 @@ export default function ActivityPage() {
         <div style={{ display: 'flex', gap: 8 }}>
           <div style={{ flex: 1, position: 'relative' }}>
             <Search size={13} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--color-white-2)', pointerEvents: 'none' }} />
-            <input value={inputQ} onChange={e => setInputQ(e.target.value)} onKeyDown={e => e.key === 'Enter' && applySearch()} placeholder="Search by action, user, or details..." style={{ width: '100%', background: 'var(--color-white-04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: '9px 12px 9px 36px', fontSize: 13, color: 'var(--text-primary)', outline: 'none' }} onFocus={e => { e.target.style.borderColor = 'rgba(99,102,241,0.5)' }} onBlur={e => { e.target.style.borderColor = 'var(--color-white-08)' }} />
+            <input value={inputQ} onChange={e => setInputQ(e.target.value)} onKeyDown={e => e.key === 'Enter' && applySearch()} placeholder="Search by action, user, or details..." style={{ width: '100%', background: 'var(--color-white-04)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, padding: '9px 12px 9px 36px', fontSize: 13, color: 'var(--text-primary)', outline: 'none' }} onFocus={e => { e.target.style.borderColor = 'rgba(2,132,199,0.5)' }} onBlur={e => { e.target.style.borderColor = 'var(--color-white-08)' }} />
           </div>
-          <button onClick={applySearch} style={{ padding: '9px 20px', borderRadius: 8, background: '#4f46e5', border: 'none', color: 'var(--color-white-full)', fontSize: 13, fontWeight: 500, cursor: 'pointer' }}>Search</button>
-          <button onClick={() => setShowFilters(!showFilters)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 16px', borderRadius: 8, background: showFilters ? 'rgba(99,102,241,0.2)' : 'var(--color-white-04)', border: showFilters ? '1px solid rgba(99,102,241,0.4)' : '1px solid rgba(255,255,255,0.08)', color: showFilters ? '#a5b4fc' : 'var(--color-white-4)', fontSize: 12, cursor: 'pointer' }}>
+          <button onClick={applySearch} style={{ padding: '9px 20px', borderRadius: 8, background: '#0284c7', border: 'none', color: 'var(--color-white-full)', fontSize: 13, fontWeight: 500, cursor: 'pointer' }}>Search</button>
+          <button onClick={() => setShowFilters(!showFilters)} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '9px 16px', borderRadius: 8, background: showFilters ? 'rgba(2,132,199,0.2)' : 'var(--color-white-04)', border: showFilters ? '1px solid rgba(2,132,199,0.4)' : '1px solid rgba(255,255,255,0.08)', color: showFilters ? '#38bdf8' : 'var(--color-white-4)', fontSize: 12, cursor: 'pointer' }}>
             <Filter size={13} />Filters
-            {activeFilters.length > 0 && <span style={{ background: '#6366f1', color: 'var(--color-white-full)', borderRadius: 99, fontSize: 10, padding: '0 5px', minWidth: 16, textAlign: 'center', lineHeight: '16px' }}>{activeFilters.length}</span>}
+            {activeFilters.length > 0 && <span style={{ background: '#0284c7', color: 'var(--color-white-full)', borderRadius: 99, fontSize: 10, padding: '0 5px', minWidth: 16, textAlign: 'center', lineHeight: '16px' }}>{activeFilters.length}</span>}
           </button>
         </div>
 

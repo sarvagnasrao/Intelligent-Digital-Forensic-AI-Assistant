@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import {
-  Fingerprint, LayoutDashboard, Layers, Activity, Users, Plus, Search,
+  Fingerprint, LayoutDashboard, BarChart3, Layers, Activity, Users, Plus, Search,
   ChevronRight, Upload, HardDrive, Clock, Bot, Network, UserSearch,
   AlertTriangle, Crosshair, Key, Zap, GitCompare, Globe, FileText,
   StickyNote, ShieldCheck, Settings2, Settings, LogOut, Cpu, Database,
@@ -9,14 +9,16 @@ import {
 } from 'lucide-react'
 import { getCases } from '../api/client'
 import { useAuth } from '../context/AuthContext'
+import usePreferences from '../hooks/usePreferences'
 
 // ── Global navigation ────────────────────────────────────────────────────
 // These routes are not scoped to a case.
 const NAV_TOP = [
-  { icon: LayoutDashboard, label: 'Dashboard',    path: '/'            },
+  { icon: LayoutDashboard, label: 'Dashboard',     path: '/dashboard'   },
+  { icon: BarChart3,       label: 'Statistics',    path: '/statistics'  },
   { icon: Layers,          label: 'Queue',         path: '/queue'       },
   { icon: Activity,        label: 'System Health', path: '/health'      },
-  { icon: ShieldCheck,    label: 'Logs & Activity', path: '/activity'  },
+  { icon: ShieldCheck,     label: 'Logs & Activity', path: '/activity'  },
 ]
 
 // ── Per-case navigation ──────────────────────────────────────────────────
@@ -84,7 +86,7 @@ function NavItem({ icon: Icon, label, active, onClick, collapsed }) {
         justifyContent: collapsed ? 'center' : 'flex-start',
         borderRadius: 8,
         background: active
-          ? 'linear-gradient(135deg, #4f46e5 0%, #6366f1 100%)'
+          ? 'linear-gradient(135deg, #0284c7 0%, #2563eb 100%)'
           : hovered ? 'var(--bg-hover)' : 'transparent',
         border: 'none',
         cursor: 'pointer',
@@ -145,6 +147,8 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
   const navigate = useNavigate()
   const location = useLocation()
   const { user, signOut, isAdmin } = useAuth()
+  const { prefs } = usePreferences()
+  const showSystemHealth = prefs.show_system_resources === false
   const [cases, setCases] = useState([])
   const [expanded, setExpanded] = useState(activeCaseId)
   const [search, setSearch] = useState('')
@@ -296,7 +300,7 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
         flexShrink: 0,
         display: 'flex', flexDirection: 'column', gap: 2,
       }}>
-        {NAV_TOP.map(item => (
+        {NAV_TOP.filter(item => item.path !== '/health' || showSystemHealth).map(item => (
           <NavItem
             key={item.path}
             icon={item.icon}
@@ -506,7 +510,7 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
       </div>
 
       {/* ── System health ─────────────────────────────────────────────── */}
-      {!collapsed && (
+      {showSystemHealth && !collapsed && (
         <div style={{
           padding: '8px 14px',
           borderTop: '1px solid var(--line-DEFAULT)',
@@ -531,7 +535,7 @@ export default function Sidebar({ activeCaseId, setActiveCaseId, status, collaps
           </div>
         </div>
       )}
-      {collapsed && (
+      {showSystemHealth && collapsed && (
         <div style={{
           padding: '7px 0', flexShrink: 0,
           display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5,

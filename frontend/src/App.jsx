@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { Routes, Route } from 'react-router-dom'
+import { Routes, Route, Navigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import ProtectedRoute from './components/ProtectedRoute'
 import ErrorBoundary from './components/ErrorBoundary'
@@ -7,8 +7,10 @@ import Sidebar from './components/Sidebar'
 import StatusBar from './components/StatusBar'
 import AppBackground from './components/AppBackground'
 import LoginPage from './pages/LoginPage'
+import LandingPage from './pages/LandingPage'
 import RegisterPage from './pages/RegisterPage'
 import DashboardPage from './pages/DashboardPage'
+import StatisticsPage from './pages/StatisticsPage'
 import AdminUsersPage from './pages/AdminUsersPage'
 import ActivityPage from './pages/ActivityPage'
 import SettingsPage from './pages/SettingsPage'
@@ -119,13 +121,20 @@ function AppLayout() {
           <StatusBar />
           <main style={{
             flex: 1,
+            minHeight: 0,
             overflowY: 'auto',
-            padding: '24px',
+            padding: '20px 28px',
           }}>
             <ErrorBoundary>
             <Routes>
               <Route path="/" element={
+                <Navigate to="/dashboard" replace />
+              } />
+              <Route path="/dashboard" element={
                 <ProtectedRoute><DashboardPage activeCaseId={activeCaseId} setActiveCaseId={setActiveCaseId} /></ProtectedRoute>
+              } />
+              <Route path="/statistics" element={
+                <ProtectedRoute><StatisticsPage /></ProtectedRoute>
               } />
               <Route path="/admin/users" element={
                 <ProtectedRoute minimumRole="Admin"><AdminUsersPage /></ProtectedRoute>
@@ -237,7 +246,8 @@ export default function App() {
     <AuthProvider>
       <Routes>
         <Route path="/login"    element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
+        <Route path="/register" element={<Navigate to="/login" replace />} />
+        <Route path="/"         element={<ProtectedRoute><Navigate to="/dashboard" replace /></ProtectedRoute>} />
         <Route path="/*"        element={<AppLayout />} />
       </Routes>
     </AuthProvider>

@@ -39,7 +39,9 @@ import {
   Activity, AlertCircle, Cpu, Database, Folder, HardDrive, Layers,
 } from 'lucide-react'
 import { getStatus } from '../api/client'
+import { Navigate } from 'react-router-dom'
 import PageLayout from '../components/PageLayout'
+import usePreferences from '../hooks/usePreferences'
 
 /** The one thing that may stand in for a measurement we do not have. */
 const NOT_MEASURED = '—'
@@ -234,11 +236,15 @@ function CannotReach({ error }) {
 }
 
 export default function SystemHealthPage() {
+  const { prefs } = usePreferences()
+  const showSystemHealth = prefs.show_system_resources === false
+
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    if (!showSystemHealth) return
     let cancelled = false
     const load = async () => {
       try {
@@ -262,7 +268,7 @@ export default function SystemHealthPage() {
       cancelled = true
       clearInterval(t)
     }
-  }, [])
+  }, [showSystemHealth])
 
   const services = data?.services && typeof data.services === 'object' ? data.services : null
   const service = (key) => services?.[key] ?? null
@@ -314,6 +320,10 @@ export default function SystemHealthPage() {
         : state('ollama') === 'unavailable'
           ? 'Not verifiable'
           : NOT_MEASURED
+
+  if (!showSystemHealth) {
+    return <Navigate to="/dashboard" replace />
+  }
 
   return (
     <PageLayout

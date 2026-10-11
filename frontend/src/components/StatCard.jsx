@@ -3,9 +3,9 @@ import useCountUp from '../hooks/useCountUp'
 
 const ACCENT_COLORS = {
   indigo: {
-    line: '#6366f1',
-    icon: 'rgba(99,102,241,0.15)',
-    text: '#818cf8'
+    line: '#0284c7',
+    icon: 'rgba(2,132,199,0.15)',
+    text: '#38bdf8'
   },
   blue: {
     line: '#3b82f6',

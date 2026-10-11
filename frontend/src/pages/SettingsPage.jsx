@@ -167,8 +167,8 @@ function PreferencesTab() {
               System resource monitoring
             </div>
             <div style={{ fontSize: 11, color: 'var(--color-white-4)', lineHeight: 1.5 }}>
-              Show live CPU, RAM and queue telemetry on the Evidence page.
-              Turn off to hide hardware settings you do not use.
+              Show live CPU, RAM and queue telemetry on the Evidence page (hides System Health).
+              Turn off to show System Health and hide hardware telemetry.
             </div>
           </div>
           <button
@@ -188,7 +188,7 @@ function PreferencesTab() {
               cursor: 'pointer',
               position: 'relative',
               background: prefs.show_system_resources
-                ? 'linear-gradient(90deg, #6366f1, #4f46e5)'
+                ? 'linear-gradient(90deg, #0284c7, #2563eb)'
                 : 'rgba(255,255,255,0.14)',
               transition: 'background 0.2s ease',
             }}

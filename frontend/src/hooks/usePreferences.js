@@ -20,6 +20,9 @@ function readCache() {
 export function cachePreferences(prefs) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(prefs))
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('idfai_prefs_changed'))
+    }
   } catch {
     /* private mode / quota - the cache is an optimisation, not required */
   }
@@ -50,7 +53,18 @@ export default function usePreferences() {
     }
   }, [])
 
-  useEffect(() => { refresh() }, [refresh])
+  useEffect(() => {
+    refresh()
+    const handleSync = () => {
+      setPrefs(readCache())
+    }
+    window.addEventListener('idfai_prefs_changed', handleSync)
+    window.addEventListener('storage', handleSync)
+    return () => {
+      window.removeEventListener('idfai_prefs_changed', handleSync)
+      window.removeEventListener('storage', handleSync)
+    }
+  }, [refresh])
 
   return { prefs, loading, refresh }
 }

@@ -27,7 +27,7 @@ export function StatCard({
   label,
   value,
   sub,
-  accent = '#6366f1',
+  accent = '#0284c7',
   onClick
 }) {
   return (

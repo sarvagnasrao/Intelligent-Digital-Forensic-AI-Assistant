@@ -17,8 +17,14 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.chdir(r"D:\Users\Anon\Desktop\IDFA_main3")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+# No os.chdir here. This suite used to chdir to the author's own checkout
+# (D:\Users\Anon\Desktop\IDFA_main3), so on any other machine it died with
+# FileNotFoundError before printing a summary -- and a suite that prints no
+# summary reads as "unreadable", which made the gate refuse to total at all.
+# Nothing here needs a particular working directory: it builds its own temp
+# dirs and drives a fake Qdrant client.
 
 from backend.modules import index_provenance as ip
 from backend.modules import vector_store as vs

@@ -129,14 +129,19 @@ def main():
 
     # ── B. run_rag_query separates "failed" from "matched nothing" ──────
     print("\n=== B. run_rag_query: a fault is never reported as clean ===")
-    real = rag_engine.search_chunks
+    # Stub the seam run_rag_query now depends on. Stage 4.1 inserted `retrieve`
+    # (dense + exact-term fusion) between run_rag_query and search_chunks, so a
+    # fault must be injected THERE to reach the caller's error path at all. The
+    # assertions below are UNCHANGED: they test how run_rag_query reports a
+    # retrieval fault, not which internal function produced it.
+    real = rag_engine.retrieve
     try:
         def _boom(**kw):
             raise vector_store.VectorStoreError(
                 "Could not search case c: RuntimeError: storage folder is "
                 "locked by another instance")
 
-        rag_engine.search_chunks = _boom
+        rag_engine.retrieve = _boom
         r = rag_engine.run_rag_query(
             query="what is the suspect's email address",
             case_id="c",
@@ -147,7 +152,7 @@ def main():
             conversation_history=None,
         )
     finally:
-        rag_engine.search_chunks = real
+        rag_engine.retrieve = real
 
     answer = (r.get("answer") or "").lower()
     ps = r.get("prompt_stats") or {}
@@ -233,7 +238,10 @@ def main():
     real_ref = rag_engine.is_refusal
     real_diag = rag_engine.ollama_diagnostic
     try:
-        rag_engine.search_chunks = _fake
+        # Same seam as section B: run_rag_query's retrieval entry point is
+        # `retrieve` now. Every assertion below (widened pool, counts before and
+        # after the floor, model not consulted) is unchanged.
+        rag_engine.retrieve = _fake
         rag_engine.get_graph_context = lambda *a, **k: ""
         rag_engine.generate_response_detailed = lambda p, s: (
             generated.append(p) or {
@@ -249,7 +257,7 @@ def main():
             cases_dir="data/cases", evidence_id=None, asked_by="x",
             conversation_history=None)
     finally:
-        rag_engine.search_chunks = real
+        rag_engine.retrieve = real
         rag_engine.get_graph_context = real_gc
         rag_engine.generate_response_detailed = real_gen
         rag_engine.effective_context_tokens = real_eff

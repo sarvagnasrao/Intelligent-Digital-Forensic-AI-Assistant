@@ -183,6 +183,47 @@ def compute_sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def hash_entry_sha256(entry, size: int,
+                      chunk_size: int = _HASH_CHUNK,
+                      stop_check=None) -> tuple:
+    """
+    Streams a pytsk3 directory entry, hashing it in bounded chunks.
+
+    The in-image walk used to read a whole entry with a single
+    ``entry.read_random(0, size)`` and hash the buffer afterwards, so the read
+    request was the file size (up to the 2 GB video cap). This reads
+    ``chunk_size`` bytes at a time and updates the digest as it goes, returning
+    ``(hexdigest, data)``.
+
+    ``data`` is still the whole entry: Shannon entropy, ``stored_file_path``
+    writing and text extraction all need the bytes, so this bounds each read
+    request and removes a second full-buffer hashing pass. It does NOT by
+    itself cap peak RSS - that needs a streaming entropy counter
+    (``entropy_analyzer.calculate_shannon_entropy`` builds a ``Counter`` over
+    the whole buffer) and streaming extractors, neither of which lives in this
+    module. Stated rather than silently half-fixed.
+
+    A short read terminates the loop; the caller's size check still decides
+    whether that is an error (it is - see ``extract_file_content``).
+    """
+    if chunk_size <= 0:
+        chunk_size = _HASH_CHUNK
+    sha256 = hashlib.sha256()
+    buf = bytearray()
+    offset = 0
+    while offset < size:
+        n = min(chunk_size, size - offset)
+        chunk = entry.read_random(offset, n)
+        if not chunk:
+            break
+        sha256.update(chunk)
+        buf.extend(chunk)
+        offset += len(chunk)
+        if stop_check is not None:
+            stop_check()
+    return sha256.hexdigest(), bytes(buf)
+
+
 def format_timestamp(ts_value) -> str:
     """Converts pytsk3 timestamp to string."""
     try:
@@ -785,6 +826,28 @@ def extract_text_from_bytes(
                 '_reason': f"{ext} reader produced no text from this file",
             }
         return result[0], result[1], {}
+
+    # Registry hives are matched by NAME, not by extension, so they never
+    # reached an allowlist branch above: SYSTEM, SAM, SOFTWARE and SECURITY have
+    # no extension at all, and NTUSER.DAT / UsrClass.dat carry extensions in no
+    # allowlist. `is_supported_file` admits them on the in-image walk, so
+    # without this branch every hive fell through to the content sniffer and was
+    # reported 'unsupported' - the format was accepted and then never extracted
+    # (A7). media_extractor.extract_media already has this branch, but
+    # extract_text_from_bytes only routes to extract_media for the
+    # Office/audio/video/email extensions, which a hive is not.
+    try:
+        from backend.modules.registry_parser import (
+            is_registry_hive, parse_registry_hive)
+        hive_name = os.path.basename(filename)
+        if is_registry_hive(hive_name):
+            reg_text, reg_type = parse_registry_hive(
+                data, hive_name, temp_dir)
+            return reg_text, reg_type, {}
+    except ImportError:
+        # registry_parser absent: fall through to the content sniffer rather
+        # than crash the whole walk on one unreadable format.
+        pass
 
     # The extension is not in any allowlist. Before discarding the content,
     # decide from the bytes -- see the long note on _looks_like_text for why an
@@ -1392,26 +1455,40 @@ def inspect_raw_image(image_path: str) -> dict:
         return result
 
     bad = [p for p in result["partitions"] if p["truncated"]]
-    # A split set whose tail segments are absent is missing data, not a
-    # truncated acquisition, and the two need different remedies: upload the
-    # remaining segments versus re-acquire the disk. Naming the missing
-    # segments is the actionable form of that.
-    set_incomplete = bool(result["missing_segments"]) and \
-        len(result["segments"]) == 1
+    # A split set with a gap is missing data, not a truncated acquisition, and
+    # the two need different remedies: upload the missing segment(s) versus
+    # re-acquire the disk. Naming the missing segments is the actionable form.
+    #
+    # This used to also require len(segments) == 1, on the reading that the only
+    # incomplete set worth describing was a lone first segment. But
+    # image_segment_paths stops at the first gap, so a set like .001 .002 .004
+    # resolves to two contiguous segments *and* names .003 as missing -- and the
+    # old guard threw that away, telling the operator to re-acquire a disk when
+    # uploading one segment would have completed the set. Missing segments are
+    # missing however many contiguous ones precede them.
+    set_incomplete = bool(result["missing_segments"])
 
-    if bad and set_incomplete:
-        p = bad[0]
+    if set_incomplete:
+        # A set with a hole is short of bytes by definition, and the caller
+        # decides whether to warn from this flag; say so here rather than only
+        # in the generic truncation branch below.
+        result["truncated"] = True
         missing = ", ".join(result["missing_segments"][:6])
         if len(result["missing_segments"]) > 6:
             missing += f", ... (+{len(result['missing_segments']) - 6} more)"
+        if bad:
+            p = bad[0]
+            short = (
+                f" Partition {p['index']} ({p['fs_type']}) declares "
+                f"{_human_bytes(p['declared_bytes'])} while the contiguous "
+                f"segment(s) present hold {_human_bytes(file_size)}.")
+        else:
+            short = ""
         result["summary"] = (
-            f"SPLIT IMAGE SET IS INCOMPLETE - {os.path.basename(image_path)} "
-            f"is the first segment of a split acquisition, but segments "
-            f"{missing} are not beside it. "
-            f"Partition {p['index']} ({p['fs_type']}) declares "
-            f"{_human_bytes(p['declared_bytes'])} while the set present holds "
-            f"{_human_bytes(file_size)}. Upload the whole segment set - "
-            f"a lone first segment cannot be walked."
+            f"SPLIT IMAGE SET IS INCOMPLETE - the segments beside "
+            f"{os.path.basename(image_path)} are missing {missing}."
+            f"{short} The walk stops at the first gap, so nothing past it is "
+            f"read. Upload the missing segment(s) beside the set and re-ingest."
         )
     elif bad:
         result["truncated"] = True
@@ -1656,7 +1733,10 @@ def extract_file_content(
         # Verified against pytsk3 20260715: dir() on the yielded entry is
         # ['as_directory', 'current_attr', 'info', 'max_attr', 'read_random'].
         # No as_file(). There is nothing to unwrap.
-        data = entry.read_random(0, size)
+        # Stream the entry in bounded chunks, hashing as we read (A9). Was a
+        # single `data = entry.read_random(0, size)` followed by
+        # `compute_sha256_bytes(data)`.
+        artifact_hash, data = hash_entry_sha256(entry, size)
 
         # A short read means the declared size does not match what the
         # filesystem returned -- a truncated image, or a cluster chain that runs
@@ -1674,8 +1754,8 @@ def extract_file_content(
                 f"complete."
             )
 
-        # Compute artifact hash
-        artifact_hash = compute_sha256_bytes(data)
+        # artifact_hash was computed by hash_entry_sha256 above, while the
+        # entry was being streamed.
 
         # Calculate Shannon entropy before text extraction
         entropy = calculate_shannon_entropy(data)

@@ -8,6 +8,28 @@ import os
 nlp = spacy.load("en_core_web_sm", disable=["tagger", "parser", "attribute_ruler", "lemmatizer", "tok2vec"])
 
 
+# NER_BUDGET_CHARS bounds how much text one build_graph / extract_entities call
+# may hand to spaCy. It is a CHARACTER budget, not a chunk count: a chunk count
+# is only an amount-of-text proxy while every chunk is the same size, and
+# chunking has changed size before (see the note in build_graph). At the
+# measured ~42 KiB/s single-threaded this is ~0.7 s per call. It is enforced as
+# a hard ceiling on the total fed in, including a single oversized chunk, so no
+# input shape can run the pipeline unbounded.
+NER_BUDGET_CHARS = 30_000
+
+# CO_MENTION_MAX_PERSONS caps the pairwise CO_MENTIONED_WITH relation within a
+# single chunk. Every distinct pair is one graph insert, so the relation is
+# quadratic: a chunk naming 300 people is 44,850 inserts, and a real document
+# that lists a directory of names reaches that easily. The cap is on the number
+# of people considered for the pairwise pass, giving at most
+# C(CO_MENTION_MAX_PERSONS, 2) = 190 edges per chunk. It does NOT drop anyone:
+# every person still becomes a Person node with a MENTIONED_IN edge to the file
+# (see the mention loops), so entity coverage is unchanged and only the
+# quadratic co-occurrence relation is bounded. 20 is well above the number of
+# people a normal prose chunk names (a 700-char chunk names a handful).
+CO_MENTION_MAX_PERSONS = 20
+
+
 def _get_graph_path(case_id: str,
                     cases_dir: str) -> str:
     return os.path.join(
@@ -87,6 +109,12 @@ def _resolve_entities(
 
 
 def extract_entities(text: str) -> dict:
+    # Bounded: this is the standalone entry point used by get_graph_context
+    # (the query text) and by the grounding check. A caller can pass anything,
+    # so the same NER ceiling build_graph enforces applies here, otherwise a
+    # long input runs the pipeline unbounded.
+    if text and len(text) > NER_BUDGET_CHARS:
+        text = text[:NER_BUDGET_CHARS]
     doc = nlp(text)
     persons, locations, organizations = [], [], []
 
@@ -151,15 +179,24 @@ def build_graph(chunks: list[str],
     # `n_process` pool; that is item 7 and it is where the real parallelism
     # belongs.
     #
-    # Chunks are taken whole rather than sliced, so a document boundary is never
-    # cut mid-passage and the entity graph does not gain a partial document.
-    NER_BUDGET_CHARS = 30_000
-    budgeted, budget_used = [], 0
+    # Chunks are taken whole, so a document boundary is not cut mid-passage.
+    # Only a single chunk that alone exceeds the remaining budget is sliced,
+    # because otherwise no budget could bound it.
+    #
+    # The old loop (`if budgeted and budget_used + len(c) > NER_BUDGET_CHARS`)
+    # always admitted the FIRST chunk whatever its size, so one oversized chunk
+    # - which is exactly the shape a budget exists to bound - ran in full. The
+    # loop below spends a `remaining` allowance instead; a chunk that does not
+    # fit the remainder is sliced, so the total handed to spaCy can never
+    # exceed NER_BUDGET_CHARS.
+    budgeted, remaining = [], NER_BUDGET_CHARS
     for c in chunks or []:
-        if budgeted and budget_used + len(c) > NER_BUDGET_CHARS:
+        if remaining <= 0:
             break
+        if len(c) > remaining:
+            c = c[:remaining]
         budgeted.append(c)
-        budget_used += len(c)
+        remaining -= len(c)
 
     docs = list(nlp.pipe(budgeted, batch_size=32))
     all_extracted = []
@@ -224,7 +261,14 @@ def build_graph(chunks: list[str],
         # stop signal - the only check in this function ran every 50 spaCy
         # documents, which for a short file means exactly once, at i=0.
         # Checking per outer row keeps Stop responsive here.
-        n_persons = len(persons_resolved)
+        #
+        # The pairwise pass is also capped at CO_MENTION_MAX_PERSONS people per
+        # chunk (see the constant): at most C(cap, 2) edges are inserted for one
+        # chunk no matter how many names it holds. Both bounds on `j` and `k`
+        # use the capped count; capping only `j` would still let a capped person
+        # connect to everyone past the cap and the relation would stay linear in
+        # the number of names rather than bounded.
+        n_persons = min(len(persons_resolved), CO_MENTION_MAX_PERSONS)
         for j in range(n_persons):
             if governor is not None and j % 10 == 0:
                 governor.check_and_throttle()

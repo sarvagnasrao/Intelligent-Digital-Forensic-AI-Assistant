@@ -1,3 +1,21 @@
+## Handoff: Backend hardening — READ `PROGRESS.md` FIRST
+
+A multi-stage backend-hardening job is in progress. **`PROGRESS.md` is the
+continuation ledger** (done / in flight / to do, ownership map, exact commands,
+hard rules). Detailed findings with `file:line` are in `AUDIT_BASELINE.md`.
+Per-workstream agent logs are in `reports/`.
+
+State at last update: Stage 4.1 (hybrid dense+exact-term retrieval) is DONE and
+verified (`tests/verify_hybrid_retrieval.py` 21/0; targeted regressions all
+green). Stages 4.2/4.3, 5, 6, and the final integration gate + deferred cleanup
+are outstanding — see `PROGRESS.md` §3.
+
+Non-negotiables: do not commit/branch/reset; do not delete data until the
+cleanup step; never weaken a test or turn `None` into `0`; run the full gate only
+once, when no agent is mid-edit.
+
+---
+
 ## Handoff: Storage management (added)
 
 **What changed (§31, storage transparency):**

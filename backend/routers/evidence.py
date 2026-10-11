@@ -601,6 +601,38 @@ async def upload_multi_evidence(
 # Must be declared BEFORE /{evidence_id} routes.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# POST .../evidence/{evidence_id}/verify  -- chain of custody
+# ---------------------------------------------------------------------------
+
+def hash_evidence_set(file_path: str) -> str:
+    """
+    SHA-256 over the whole evidence file, following split segments in order.
+
+    ``evidence.file_path`` is the *first* segment of a split acquisition, while
+    ``evidence.sha256_hash`` was recorded at upload over every segment
+    concatenated in order (``_store_image_segment_set``). Re-hashing only the
+    first segment therefore can never match for a split set, which made this
+    endpoint answer "file has been modified since ingestion" for every
+    multi-segment acquisition that was in fact perfectly intact -- a false
+    tampering accusation, and the worst failure a chain-of-custody control can
+    have. Hash the same bytes the upload hashed.
+
+    ``image_segment_paths`` returns ``[file_path]`` for anything that is not a
+    first segment, so an ordinary document hashes as itself, exactly as before.
+    Imported inside the function because that module carries the forensic stack
+    and this router must import without it (see B15).
+    """
+    from backend.modules.forensic_ingestion import image_segment_paths
+
+    digest = hashlib.sha256()
+    for segment_path in image_segment_paths(file_path):
+        with open(segment_path, "rb") as f:
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
 @router.post("/{evidence_id}/verify")
 def verify_evidence_integrity(
     case_id: str,
@@ -609,12 +641,15 @@ def verify_evidence_integrity(
     db: Session = Depends(get_db),
 ):
     """
-    Re-computes SHA-256 of stored file and compares to
-    original hash recorded at upload time.
-    Returns PASS or FAIL with full details.
-    Logs result to audit trail for chain-of-custody.
+    Re-computes the SHA-256 of the stored evidence and compares it to the hash
+    recorded at upload time. For a split acquisition the whole segment set is
+    hashed, in order, matching the byte range the upload recorded (see
+    hash_evidence_set above) -- hashing only the first segment made every
+    intact split set report as tampered.
+
+    Returns PASS or FAIL with full details, and logs the result to the audit
+    trail for chain of custody.
     """
-    import hashlib
     from datetime import datetime as _dt
 
     evidence = db.query(models.Evidence).filter(
@@ -640,13 +675,10 @@ def verify_evidence_integrity(
             status_code=400,
             detail="No original hash stored. Cannot verify.")
 
-    # Recompute SHA-256
-    sha256 = hashlib.sha256()
+    # Recompute SHA-256 over the whole evidence file -- every segment of a split
+    # acquisition, in order -- which is the byte range the upload hashed.
     try:
-        with open(evidence.file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                sha256.update(chunk)
-        current_hash = sha256.hexdigest()
+        current_hash = hash_evidence_set(evidence.file_path)
     except Exception as e:
         raise HTTPException(
             status_code=500,

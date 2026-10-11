@@ -1,6 +1,6 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import (Distance,
-    VectorParams, PointStruct)
+    VectorParams, PointStruct, PayloadSchemaType)
 import uuid
 import os
 import threading
@@ -18,10 +18,19 @@ VECTOR_SIZE = 384
 # are read from the loaded instance by describe_embedder(); this names it.
 EMBEDDER_ID = 'all-MiniLM-L6-v2'
 
-# Chunks per embed call inside store_chunks. Purely a responsiveness knob:
-# smaller slices mean a shorter worst-case wait for a Stop, and more places
-# for the governor to throttle. The resulting vectors are identical.
+# Chunks per stop-check inside store_chunks. Purely a responsiveness knob:
+# smaller slices mean a shorter worst-case wait for a Stop.
 EMBED_SLICE = 16
+
+# Texts per `model.encode` call. This is the batch the device resolver times
+# when it picks a device -- `device_resolver._benchmark_embedder` runs
+# `model.encode(chunks, batch_size=64, normalize_embeddings=True, ...)` and its
+# note claims to "match production" (B4). Before this constant existed,
+# `store_chunks` handed the embedder one EMBED_SLICE (16) at a time, so the
+# benchmark's 64-wide decision was fitted on a workload production never ran.
+# The stop check still fires every EMBED_SLICE chunks; only the encode is
+# batched up to EMBED_BATCH.
+EMBED_BATCH = 64
 
 # Resolved once, because it consults the disk and the settings on first use.
 _resolved_qdrant_dir: Optional[str] = None
@@ -257,6 +266,15 @@ def get_ollama_embeddings(texts: list[str]) -> list[list[float]]:
     Embeds texts locally with all-MiniLM-L6-v2 and returns 384-dim vectors.
 
     Keeps the historical function name so existing imports do not break.
+
+    The encode is configured to match what `device_resolver` measured when it
+    chose the device (B4): `batch_size=EMBED_BATCH` (64) and
+    `normalize_embeddings=True`. Without them production encoded small,
+    un-normalised batches while the resolver's pick was fitted on 64-wide,
+    normalised ones -- the measurement and the thing measured disagreed.
+    Normalisation is rank-neutral under Qdrant's COSINE distance (cosine is
+    scale-invariant), so this changes the cost and the stored magnitudes, not
+    the ordering.
     """
     model = _load_embed_model()
 
@@ -268,7 +286,11 @@ def get_ollama_embeddings(texts: list[str]) -> list[list[float]]:
     # removing it changes nothing measurable today and would be a behaviour
     # change riding along on a provenance patch.
     truncated = [t[:1000] for t in texts]
-    embeddings = model.encode(truncated)
+    embeddings = model.encode(
+        truncated,
+        batch_size=EMBED_BATCH,
+        normalize_embeddings=True,
+    )
     return embeddings.tolist()
 
 
@@ -364,8 +386,13 @@ def close_all_clients() -> int:
 
 
 def ensure_collection(client: QdrantClient,
-                       collection_name: str):
-    """Creates collection if it does not exist."""
+                       collection_name: str,
+                       qdrant_path: str = None):
+    """Creates collection if it does not exist, then ensures its payload index.
+
+    `qdrant_path` is optional so existing call sites keep working; it is only
+    used to make the payload-index dedup key per storage directory.
+    """
     existing = [c.name for c in
                 client.get_collections().collections]
     if collection_name not in existing:
@@ -376,6 +403,62 @@ def ensure_collection(client: QdrantClient,
                 distance=Distance.COSINE
             )
         )
+    ensure_payload_indexes(client, collection_name, qdrant_path)
+
+
+# Collections whose payload index has already been requested in this process.
+#
+# The request is idempotent at the API level but NOT free in embedded Qdrant:
+# the local backend logs "Payload indexes have no effect in the local Qdrant"
+# on every call. `store_chunks` runs once per forensic artifact under one
+# collection, so an unguarded call would print that warning once per artifact
+# -- hundreds of lines per disk image. Guarded per (storage path, collection),
+# which is per case by construction.
+_payload_index_ensured = set()
+_payload_index_lock = threading.Lock()
+
+
+def ensure_payload_indexes(client: QdrantClient,
+                           collection_name: str,
+                           qdrant_path: str = None):
+    """
+    Ensure the payload indexes a filtered search depends on exist (finding B2).
+
+    `search_chunks(evidence_id=...)` and `delete_evidence_points` both build a
+    Qdrant filter on the `evidence_id` payload field. With no payload index that
+    filter is an unindexed scan of the collection's payload store -- O(corpus)
+    per query, and once more per evidence item on the re-index path.
+
+    HONEST LIMITATION, stated here rather than implied by the name: the pinned
+    qdrant-client (1.9.1) runs the local, embedded backend, and embedded Qdrant
+    IGNORES payload indexes outright -- `create_payload_index` logs "Payload
+    indexes have no effect in the local Qdrant" and returns without building
+    anything. So on this install the call does NOT reduce the cost of the
+    filter, and this is not a measured speed-up to claim. It is the correct API
+    call, put in the one place every write passes through, so that a migration
+    to a Qdrant server gets the index with no further code change. The suite
+    `tests/verify_perf_batching.py` asserts the call is made; it does not
+    pretend the embedded backend honours it.
+
+    A failure here is printed, not raised: an absent index makes the filter
+    slower, not wrong, and failing an ingest over it would trade a performance
+    problem for a correctness one.
+    """
+    key = (qdrant_path or "", collection_name)
+    with _payload_index_lock:
+        if key in _payload_index_ensured:
+            return
+        _payload_index_ensured.add(key)
+    try:
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name="evidence_id",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+    except Exception as e:
+        print(f"[VECTOR] could not ensure payload index on "
+              f"{collection_name}: {type(e).__name__}: {e}")
+
 
 
 class VectorStoreError(RuntimeError):
@@ -390,6 +473,82 @@ class VectorStoreError(RuntimeError):
     because the investigator then searches a case that has nothing in it and
     concludes the evidence was clean.
     """
+
+
+# Deterministic point ids (A5/B1).
+#
+# Point ids used to be `uuid.uuid4()`, so re-indexing the same evidence minted a
+# fresh id for every chunk and the upsert *appended* a second copy instead of
+# replacing the first. The collection grew on every re-index, `(source,
+# chunk_index)` stopped being unique, and a query returned the same passage
+# several times as if several documents corroborated each other.
+#
+# The id is a uuid5 over everything that identifies the point: the case, the
+# evidence, the source file (the forensic path stores many artifacts under one
+# evidence id, so two artifacts can share an index and a filename), the chunk
+# index and the text. Same inputs, same id, in every process and on every run.
+_ID_NAMESPACE = uuid.NAMESPACE_URL
+
+
+def _point_id(case_id: str, evidence_id: str, source_filename: str,
+              chunk_index: int, text: str) -> str:
+    return str(uuid.uuid5(
+        _ID_NAMESPACE,
+        f"{case_id}|{evidence_id}|{source_filename}|{chunk_index}|{text}"))
+
+
+def delete_evidence_points(evidence_id: str,
+                           case_id: str,
+                           qdrant_path: str) -> Optional[int]:
+    """
+    Remove every stored point belonging to one evidence item.
+
+    Re-indexing must *replace* an item's vectors, not append to them. Call this
+    once before a (re-)index begins so a second ingest of the same evidence, or
+    a re-ingest after its extracted text changed, leaves one copy behind
+    instead of two.
+
+    It is deliberately NOT done inside `store_chunks`. The document path calls
+    that function once per embed batch and the forensic path once per artifact,
+    all under the *same* evidence id, so a per-call delete would erase the
+    batches already written in the same run and keep only the last one.
+
+    Refuses to touch an index it cannot vouch for, mirroring `store_chunks`: on a
+    provenance mismatch the write is refused a moment later, and emptying a
+    store we cannot refill would be worse than the duplicate it would prevent.
+
+    Returns the number of points removed, or None when that count could not be
+    read. A missing collection is 0, not an error.
+    """
+    from backend.modules import index_provenance
+    from qdrant_client.models import (
+        Filter as QFilter, FieldCondition, MatchValue)
+
+    client = get_client(qdrant_path)
+    collection = get_collection_name(case_id)
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing:
+        return 0
+
+    verdict = index_provenance.check_index(qdrant_path, describe_embedder())
+    if verdict["state"] == index_provenance.MISMATCH:
+        print(f"[VECTOR] Not replacing {evidence_id} in case {case_id}: "
+              f"{verdict['reason']}")
+        return 0
+
+    selector = QFilter(must=[FieldCondition(
+        key="evidence_id", match=MatchValue(value=evidence_id))])
+
+    removed = None
+    try:
+        removed = client.count(
+            collection_name=collection, count_filter=selector,
+            exact=True).count
+    except Exception as ce:
+        print(f"[VECTOR] could not count points for {evidence_id}: {ce}")
+
+    client.delete(collection_name=collection, points_selector=selector)
+    return removed
 
 
 def store_chunks(chunks: list[str],
@@ -408,13 +567,14 @@ def store_chunks(chunks: list[str],
     un-parseable embedding response - raises VectorStoreError so the job can
     be marked Failed instead of silently reporting success.
 
-    stop_check is consulted between embed slices, not only between whole
-    batches. The caller already chunks the document, but one batch is up to
-    64 chunks and embedding those is the longest uninterruptible stretch in
+    stop_check is consulted every EMBED_SLICE (16) chunks, not only between
+    whole batches. The caller already chunks the document, but one batch is up
+    to 64 chunks and embedding those is the longest uninterruptible stretch in
     the document path: measured at 30s+ on a loaded 4-core box, which is long
-    enough that an operator concludes the Stop button is broken. Slicing the
-    embed also lets the resource governor throttle mid-batch, which it
-    previously could not do at all.
+    enough that an operator concludes the Stop button is broken. The reads that
+    feed the embedder are kept at EMBED_SLICE for that reason, while the encode
+    itself is batched up to EMBED_BATCH (64) so it matches the batch
+    `device_resolver` benchmarked (B4).
 
     `chunking` is the caller's `{chunk_size, chunk_overlap}`. It is recorded as
     provenance and is NOT a control -- this function does not chunk. It has a
@@ -446,21 +606,30 @@ def store_chunks(chunks: list[str],
 
         client = get_client(qdrant_path)
         collection = get_collection_name(case_id)
-        ensure_collection(client, collection)
+        ensure_collection(client, collection, qdrant_path)
 
-        # Embed in slices, checking for a stop between each.
+        # Stop-check every EMBED_SLICE chunks, but hand the embedder EMBED_BATCH
+        # (64) of them per call, so the encode the device resolver benchmarked
+        # (batch_size=64) is the encode that actually runs here (B4). The stop
+        # check is unaffected: it still fires between slices.
         embeddings = []
+        pending = []
         for start in range(0, len(chunks), EMBED_SLICE):
             if stop_check is not None and stop_check():
                 raise StopIteration("Ingestion stopped by user")
-            embeddings.extend(
-                get_ollama_embeddings(chunks[start:start + EMBED_SLICE]))
+            pending.extend(chunks[start:start + EMBED_SLICE])
+            if len(pending) >= EMBED_BATCH:
+                embeddings.extend(get_ollama_embeddings(pending))
+                pending = []
+        if pending:
+            embeddings.extend(get_ollama_embeddings(pending))
 
         points = []
         for i, chunk in enumerate(chunks):
             embedding = embeddings[i]
             points.append(PointStruct(
-                id=str(uuid.uuid4()),
+                id=_point_id(case_id, evidence_id,
+                             source_filename, i, chunk),
                 vector=embedding,
                 payload={
                     "text": chunk,
@@ -626,7 +795,11 @@ def search_chunks(query: str,
                 "evidence_id", ""),
             "chunk_index": r.payload.get(
                 "chunk_index", 0),
-            "score": round(r.score, 3)
+            "score": round(r.score, 3),
+            # The point's own id, so a caller can trace an answer back to the
+            # exact stored passage rather than to a (source, index) pair a
+            # re-index may have renumbered (Stage 4, C3).
+            "point_id": str(r.id),
         } for r in results]
 
     except StopIteration:
@@ -639,6 +812,119 @@ def search_chunks(query: str,
             f"Could not search case {case_id} for "
             f"{'evidence ' + str(evidence_id) if evidence_id else 'the case'}"
             f" (top_k={top_k}): {type(e).__name__}: {e}"
+        ) from e
+
+
+def lexical_search(query: str,
+                   case_id: str,
+                   qdrant_path: str,
+                   limit: int = 14,
+                   evidence_id: str = None) -> list[dict]:
+    """
+    Exact-term search over the case's stored chunks (Stage 4.1, finding C1).
+
+    The companion to `search_chunks`, which is dense-only and therefore blind to
+    the strings a forensic question is usually made of. Measured on the baseline
+    corpus: `search_chunks("203.0.113.77")` ranked the chunk containing that
+    address THIRD at 0.133, below the 0.15 floor, behind an unrelated .csv at
+    0.268 -- because cosine compares MEANING and an IP address has no meaning to
+    compare. This compares STRINGS.
+
+    Scoring is IDF-weighted coverage (`lexical.weighted_coverage`): the fraction
+    of the query's rarity-weighted terms the chunk contains. A rare identifier
+    ("203", "77", a hash) carries ~0.98 of weight and a ubiquitous word ~0.13,
+    so an exact identifier outvotes filler without any threshold tuned here.
+    That is deliberate -- see the note above `weighted_coverage`, and note that
+    the score floor already made this mistake once.
+
+    Returns [] when the query has no matchable terms or nothing contains any of
+    them. Raises on a real fault, exactly as `search_chunks` does, and refuses an
+    index it cannot vouch for, for the same reasons.
+
+    COST, stated plainly: embedded Qdrant has no full-text payload index here, so
+    this scrolls the collection's payloads once per query -- O(corpus). That is
+    affordable at current case sizes and is the honest simple version; a payload
+    index and a persisted term index are Stage 5 work, not a reason to hide the
+    cost behind a wrong answer.
+    """
+    from backend.modules import index_provenance, lexical
+    from qdrant_client.models import (
+        Filter as QFilter, FieldCondition, MatchValue)
+
+    terms = lexical.identifier_terms(query)
+    if not terms:
+        # Nothing to match on. The same "decline to act when there is nothing to
+        # compare" rule the query-level lexical gate follows.
+        return []
+
+    try:
+        client = get_client(qdrant_path)
+        collection = get_collection_name(case_id)
+        existing = [c.name for c in client.get_collections().collections]
+        if collection not in existing:
+            return []
+
+        verdict = index_provenance.check_index(qdrant_path, describe_embedder())
+        if verdict["state"] == index_provenance.MISMATCH:
+            raise VectorStoreError(
+                f"Refusing to search case {case_id}: {verdict['reason']}")
+        if verdict["state"] == index_provenance.UNATTRIBUTED:
+            _warn_unattributed_once(qdrant_path, case_id, verdict["reason"])
+
+        scroll_filter = None
+        if evidence_id:
+            scroll_filter = QFilter(must=[FieldCondition(
+                key="evidence_id", match=MatchValue(value=evidence_id))])
+
+        rows = []
+        offset = None
+        while True:
+            records, offset = client.scroll(
+                collection_name=collection,
+                limit=1024,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+                scroll_filter=scroll_filter,
+            )
+            for r in records:
+                payload = r.payload or {}
+                rows.append((str(r.id), payload.get("text", ""), payload))
+            if offset is None:
+                break
+
+        term_sets = [lexical.identifier_terms(t) for _, t, _ in rows]
+        dfs = lexical.document_frequencies(term_sets)
+        n_docs = len(rows)
+
+        scored = []
+        for (point_id, text, payload), chunk_terms in zip(rows, term_sets):
+            s = lexical.weighted_coverage(terms, chunk_terms, dfs, n_docs)
+            if s > 0:
+                scored.append((s, payload, point_id, text))
+
+        # Higher coverage first, then by position, so the order is stable and
+        # explainable rather than whatever the scroll happened to return.
+        scored.sort(key=lambda x: (-x[0], x[1].get("chunk_index", 0)))
+
+        return [{
+            "text": text,
+            "source": payload.get("source", ""),
+            "evidence_id": payload.get("evidence_id", ""),
+            "chunk_index": payload.get("chunk_index", 0),
+            "score": round(score, 4),
+            "match": "lexical",
+            "point_id": point_id,
+        } for score, payload, point_id, text in scored[:max(0, limit)]]
+
+    except StopIteration:
+        raise
+    except VectorStoreError:
+        raise
+    except Exception as e:
+        raise VectorStoreError(
+            f"Could not run an exact-term search in case {case_id} "
+            f"(limit={limit}): {type(e).__name__}: {e}"
         ) from e
 
 
@@ -673,6 +959,11 @@ def delete_case_collection(case_id: str,
             index_provenance.clear_provenance(qdrant_path)
             with _unattributed_lock:
                 _unattributed_warned.discard(qdrant_path)
+            # Forget the index-ensured mark too: a case id re-created later
+            # must not inherit this process's "already indexed" belief.
+            with _payload_index_lock:
+                _payload_index_ensured.discard(
+                    (qdrant_path or "", get_collection_name(case_id)))
         except Exception as e:
             print(f"QDRANT PROVENANCE ERROR: {e}")
         close_client(qdrant_path)

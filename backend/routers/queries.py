@@ -229,6 +229,15 @@ def ask_question(
             "model_used": result["model_used"],
             "ollama_available": result[
                 "ollama_available"],
+            # The excerpts the answer was built from, so a claim can be traced
+            # back to the passages behind it (finding C3). The POST has no
+            # response_model, so this is purely additive.
+            "chunks_used": result["chunks_used"],
+            # Whether the identifiers the model named actually occur in those
+            # excerpts (finding C2), and whether history was trimmed (C6).
+            # Read with .get so a caller that supplies a partial result dict
+            # is not forced to grow one.
+            "grounding": result.get("grounding"),
             # Whether the model actually saw the evidence, and how much of
             # it had to be dropped to fit the context window. Without these
             # a trimmed answer is indistinguishable from a complete one.

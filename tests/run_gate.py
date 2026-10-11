@@ -59,6 +59,7 @@ SUITES = [
     "verify_eta.py",
     "verify_evidence_archive.py",
     "verify_file_formats.py",
+    "verify_split_images.py",
     # The gate's own parser. Included on purpose: §21's rule is that a summariser is
     # a program and has to be tested like one, and this suite exists because the
     # first version of run_gate.py could not read six of the sixteen summaries and
@@ -66,8 +67,19 @@ SUITES = [
     "verify_gate_parser.py",
     "verify_forensic_failure.py",
     "verify_gpu_telemetry.py",
+    # Stage 4.1 (C1): retrieval is dense + exact-term, fused. Guards the measured
+    # failure where an exact identifier chunk ranked below the floor behind a
+    # semantically nearer stranger.
+    "verify_hybrid_retrieval.py",
+    # Stage 6 (A11/A12): NER budget and co-mention cap.
+    "verify_graph_nlp.py",
+    # Stage 6 (A7/A9): registry hive extraction and streaming hash.
+    "verify_graph_forensic.py",
     "verify_identity_attribution.py",
     "verify_ingestion_modes.py",
+    # Stage 3 (A5/B1): re-indexing the same evidence must REPLACE its vectors,
+    # not append a second copy under fresh ids.
+    "verify_reindex_idempotency.py",
     "verify_job_stop.py",
     "verify_prompt_budget.py",
     "verify_provenance.py",
@@ -77,6 +89,14 @@ SUITES = [
     "verify_storage.py",
     "verify_vector_store.py",
     "verify_ws_progress.py",
+    # Stage 4.2 (C3): claim↔excerpt traceability via chunks_used.
+    "verify_query_traceability.py",
+    # Stage 4.3 (C2/C4/C6): grounding check, honest refusal, bounded history.
+    "verify_grounding.py",
+    # Stage 5 (B4/B2): real batching/normalization + payload index.
+    "verify_perf_batching.py",
+    # Stage 5 (A9/A10): bounded media read + artifact cap reporting.
+    "verify_perf_ingestion.py",
 ]
 
 EXCLUDED = {

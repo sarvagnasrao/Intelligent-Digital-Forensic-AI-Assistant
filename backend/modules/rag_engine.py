@@ -1,4 +1,5 @@
-from backend.modules.vector_store import search_chunks
+from backend.modules.vector_store import search_chunks, lexical_search
+from backend.modules import lexical
 from backend.modules.graph_builder import (
     get_graph_context, extract_entities)
 from backend.modules.ollama_client import (
@@ -142,6 +143,51 @@ EVIDENCE_NOTE_MARKER = "Evidence caveat:"
 # because a caveat on the reliability of a finding should not read as part
 # of the finding.
 
+# ---------------------------------------------------------------------------
+# Conversation memory is bounded on purpose (finding C6)
+# ---------------------------------------------------------------------------
+# The conversation history is PROTECTED in the prompt: it is measured and
+# reserved before the evidence is allowed to spend anything. That is the right
+# priority for a handful of exchanges, but unbounded it inverts -- a client
+# could send enough history to consume the whole window and leave the evidence
+# with nothing. The answer would then be about the transcript, not the case,
+# while still carrying a sources footer. The producer caps each field and the
+# number of exchanges; `build_prompt` caps the assembled block again, because
+# it is a public seam a caller can reach directly.
+CONV_MAX_EXCHANGES = 5
+CONV_MAX_QUESTION_CHARS = 500
+CONV_MAX_ANSWER_CHARS = 500
+
+
+def build_conversation_context(history, max_exchanges: int = CONV_MAX_EXCHANGES) -> str:
+    """Render at most `max_exchanges` exchanges, with every field bounded.
+
+    Client-supplied and unvalidated: a non-list is ignored, non-dict entries
+    are skipped, and questions are capped as well as answers (they were not).
+    """
+    if not isinstance(history, list):
+        return ""
+    recent = [e for e in history if isinstance(e, dict)][-max_exchanges:]
+    if not recent:
+        return ""
+
+    def _clip(value, limit: int) -> str:
+        text = value if isinstance(value, str) else (
+            "" if value is None else str(value))
+        if len(text) > limit:
+            return text[:limit] + "..."
+        return text
+
+    lines = ["\nPrevious exchanges in this investigation session:"]
+    for i, exchange in enumerate(recent, 1):
+        question = _clip(exchange.get("question", ""), CONV_MAX_QUESTION_CHARS)
+        answer = _clip(exchange.get("answer", ""), CONV_MAX_ANSWER_CHARS)
+        lines.append(f"\n[Exchange {i}]")
+        lines.append(f"Investigator: {question}")
+        lines.append(f"Assistant: {answer}")
+    return "\n".join(lines)
+
+
 
 def _elide(text: str, max_chars: int) -> tuple[str, int]:
     """
@@ -276,14 +322,12 @@ QUERY_TERM_FLOOR = 0.0
 # is correct. Conflating the two states would make "hi" and "asdf"
 # indistinguishable, which is the same conflation that made a missing score
 # read as a failed one in `apply_relevance_floor`.
-_QUERY_STOPWORDS = frozenset("""
-    a an the is are was were be been being do does did has have had of in on at
-    to from by for with about into through over under and or but if then than
-    so as it its this that these those i you he she we they them his her their
-    our my me us who whom whose which what when where why how all any both each
-    more most other some such no not only own same too very can will just also
-    there here am up out down off again further once
-""".split())
+# Single source of truth for the stop list. `lexical.QUERY_STOPWORDS` exists for
+# exactly this purpose: Stage 4.1 added a second, independent matcher and two
+# copies of this list would drift until a query was "content" to one half of the
+# hybrid retriever and "empty" to the other. Stdlib-only, no import cycle
+# (`lexical` imports nothing from this package).
+_QUERY_STOPWORDS = lexical.QUERY_STOPWORDS
 
 # Split on EVERY non-alphanumeric run. Evidence identifiers are full of
 # separators and a tokeniser that preserved them would fail to match a question
@@ -403,6 +447,8 @@ def _unanswered(answer: str,
             "excerpts": 0,
             "excerpts_trimmed": 0,
             "chars_elided": 0,
+            "conv_trimmed": False,
+            "conv_chars_elided": 0,
             "graph_trimmed": False,
             "sources": 0,
             "context_tokens": effective_context_tokens(),
@@ -411,6 +457,9 @@ def _unanswered(answer: str,
             "model_not_consulted": True,
         },
         "refused": False,
+        # Nothing was retrieved, so no answer can be grounded in it, and no
+        # model was asked. Unmeasured, not a pass (finding C2).
+        "grounding": _unmeasured_grounding("model_not_consulted"),
         "ollama_available": diag.get("running", False),
         "model_ready": diag.get("model_ready", False),
         "model_diagnostic": diag,
@@ -442,6 +491,116 @@ def apply_relevance_floor(chunks: list,
             continue
         kept.append(c)
     return kept, dropped
+
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval: dense similarity fused with exact-term matching
+# (Stage 4.1, finding C1).
+# ---------------------------------------------------------------------------
+# Reciprocal Rank Fusion's damping constant, from Cormack, Clarke & Buettcher
+# (2009). It flattens the advantage of the top rank so neither retriever can
+# dominate on one lucky hit. 60 is the value from the paper and is deliberately
+# NOT fitted to this corpus: a constant tuned here would be a property of this
+# corpus, which is exactly the mistake the score floor already made once.
+RRF_K = 60
+
+
+def retrieve(query: str,
+             case_id: str,
+             qdrant_path: str,
+             top_k: int = RETRIEVAL_TOP_K,
+             evidence_id: str = None) -> list[dict]:
+    """Dense similarity fused with exact-term matching, then deduplicated.
+
+    Why two retrievers. Dense search compares MEANING, so it is the right tool
+    for "who was meeting the shell company" and the wrong one for
+    "203.0.113.77": an IP address has no meaning to compare, and the measured
+    baseline ranked the chunk that literally contains it THIRD at 0.133 --
+    below the 0.15 floor, behind an unrelated .csv at 0.268. Exact-term matching
+    compares STRINGS, so it finds that chunk, but it cannot recognise a
+    paraphrase. Running one and not the other is a choice to fail one of those
+    two questions.
+
+    How they are fused. Reciprocal Rank Fusion: each retriever contributes
+    1/(RRF_K + rank) for every passage it returned, and the sums decide the
+    order. RRF operates on RANKS, not scores, so the two scales -- a cosine in
+    [-1, 1] and an IDF-weight coverage in [0, 1] -- never have to be normalised
+    against each other, which would be another fitted constant.
+
+    Identity is (source, chunk_index), not list position, so a passage found by
+    both retrievers is one entry carrying both scores, never two near-duplicate
+    excerpts in the prompt.
+
+    The returned entries keep `score` in its ORIGINAL meaning -- the dense
+    cosine, or None for an exact-term-only hit -- so `apply_relevance_floor`
+    still measures what it was measured to measure. Each entry also carries
+    `match` ("dense" / "lexical" / "both"), `dense_score`, `lexical_score` and
+    `point_id` for tracing an answer back to stored data (finding C3).
+
+    Raises if either retriever faults; `run_rag_query` turns that into an honest
+    "retrieval failed" rather than a quiet fallback to half a retriever.
+    """
+    dense = search_chunks(query=query, case_id=case_id,
+                          qdrant_path=qdrant_path,
+                          top_k=top_k, evidence_id=evidence_id)
+    exact = lexical_search(query=query, case_id=case_id,
+                           qdrant_path=qdrant_path,
+                           limit=top_k, evidence_id=evidence_id)
+
+    fused: dict = {}
+
+    def entry_for(hit: dict) -> dict:
+        key = (hit.get("source", ""), hit.get("chunk_index", 0))
+        e = fused.get(key)
+        if e is None:
+            e = {
+                "text": hit.get("text", ""),
+                "source": hit.get("source", ""),
+                "evidence_id": hit.get("evidence_id", ""),
+                "chunk_index": hit.get("chunk_index", 0),
+                "point_id": hit.get("point_id"),
+                "dense_score": None,
+                "lexical_score": None,
+                "fused_score": 0.0,
+            }
+            fused[key] = e
+        return e
+
+    for rank, hit in enumerate(dense):
+        e = entry_for(hit)
+        e["fused_score"] += 1.0 / (RRF_K + rank)
+        e["dense_score"] = hit.get("score")
+        if hit.get("point_id"):
+            e["point_id"] = hit["point_id"]
+
+    for rank, hit in enumerate(exact):
+        e = entry_for(hit)
+        e["fused_score"] += 1.0 / (RRF_K + rank)
+        e["lexical_score"] = hit.get("score")
+        if hit.get("point_id"):
+            e["point_id"] = hit["point_id"]
+
+    ranked = sorted(
+        fused.values(),
+        key=lambda e: (-e["fused_score"],
+                       -(e["lexical_score"] or 0.0),
+                       -(e["dense_score"] or 0.0),
+                       e["chunk_index"]))
+
+    out = []
+    for e in ranked[:max(0, top_k)]:
+        if e["dense_score"] is not None and e["lexical_score"] is not None:
+            e["match"] = "both"
+        elif e["lexical_score"] is not None:
+            e["match"] = "lexical"
+        else:
+            e["match"] = "dense"
+        # Deliberately NOT the fused score: keeping the cosine here is what lets
+        # the 0.15 floor keep meaning "cosine < 0.15", and an exact-term-only hit
+        # (score None) is KEPT by `apply_relevance_floor` by design.
+        e["score"] = e["dense_score"]
+        out.append(e)
+    return out
 
 
 def build_prompt(query: str,
@@ -482,6 +641,12 @@ def build_prompt(query: str,
         "excerpts": len(chunks),
         "excerpts_trimmed": 0,
         "chars_elided": 0,
+        # Conversation trimming is tracked SEPARATELY from evidence elision:
+        # the router turns `chars_elided` into a "the model did not see the
+        # evidence" caveat, and blaming the evidence for a trimmed transcript
+        # would be the same class of false statement this job is removing.
+        "conv_trimmed": False,
+        "conv_chars_elided": 0,
         "estimated_tokens": 0,
         "graph_trimmed": False,
     }
@@ -496,6 +661,18 @@ def build_prompt(query: str,
     instruction = (f"Current Question: {query}\n\n"
                    f"Provide your analysis based solely "
                    f"on the evidence above:")
+
+    # ---- conversation memory is bounded before it is protected (C6) ----
+    # It is reserved ahead of the evidence, so a block larger than a fraction
+    # of the window would leave the excerpts nothing and answer the question
+    # from the transcript. The producer bounds it too; this is the public-seam
+    # guard for a caller that hands `build_prompt` a huge string directly.
+    if conv_context:
+        conv_cap = to_chars(max(0, budget_tokens) // 4)
+        conv_context, conv_dropped = _elide(conv_context, conv_cap)
+        if conv_dropped:
+            stats["conv_trimmed"] = True
+            stats["conv_chars_elided"] = conv_dropped
 
     # ---- protected: reserved before anything else is allowed to spend ----
     protected = [p for p in (conv_context, instruction) if p]
@@ -530,7 +707,13 @@ def build_prompt(query: str,
          # it is not calibrated across embedding models, and 0.42 does not mean
          # "42% likely". Calling it confidence invited the model to reason
          # probabilistically about a number carrying no such meaning.
-         f"Relevance: {chunk.get('score', '')}\n"
+         # A None score is not a zero score. The hybrid retriever leaves `score`
+         # as None when a passage was found by exact-term matching alone (there
+         # is no cosine to report), and printing "None" would read as a failed
+         # measurement rather than a different one. Missing key still renders
+         # empty, as before.
+         f"Relevance: "
+         f"{'exact-term match' if 'score' in chunk and chunk['score'] is None else chunk.get('score', '')}\n"
          f"Content: ")
         for i, chunk in enumerate(chunks)
     ]
@@ -607,6 +790,120 @@ def is_refusal(text: str) -> bool:
         return False
     head = text.strip().lower()[:220]
     return any(p in head for p in REFUSAL_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Grounding: do the identifiers in the answer occur in the excerpts? (C2)
+# ---------------------------------------------------------------------------
+# `extract_entities` (imported above and, before this, never used) is the
+# concrete-identifier extractor this pipeline already had. It is joined by two
+# patterns for identifiers spaCy's small model does not label: email addresses
+# and hex digests (hashes). Every one of these is a HARD identifier -- a string
+# an investigator can search for and a fabricated one can be spotted in -- as
+# opposed to a judgement about meaning.
+#
+# The check is reported, never enforced: a refused or ungrounded answer is not
+# rewritten here. The defect C2 names is not that the model may hallucinate, it
+# is that nothing checked and the result was indistinguishable from a grounded
+# one. So the verdict travels with the answer, and an unmeasured verdict is
+# None, not a pass.
+_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
+_HEX_RUN_RE = re.compile(r"\b[0-9a-fA-F]{16,}\b")
+
+
+def _hard_identifiers(text: str) -> list:
+    found = [("email", m) for m in _EMAIL_RE.findall(text or "")]
+    for run in _HEX_RUN_RE.findall(text or ""):
+        low = run.lower()
+        # A digest has both digits and a-f letters; a long pure digit run is a
+        # number, not a hash, and flagging it would be a false positive.
+        if any(c.isdigit() for c in run) and any(c in "abcdef" for c in run):
+            found.append(("hash", run))
+    return found
+
+
+def answer_identifiers(text: str) -> list:
+    """Every concrete identifier in `text`, de-duplicated, in a stable shape.
+
+    Returns a list of {"kind", "value"} so a caller can report which kinds were
+    checked and which failed, rather than a bare count.
+    """
+    text = text or ""
+    out, seen = [], set()
+
+    def add(kind, value):
+        value = (value or "").strip()
+        if not value:
+            return
+        key = (kind, value.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"kind": kind, "value": value})
+
+    try:
+        ents = extract_entities(text) or {}
+    except Exception:
+        # A NER fault must not turn an answer into a crash. The hard
+        # identifiers below are still checkable without it.
+        ents = {}
+    for value in ents.get("ips") or []:
+        add("ip", value)
+    for value in ents.get("persons") or []:
+        add("person", value)
+    for value in ents.get("organizations") or []:
+        add("organization", value)
+    for value in ents.get("locations") or []:
+        add("location", value)
+    for kind, value in _hard_identifiers(text):
+        add(kind, value)
+    return out
+
+
+def _unmeasured_grounding(reason: str) -> dict:
+    """A grounding verdict for a question the model was never asked."""
+    return {
+        "checked": 0,
+        "grounded": 0,
+        "ungrounded": 0,
+        "grounded_ratio": None,
+        "identifiers": [],
+        "ungrounded_identifiers": [],
+        "reason": reason,
+        "scope": "retrieved_excerpts",
+    }
+
+
+def grounding_check(answer: str, chunks: list) -> dict:
+    """Report which identifiers in `answer` occur in the retrieved excerpts.
+
+    Never fabricates a pass: with no identifiers to check, `grounded_ratio` is
+    None ("unmeasured"), which is deliberately different from 1.0 ("all
+    grounded") and from 0.0 ("none grounded", which is a real measurement).
+    """
+    identifiers = answer_identifiers(answer) if answer else []
+    haystack = "\n".join(
+        str((c or {}).get("text") or "") for c in (chunks or [])).lower()
+
+    grounded, ungrounded = [], []
+    for ident in identifiers:
+        if ident["value"].lower() in haystack:
+            grounded.append(ident)
+        else:
+            ungrounded.append(ident)
+
+    checked = len(identifiers)
+    return {
+        "checked": checked,
+        "grounded": len(grounded),
+        "ungrounded": len(ungrounded),
+        "grounded_ratio": (len(grounded) / checked) if checked else None,
+        "identifiers": identifiers,
+        "ungrounded_identifiers": ungrounded,
+        "reason": None if checked else "no_identifiers_in_answer",
+        "scope": "retrieved_excerpts",
+    }
 
 
 def process_response(
@@ -746,7 +1043,11 @@ def run_rag_query(
     # reported alongside `chunks_retrieved`.
     retrieval_error = None
     try:
-        chunks = search_chunks(
+        # Hybrid: dense plus exact-term matching (Stage 4.1, finding C1). The
+        # exact-term half is what lets a question about an IP, hash or filename
+        # rank the passage that literally contains it above a semantically
+        # nearer stranger -- the failure measured on the baseline corpus.
+        chunks = retrieve(
             query=query,
             case_id=case_id,
             qdrant_path=qdrant_path,
@@ -815,19 +1116,23 @@ def run_rag_query(
         # wording is not the evidence's vocabulary.
         shown = ", ".join(sorted(content_terms(query))[:8])
         return _unanswered(
-            "Your question shares no wording with anything indexed in this "
-            f"case, so retrieval had nothing to match on. It was compared "
-            f"against {chunks_retrieved} passages and not one contained a "
-            f"single one of the {lex_terms} searchable terms in your "
-            f"question ({shown}).\n\n"
+            "Your question shares no wording with the "
+            f"{chunks_retrieved} passage"
+            f"{'s' if chunks_retrieved != 1 else ''} retrieval returned for "
+            "it in this case, so there was nothing in them to match on. Those "
+            f"passages were compared against the {lex_terms} searchable terms "
+            f"in your question ({shown}), and not one of them contained a "
+            "single one of those terms.\n\n"
             "This is not a finding that the case is clean — it is a finding "
             "about the wording. Evidence usually holds the specific strings "
             "worth asking about: a name, an email address, an IP, a domain, a "
             "handle, a case number or a filename. Ask using those and the same "
             "passages become searchable. The model was not asked, because "
             "there was nothing grounded for it to read.\n\n"
-            "Nothing in this case has been examined against this question, and "
-            "nothing in it has been ruled out.",
+            "This is a statement about the passages retrieval returned, not "
+            "about every passage the case holds. Nothing in this case has been "
+            "examined against this question, and nothing in it has been ruled "
+            "out.",
             retrieval_failed=False,
             retrieval_error=None,
             chunks_retrieved=chunks_retrieved,
@@ -899,29 +1204,13 @@ def run_rag_query(
     # the last 4,091 -- which is the question without any of the evidence.)
     evidence_context = ""
 
-    # Step 4: Build conversation context from history
-    conv_context = ""
-    if conversation_history:
-        # Cap at last 5 exchanges
-        recent = conversation_history[-5:]
-        conv_lines = [
-            "\nPrevious exchanges in this investigation session:"
-        ]
-        for i, exchange in enumerate(recent, 1):
-            conv_lines.append(f"\n[Exchange {i}]")
-            conv_lines.append(
-                f"Investigator: {exchange.get('question', '')}"
-            )
-            raw_answer = exchange.get('answer', '')
-            if len(raw_answer) > 500:
-                conv_lines.append(
-                    f"Assistant: {raw_answer[:500]}..."
-                )
-            else:
-                conv_lines.append(
-                    f"Assistant: {raw_answer}"
-                )
-        conv_context = '\n'.join(conv_lines)
+    # Step 4: Build conversation context from history.
+    #
+    # Bounded at the producer as well as in `build_prompt` (finding C6):
+    # questions are capped like answers, non-dict entries are skipped, and at
+    # most CONV_MAX_EXCHANGES are carried. History is PROTECTED text in the
+    # prompt, so "more history" must never mean "less evidence".
+    conv_context = build_conversation_context(conversation_history)
 
     # Step 5: Assemble a prompt that fits the context window.
     budget = prompt_budget_tokens()
@@ -1020,6 +1309,15 @@ def run_rag_query(
     elapsed_ms = int(
         (time.time() - start_time) * 1000)
 
+    # Step 8: Grounding (finding C2). Run on the model's OWN answer text, not
+    # the processed copy, so the sources footer appended above contributes no
+    # identifiers of its own. A model that was never consulted has nothing to
+    # check: unmeasured, not a pass.
+    if not diag["running"] or not diag["model_ready"]:
+        grounding = _unmeasured_grounding("model_not_consulted")
+    else:
+        grounding = grounding_check(raw_answer, chunks)
+
     return {
         "answer": processed,
         "raw_llm_response": raw_answer,
@@ -1027,6 +1325,9 @@ def run_rag_query(
         "graph_context": graph_ctx,
         "prompt_stats": prompt_stats,
         "refused": is_refusal(raw_answer),
+        # Which identifiers in the answer actually occur in the excerpts it
+        # was built from (C2). Reported, never enforced.
+        "grounding": grounding,
         "ollama_available": diag["running"],
         "model_ready": diag["model_ready"],
         "model_diagnostic": diag,

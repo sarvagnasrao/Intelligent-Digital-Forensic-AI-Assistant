@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, ConfigDict
+import json
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +72,12 @@ class EvidenceResponse(BaseModel):
 # QueryLog Schemas
 # ---------------------------------------------------------------------------
 
+# How many conversation exchanges a client may submit. The RAG engine only
+# renders the last few and caps each field, so this is a denial-of-service
+# guard on the request body, not a behaviour change (finding C6).
+MAX_CONVERSATION_HISTORY = 50
+
+
 class QueryCreate(BaseModel):
     question_text: str
     # Accepted for backward compatibility and IGNORED. The server records
@@ -80,7 +88,21 @@ class QueryCreate(BaseModel):
     # a forensic record. A field that is ignored should not be mandatory.
     asked_by: Optional[str] = None
     evidence_id: Optional[str] = None
-    conversation_history: list = []
+    # Bounded on purpose (finding C6). This list is client-supplied, is
+    # rendered into the model's prompt as PROTECTED text ahead of the
+    # evidence, and was previously unbounded -- so a caller could crowd the
+    # evidence out of the context window with history alone. Non-dict entries
+    # are dropped rather than crashing the prompt builder, and the list is
+    # truncated to the most recent MAX_CONVERSATION_HISTORY exchanges.
+    conversation_history: list = Field(default_factory=list)
+
+    @field_validator("conversation_history", mode="before")
+    @classmethod
+    def _bounded_history(cls, value):
+        if not isinstance(value, list):
+            return []
+        entries = [e for e in value if isinstance(e, dict)]
+        return entries[-MAX_CONVERSATION_HISTORY:]
 
 
 class QueryResponse(BaseModel):
@@ -106,6 +128,25 @@ class QueryResponse(BaseModel):
     uncited_sentence_count: int
     response_time_ms: int
     is_flagged: bool
+    # The stored JSON array of excerpt references the answer was built from,
+    # returned so a claim can be traced to the passages behind it (finding C3).
+    # The column is a JSON TEXT field; it is parsed here. A missing, null,
+    # empty or malformed value is None -- "not returnable" -- NEVER [], which
+    # would assert the answer was built from no excerpts at all.
+    chunks_used: Optional[list] = None
+
+    @field_validator("chunks_used", mode="before")
+    @classmethod
+    def _parse_chunks_used(cls, value):
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError):
+                return None
+            return parsed if isinstance(parsed, list) else None
+        return None
 
     model_config = ConfigDict(
         from_attributes=True,

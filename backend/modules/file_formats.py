@@ -229,9 +229,12 @@ _EXTENSION_TO_CATEGORY = {
 # The set the upload gate checks. Lowercase, always dot-prefixed.
 UPLOAD_EXTENSIONS = frozenset(_EXTENSION_TO_CATEGORY)
 
-# Kept for callers that only care about the images; ingestion.py has its own
-# copy of this set for the pipeline-dispatch check, and the two are asserted
-# equal in tests/verify_file_formats.py.
+# The bare disk-image extension set: `.e01 .001 .dd .raw .img`, one per
+# container, meaning the *first* segment of a raw or EWF acquisition.
+# Continuation segments (`.002`, `.E02`) are not in this set by design; they are
+# recognised by is_image_segment_extension / is_forensic_image, and dispatch
+# asks is_forensic_image (backend.ingestion.route_for_filename) so the upload
+# gate and the pipeline cannot disagree about what a disk image is.
 FORENSIC_IMAGE_EXTENSIONS = frozenset(
     next(g["extensions"] for g in FORMAT_GROUPS
          if g["key"] == "disk_image")

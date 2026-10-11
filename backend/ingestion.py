@@ -1,13 +1,14 @@
 from backend.modules.text_parser import (
     extract_text, chunk_text)
-from backend.modules.vector_store import store_chunks, case_qdrant_path
+from backend.modules.vector_store import (
+    store_chunks, case_qdrant_path, delete_evidence_points)
 from backend.modules.graph_builder import build_graph
 from backend.modules.forensic_ingestion import (
     ingest_e01, ingest_raw,
     extract_file_content, compute_sha256,
-    detect_image_format, inspect_raw_image)
+    detect_image_format, inspect_raw_image,
+    image_segment_paths)
 from backend.modules.file_formats import (
-    FORENSIC_IMAGE_EXTENSIONS as FORENSIC_EXTENSIONS,
     is_forensic_image as _is_forensic_image,
     normalize_extension,
 )
@@ -37,6 +38,29 @@ settings = get_settings()
 # ---------------------------------------------------------------------------
 # Router entry point — dispatches to document or forensic pipeline
 # ---------------------------------------------------------------------------
+
+
+def route_for_filename(filename: str) -> str:
+    """
+    Which pipeline a submitted file takes: ``"forensic"`` or ``"document"``.
+
+    This is the single decision point for dispatch, and it is deliberately the
+    *shared* format policy rather than a local copy of the bare disk-image
+    extension set. The two disagreed once, and it cost a real result: the upload
+    gate accepted continuation segments (``SCHARDT.002``, ``case.E02``) so a
+    whole acquisition could be submitted, but dispatch tested
+    ``ext in FORENSIC_IMAGE_EXTENSIONS``, which holds only
+    ``{.e01, .001, .dd, .raw, .img}``. A ``.002`` therefore arrived at the
+    **document** pipeline, was sniffed as binary, yielded no text, and the
+    evidence was recorded as ``Indexed`` with ``chunk_count=0`` -- a segment of
+    a disk image quietly accepted as an empty document, which is the exact
+    silent-success shape this codebase keeps removing.
+
+    ``is_forensic_image`` returns True for those continuation segments; asking
+    it is what makes the gate and the pipeline agree by construction instead of
+    by two lists being kept in step.
+    """
+    return "forensic" if _is_forensic_image(filename) else "document"
 
 
 def _update_job_progress(job_id: str, percent: int, step: str):
@@ -134,8 +158,19 @@ def run_ingestion_with_progress(
         if not evidence:
             return
 
-        ext = normalize_extension(filename)
-        is_disk_image = ext in FORENSIC_EXTENSIONS
+        is_disk_image = route_for_filename(filename) == "forensic"
+
+        # Replace, don't append (Stage 3, A5/B1). Re-indexing this evidence must
+        # leave exactly one copy of each chunk. Both pipelines below call
+        # store_chunks repeatedly under this same evidence id -- once per embed
+        # batch (document) or once per artifact (forensic) -- so the previous
+        # copy has to be cleared here, before either pipeline starts, and cannot
+        # be cleared inside store_chunks without erasing the batches written
+        # earlier in the same run.
+        removed = delete_evidence_points(evidence_id, case_id, qdrant_path)
+        if removed:
+            print(f"[INGESTION] Re-index: removed {removed} previous point(s) "
+                  f"for evidence {evidence_id}")
 
         if is_disk_image:
             _run_forensic_with_progress(
@@ -220,6 +255,76 @@ def run_ingestion_with_progress(
 
 # Fast path for types handled by text_parser.extract_text()
 _FAST_TEXT_EXTENSIONS = {'.pdf', '.txt'}
+
+
+# Read size for the document/media path. Same reasoning as
+# `forensic_ingestion._HASH_CHUNK`: one syscall per 8 KB is wasteful, and a
+# bounded read gives the stop check a fine place to fire without allocating the
+# whole file in a single request.
+_MEDIA_READ_CHUNK = 1024 * 1024
+
+
+def _media_size_limit(filename: str) -> int:
+    """
+    The size ceiling for a document/media file, from the shared format policy.
+
+    A9. The document path had no ceiling at all: `data = f.read()` read any
+    file, of any size, straight into RAM, while the in-image walk has always
+    enforced `forensic_ingestion.MAX_FILE_SIZE` (50 MB) for text/office/email
+    and `VIDEO_MAX_FILE_SIZE` (2 GB) for video. Read from the module at call
+    time rather than copied so the two paths cannot drift apart.
+    """
+    from backend.modules import forensic_ingestion
+    ext = normalize_extension(filename)
+    if ext in forensic_ingestion.VIDEO_EXTENSIONS:
+        return forensic_ingestion.VIDEO_MAX_FILE_SIZE
+    return forensic_ingestion.MAX_FILE_SIZE
+
+
+def _read_media_bytes(file_path: str,
+                      filename: str,
+                      stop_check=None) -> bytes:
+    """
+    Read a document/media file into memory in bounded, interruptible chunks.
+
+    A9. The document path was a bare `data = f.read()`: the whole file in one
+    allocation, with **no stop check and no size policy**. A mislabeled or
+    genuinely large video (the media branch handles video/audio) was read into
+    RAM with no ceiling, and an operator's Stop could not fire until the read
+    returned -- the same "Stop looks broken" failure the forensic hash loop was
+    fixed for.
+
+    This reads `_MEDIA_READ_CHUNK` bytes at a time, checking `stop_check`
+    between reads, and refuses a file over `_media_size_limit(filename)` with a
+    message naming the file and the cap. The bytes are still accumulated into
+    one buffer because every caller below needs the whole file
+    (`extract_text_from_bytes` writes PDFs to a temp file and decodes text).
+    So this does NOT by itself cap peak RSS -- streaming the extractors is a
+    separate change in `forensic_ingestion`. What it adds is a bounded read
+    request, an enforced ceiling, and a stop that actually fires.
+    """
+    limit = _media_size_limit(filename)
+    try:
+        size = os.path.getsize(file_path)
+    except OSError as e:
+        raise RuntimeError(f"Could not stat {filename}: {e}") from e
+    if size > limit:
+        raise RuntimeError(
+            f"{filename} is {size / (1024 * 1024):.1f} MB, over the "
+            f"{limit // (1024 * 1024)} MB limit for this file type. It was "
+            f"not read into memory or indexed.")
+
+    buf = bytearray()
+    with open(file_path, "rb") as f:
+        while True:
+            if stop_check is not None and stop_check():
+                raise StopIteration("Ingestion stopped by user")
+            chunk = f.read(_MEDIA_READ_CHUNK)
+            if not chunk:
+                break
+            buf.extend(chunk)
+    return bytes(buf)
+
 
 
 def _finish_job_no_text(job_id: str, filename: str, extraction_type: str):
@@ -316,8 +421,9 @@ def _run_document_with_progress(
             governor.check_and_throttle()
             from backend.modules.forensic_ingestion \
                 import extract_text_from_bytes
-            with open(file_path, 'rb') as f:
-                data = f.read()
+            data = _read_media_bytes(
+                file_path, filename,
+                stop_check=governor._stop_check)
             temp_dir = tempfile.mkdtemp(
                 prefix="cfi_media_")
             try:
@@ -563,6 +669,46 @@ def _run_document_with_progress(
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on how many extracted artifacts are embedded and upserted in one
+# disk-image ingest (A10). It limits INDEXING only: every recoverable artifact
+# is still written to `ForensicArtifact`, so nothing is lost from the case, only
+# from its semantic search. The bound exists because the per-artifact embed +
+# upsert dominates a walk and a volume of tens of thousands of tiny text files
+# can otherwise run for hours.
+FORENSIC_ARTIFACT_INDEX_CAP = 500
+
+
+def _artifact_cap_report(indexed: int, total: int):
+    """
+    Describe a truncated forensic index, or return None when nothing was cut.
+
+    A10. The store loop used to `break` at 500 artifacts and print one line to
+    stdout. Nothing in the database recorded it: the queue row said
+    "Complete - N artifacts", the evidence row said Indexed, and a later search
+    that found nothing read as "not on the disk" rather than "not in the
+    index". This returns a JSON-serialisable record so the caller can persist
+    the reason on the evidence, the audit log and the job row.
+
+    `total` is the number of artifacts with text that the walk produced;
+    `indexed` is how many were actually embedded. `None` means the whole corpus
+    was indexed.
+    """
+    if total <= indexed:
+        return None
+    return {
+        "cap": FORENSIC_ARTIFACT_INDEX_CAP,
+        "artifacts_extracted": total,
+        "artifacts_indexed": indexed,
+        "artifacts_not_indexed": total - indexed,
+        "reason": (
+            f"Vector indexing capped at {FORENSIC_ARTIFACT_INDEX_CAP} "
+            f"artifacts; {total - indexed} of {total} extracted files were "
+            f"saved to the artifact store but not embedded, so they are absent "
+            f"from semantic search. The artifact inventory still lists them."
+        ),
+    }
+
+
 def _run_forensic_with_progress(evidence, case_id, file_path,
                            filename, job_id, governor,
                            include_deleted, qdrant_path, db, progress_callback=None,
@@ -633,9 +779,29 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
         image_hash = compute_sha256(
             file_path,
             stop_check=getattr(governor, "_stop_check", None))
-        evidence.sha256_hash = image_hash
-        db.commit()
-        print(f"[FORENSIC] SHA-256: {image_hash[:16]}...")
+        # Report the walk-time hash; do NOT write it over evidence.sha256_hash.
+        #
+        # That column is the chain-of-custody digest recorded at upload, and for
+        # a split acquisition it is the digest of every segment concatenated in
+        # order -- while `file_path` here is only the *first* segment. Writing
+        # the first-segment hash over it silently changed what the column meant,
+        # and it made /evidence/{id}/verify report "file has been modified since
+        # ingestion" on a split set nobody had touched, because verification
+        # compared the whole-set digest against a first-segment hash. A false
+        # tampering accusation is the worst thing a custody control can say, so
+        # the recorded digest stays authoritative and verification re-hashes the
+        # whole set (see routers.evidence.hash_evidence_set).
+        #
+        # The walk-time hash is still worth checking where it is comparable: on
+        # a file that is not a split set it must equal the recorded digest, and
+        # a disagreement there is a finding worth printing.
+        split_set = len(image_segment_paths(file_path)) > 1
+        recorded = evidence.sha256_hash
+        if recorded and not split_set and recorded != image_hash:
+            print(f"[FORENSIC] WARNING: walk-time SHA-256 {image_hash[:16]}... "
+                  f"does not match the hash recorded at upload "
+                  f"{recorded[:16]}... for {filename}")
+        print(f"[FORENSIC] SHA-256 (walk): {image_hash[:16]}...")
 
         # Determine image type.
         # Extension is NOT trusted - '.001' is the split-EWF
@@ -904,9 +1070,10 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             indexed_chunks = []
             for art_text, art_name in zip(
                     all_chunk_texts, all_chunk_names):
-                if stored_files >= 500:
-                    print(f"[FORENSIC] Artifact cap reached at 500 files; "
-                          f"{len(all_chunk_texts) - 500} not indexed")
+                if stored_files >= FORENSIC_ARTIFACT_INDEX_CAP:
+                    print(f"[FORENSIC] Artifact cap reached at "
+                          f"{FORENSIC_ARTIFACT_INDEX_CAP} files; "
+                          f"{len(all_chunk_texts) - stored_files} not indexed")
                     break
                 # Now actually reads the profile, rather than defaulting to
                 # text_parser's 20000/0 behind every profile selector.
@@ -932,6 +1099,12 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
                 )
                 stored_files += 1
                 governor.check_and_throttle()
+
+            # A10: did the cap actually cut anything? Recorded, not just printed.
+            cap_report = _artifact_cap_report(
+                stored_files, len(all_chunk_texts))
+            if cap_report:
+                print(f"[FORENSIC] {cap_report['reason']}")
 
             # Build entity graph
             # Was: 85, then immediately 75, then 90. The bar went backwards
@@ -1068,6 +1241,16 @@ def _run_forensic_with_progress(evidence, case_id, file_path,
             evidence.chunk_count = total_chunks
             evidence.entity_count = total_entities
             evidence.error_message = None
+            # A10: the truncated index is a fact about this evidence, so it is
+            # written on the evidence row itself and in the audit log -- not
+            # only to stdout, which scrolls away and is not what an
+            # investigator reads.
+            if cap_report:
+                prior = (evidence.notes or "").strip()
+                evidence.notes = (
+                    (prior + "\n" if prior else "") + cap_report["reason"])
+                _create_audit_log(
+                    db, case_id, "FILE_INGEST_ARTIFACT_CAP", cap_report)
             db.commit()
 
             # Audit log

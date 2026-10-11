@@ -1,4 +1,6 @@
-"""End-to-end verification of the three ingestion profiles.
+#!/usr/bin/env python3
+"""
+End-to-end verification of the three ingestion profiles.
 
 Runs the real pipeline (no mocks) against a generated text document, once per
 profile, and asserts:
@@ -9,59 +11,92 @@ profile, and asserts:
   * the same file ingested under 'accurate' produces at least as many, and
     normally more, chunks than 'fastest' - which is the whole point of
     offering the choice
+
+Isolation follows `verify_reindex_idempotency.py` and `verify_perf_batching.py`:
+temp DB / cases / Qdrant dirs chosen BEFORE any backend import, an `atexit`
+cleanup, and a deterministic embedder stub so the suite is fast and offline.
 """
+
+import atexit
+import hashlib
 import os
+import shutil
 import sys
 import tempfile
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
-from backend.database import SessionLocal, engine
-from backend import models
-from backend.modules.ingestion_modes import resolve_mode_for_device, MODES
-from backend.modules.text_parser import chunk_text
-from backend.modules.resource_governor import ResourceGovernor
-from backend.ingestion import run_ingestion_with_progress
+TMP = tempfile.mkdtemp(prefix="cfi_ing_modes_")
+atexit.register(lambda: shutil.rmtree(TMP, ignore_errors=True))
 
-PASS, FAIL = [], []
+PASS = 0
+FAIL = 0
+FAILED = []
 
 
 def check(label, cond, detail=""):
-    (PASS if cond else FAIL).append(label)
-    print(f"  {'PASS' if cond else 'FAIL'}  {label}{(' — ' + str(detail)) if detail else ''}")
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ok   {label}")
+    else:
+        FAIL += 1
+        FAILED.append(label)
+        print(f"  FAIL {label}" + (f"  -- {detail}" if detail else ""))
 
 
-def _cleanup(case_id, settings):
-    """Removes every row and directory this script created.
+def _make_env(root):
+    """Point the backend at an isolated temp environment. MUST run before any
+    backend import (get_settings is lru_cached; backend.database builds its
+    engine at import time)."""
+    db_path = os.path.join(root, "ing_modes.db").replace("\\", "/")
+    os.environ["DATABASE_URL"] = "sqlite:///" + db_path
+    os.environ["CASES_DIR"] = os.path.join(root, "cases")
+    os.environ["QDRANT_DIR"] = os.path.join(root, "qdrant")
+    os.environ["DEBUG"] = "False"
 
-    Without this the checks would leave cases, evidence, entities and a
-    per-case Qdrant store behind on each run, and a re-run would be testing
-    against an ever-growing pile of the previous run's data.
-    """
-    import shutil
 
-    db = SessionLocal()
-    try:
-        for model in (models.ForensicArtifact, models.Entity,
-                      models.IngestionJob, models.Evidence):
-            try:
-                db.query(model).filter(
-                    model.case_id == case_id).delete(
-                    synchronize_session=False)
-            except Exception:
-                pass
-        db.query(models.Case).filter(
-            models.Case.id == case_id).delete(synchronize_session=False)
-        db.commit()
-    finally:
-        db.close()
+def _fake_embed(texts):
+    """Deterministic 384-dim vectors without torch / sentence-transformers."""
+    out = []
+    for t in texts:
+        h = hashlib.sha256(t.encode("utf-8")).digest()
+        vec = [((h[i % len(h)] / 255.0) - 0.5) for i in range(384)]
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        out.append([x / norm for x in vec])
+    return out
 
-    case_dir = os.path.join(settings.cases_dir, case_id)
-    if os.path.isdir(case_dir):
-        shutil.rmtree(case_dir, ignore_errors=True)
 
+class _Array:
+    def __init__(self, data):
+        self._data = data
+
+    def tolist(self):
+        return self._data
+
+
+def _stub_embedder(vs):
+    """No torch / model load; keep provenance comparing like-for-like."""
+    vs._embed_model = type("_FakeModel", (), {
+        "encode": lambda self, texts, **kw: _Array(_fake_embed(texts)),
+        "get_sentence_embedding_dimension": lambda self: 384,
+        "max_seq_length": 256,
+    })()
+    vs._embed_tried = True
+    vs.describe_embedder = lambda: {
+        "embedder_id": vs.EMBEDDER_ID,
+        "vector_size": vs.VECTOR_SIZE,
+        "max_seq_length": 256,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Corpus and mode constants (copied to avoid importing before env is set)
+# ---------------------------------------------------------------------------
 
 BODY = (
     "Digital forensic examination report. " * 900 +
@@ -69,26 +104,91 @@ BODY = (
     "Contact sarvagnasrao@example.com and 192.168.1.44. " * 200
 )
 
+MODES = {
+    "fastest": {
+        "chunk_size": 700, "chunk_overlap": 120, "embed_batch": 256,
+        "ocr": False, "whisper_model": "tiny", "whisper_gpu": False,
+        "include_deleted": False,
+    },
+    "normal": {
+        "chunk_size": 700, "chunk_overlap": 120, "embed_batch": 128,
+        "ocr": True, "whisper_model": "base", "whisper_gpu": False,
+        "include_deleted": False,
+    },
+    "accurate": {
+        "chunk_size": 700, "chunk_overlap": 120, "embed_batch": 64,
+        "ocr": True, "whisper_model": "small", "whisper_gpu": False,
+        "include_deleted": True,
+    },
+}
 
-def main():
-    from backend.dependencies import get_settings
-    settings = get_settings()
-    os.makedirs(settings.cases_dir, exist_ok=True)
+
+def _seed_case(case_id, ev_id, filename, data):
+    """Write a file and its case/evidence rows into the isolated DB."""
+    from backend.database import SessionLocal
+    from backend import models
+
+    ev_dir = os.path.join(TMP, "cases", case_id, "evidence")
+    os.makedirs(ev_dir, exist_ok=True)
+    stored = os.path.join(ev_dir, f"{ev_id}_{filename}")
+    with open(stored, "wb") as f:
+        f.write(data)
 
     db = SessionLocal()
-
-    # ── A throwaway case to hang the test evidence off ─────────────────────
-    case_id = str(uuid.uuid4())
-    case = models.Case(
-        id=case_id,
-        case_number=f"TEST-{uuid.uuid4().hex[:6].upper()}",
-        case_name="Ingestion profile verification",
-        description="Automated end-to-end check of fastest/normal/accurate",
-        status="Active",
-        created_by="verify",
-    )
-    db.add(case)
+    if not db.query(models.Case).filter(models.Case.id == case_id).first():
+        db.add(models.Case(
+            id=case_id, case_name="Ingestion profile verification",
+            case_number=None, status="Active", created_by="verify"))
+        db.commit()
+    db.add(models.Evidence(
+        id=ev_id, case_id=case_id, filename=filename,
+        original_filename=filename,
+        file_path=stored, file_size_bytes=len(data),
+        file_type=os.path.splitext(filename)[1].lstrip(".") or "txt",
+        sha256_hash=hashlib.sha256(data).hexdigest(),
+        ingested_by="verify", status="Queued"))
     db.commit()
+    db.close()
+    return stored
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    _make_env(TMP)
+
+    # Import AFTER env is set
+    from backend.database import init_db, SessionLocal
+    from backend import models
+    from backend.modules import job_worker as jw
+    from backend.modules.ingestion_modes import resolve_mode_for_device
+    from backend.ingestion import run_ingestion_with_progress
+    from backend.modules.resource_governor import ResourceGovernor
+    from backend.modules import vector_store as vs
+
+    _stub_embedder(vs)
+    init_db()
+
+    # Stop the worker so jobs run deterministically (see verify_queue_api.py)
+    jw.stop_worker()
+    t = jw._worker_thread
+    if t is not None and t.is_alive():
+        t.join(timeout=30)
+
+    db = SessionLocal()
+    try:
+        case_id = str(uuid.uuid4())
+        db.add(models.Case(
+            id=case_id,
+            case_number=f"TEST-{uuid.uuid4().hex[:6].upper()}",
+            case_name="Ingestion profile verification",
+            description="Automated end-to-end check of fastest/normal/accurate",
+            status="Active", created_by="verify"))
+        db.commit()
+    finally:
+        db.close()
 
     results = {}
 
@@ -103,44 +203,24 @@ def main():
             for w in mode["warnings"]:
                 print(f"  warning: {w}")
 
-        # ── Evidence row ───────────────────────────────────────────────────
+        # Evidence row
         ev_id = str(uuid.uuid4())
-        tmp_dir = tempfile.mkdtemp(prefix="idfai_mode_test_")
-        src = os.path.join(tmp_dir, "report.txt")
-        with open(src, "w", encoding="utf-8") as f:
-            f.write(BODY)
-        size = os.path.getsize(src)
-
-        ev = models.Evidence(
-            id=ev_id,
-            case_id=case_id,
-            filename=os.path.basename(src),
-            original_filename=os.path.basename(src),
-            file_path=src,
-            file_size_bytes=size,
-            file_type="text",
-            sha256_hash="0" * 64,
-            ingested_by="verify",
-            status="Queued",
-        )
-        db.add(ev)
+        stored = _seed_case(case_id, ev_id, "report.txt", BODY.encode("utf-8"))
 
         job_id = str(uuid.uuid4())
-        job = models.IngestionJob(
-            id=job_id,
-            evidence_id=ev_id,
-            case_id=case_id,
-            status="Running",
-            progress_percent=0,
-            min_free_ram_mb=256,
-            cpu_throttle_percent=100,
-            ingestion_mode=mode_key,
-            created_by="verify",
-        )
-        db.add(job)
-        db.commit()
+        db = SessionLocal()
+        try:
+            job = models.IngestionJob(
+                id=job_id, evidence_id=ev_id, case_id=case_id,
+                status="Running", progress_percent=0,
+                min_free_ram_mb=256, cpu_throttle_percent=100,
+                ingestion_mode=mode_key, created_by="verify")
+            db.add(job)
+            db.commit()
+        finally:
+            db.close()
 
-        # ── Capture every progress tick ────────────────────────────────────
+        # Capture every progress tick
         ticks = []
 
         def on_progress(cid, jid, eid, percent, step):
@@ -148,51 +228,42 @@ def main():
 
         t0 = time.time()
         run_ingestion_with_progress(
-            evidence_id=ev_id,
-            case_id=case_id,
-            file_path=src,
-            filename=os.path.basename(src),
-            job_id=job_id,
-            governor=ResourceGovernor(
-                min_free_ram_mb=256, cpu_throttle_percent=100),
-            progress_callback=on_progress,
-            mode=mode,
-        )
+            evidence_id=ev_id, case_id=case_id, file_path=stored,
+            filename="report.txt", job_id=job_id,
+            governor=ResourceGovernor(min_free_ram_mb=256, cpu_throttle_percent=100),
+            progress_callback=on_progress, mode=mode)
         elapsed = time.time() - t0
 
-        db.expire_all()
-        job = db.query(models.IngestionJob).filter(
-            models.IngestionJob.id == job_id).first()
-        ev = db.query(models.Evidence).filter(
-            models.Evidence.id == ev_id).first()
+        db = SessionLocal()
+        try:
+            job = db.query(models.IngestionJob).filter(
+                models.IngestionJob.id == job_id).first()
+            ev = db.query(models.Evidence).filter(
+                models.Evidence.id == ev_id).first()
+            chunks = ev.chunk_count or 0
+            entities = ev.entity_count or 0
+        finally:
+            db.close()
 
-        chunks = ev.chunk_count or 0
         results[mode_key] = {
-            "chunks": chunks,
-            "entities": ev.entity_count or 0,
-            "status": ev.status,
-            "job_status": job.status,
-            "percent": job.progress_percent,
-            "step": job.current_step,
-            "elapsed": elapsed,
-            "ticks": len(ticks),
-            "text_len": len(BODY),
-            "mode": mode,          # the resolved mode dict with all knobs
+            "chunks": chunks, "entities": entities,
+            "status": ev.status, "job_status": job.status,
+            "percent": job.progress_percent, "step": job.current_step,
+            "elapsed": elapsed, "ticks": len(ticks),
+            "text_len": len(BODY), "mode": mode,
         }
 
         print(f"  result: status={ev.status} job={job.status} "
               f"percent={job.progress_percent} chunks={chunks} "
-              f"entities={ev.entity_count} in {elapsed:.1f}s")
+              f"entities={entities} in {elapsed:.1f}s")
         print(f"  final step: {job.current_step}")
         print(f"  progress ticks: {len(ticks)}")
 
         check(f"{mode_key}: evidence Indexed", ev.status == "Indexed", ev.status)
         check(f"{mode_key}: job Completed", job.status == "Completed", job.status)
-        check(f"{mode_key}: job at 100%", job.progress_percent == 100,
-              job.progress_percent)
+        check(f"{mode_key}: job at 100%", job.progress_percent == 100, job.progress_percent)
         check(f"{mode_key}: job step says Complete",
-              (job.current_step or "").startswith("Complete"),
-              job.current_step)
+              (job.current_step or "").startswith("Complete"), job.current_step)
         check(f"{mode_key}: chunks were stored", chunks > 0, chunks)
         check(f"{mode_key}: progress ticked", len(ticks) >= 5, len(ticks))
 
@@ -202,27 +273,18 @@ def main():
               percents)
         check(f"{mode_key}: progress ends at 100", percents[-1] == 100, percents[-1])
 
-        # The profile must be recorded on the row so a retry reproduces it.
         check(f"{mode_key}: mode persisted on job",
               job.ingestion_mode == mode_key, job.ingestion_mode)
 
-        # ── Cleanup so repeated runs do not pile up Qdrant dirs ────────────
-        try:
-            import shutil
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
-
-    # ── Cross-profile behaviour ────────────────────────────────────────────
+    # Cross-profile behaviour
     print("\n=== cross-profile ===")
     print(f"  body length      : {results['fastest']['text_len']} chars")
     print(f"  fastest  chunks  : {results['fastest']['chunks']}")
     print(f"  normal   chunks  : {results['normal']['chunks']}")
     print(f"  accurate chunks  : {results['accurate']['chunks']}")
 
-    # Chunking is now GLOBAL (700/120 for all profiles) — profiles no longer
-    # trade retrieval coverage for speed. They differ in OCR, Whisper size,
-    # deleted-file recovery and embed_batch. See §31.7 item 5.
+    from backend.modules.text_parser import chunk_text
+
     check("all profiles yield the same chunk count (global chunking)",
           results['fastest']['chunks'] == results['normal']['chunks']
           == results['accurate']['chunks'],
@@ -234,42 +296,16 @@ def main():
           and results['accurate']['mode']['ocr'] is True,
           "OCR differs across profiles")
 
-    # The chunk counts must be consistent with the configured chunk sizes,
-    # which is what proves the mode actually reached the pipeline rather than
-    # being stored on the row and then ignored.
-    #
-    # `chunk_text` advances by `chunk_size - overlap`, not by `chunk_size`,
-    # so the count is ceil(len / stride) and NOT ceil(len / chunk_size). This
-    # assertion used to be the latter, and it was wrong the moment two profiles
-    # gained an overlap: `normal` correctly produced 11 chunks where the old
-    # formula demanded 10. Overlap is not a rounding artefact, it is what stops
-    # a fact spanning a boundary from being lost, so the product was right and
-    # the test was the thing that had to move.
-    #
-    # Deriving it from the real stride also makes it stricter than before, not
-    # looser. The old formula could not tell "chunk_size arrived but overlap
-    # was dropped" from success, because it ignored overlap completely.
-    for key, mode_key in (("fastest", "fastest"), ("normal", "normal"),
-                          ("accurate", "accurate")):
+    for mode_key in ("fastest", "normal", "accurate"):
         cs = MODES[mode_key]["chunk_size"]
         ov = MODES[mode_key].get("chunk_overlap", 0) or 0
 
-        # overlap >= chunk_size would make the stride non-positive, and
-        # `chunk_text` would then never advance and loop for ever. Asserted
-        # rather than divided by, so the failure names the cause.
         check(f"{mode_key}: overlap is smaller than the chunk size",
               0 <= ov < cs, f"chunk_size={cs} overlap={ov}")
 
         stride = cs - ov
-        expect = -(-len(BODY) // stride)      # ceil
-        got = results[key]["chunks"]
+        expect = -(-len(BODY) // stride)
 
-        # chunk_text also drops any chunk whose stripped length is <= 20, which
-        # would make exact equality wrong for a reason that has nothing to do
-        # with the configured size. Measured rather than assumed: on this BODY
-        # the filter never fires, so the loop count really is the chunk count.
-        # If BODY is ever changed to end in whitespace this starts failing and
-        # says why, instead of the equality silently becoming a coincidence.
         raw_loop = chunk_text(BODY, chunk_size=cs, overlap=ov)
         check(f"{mode_key}: the >20-char trim is not what sets the count",
               len(raw_loop) == expect,
@@ -278,40 +314,30 @@ def main():
 
         check(f"{mode_key}: chunk count matches chunk_size {cs} "
               f"stride {stride}",
-              got == expect, f"expected {expect}, got {got}")
+              results[mode_key]["chunks"] == expect,
+              f"expected {expect}, got {results[mode_key]['chunks']}")
 
-    # ── A failed index must never read as a successful one ────────────────
-    # This is the same defect class as the truncated-image bug (B1), in the
-    # embedding path: store_chunks used to print and return 0, which the
-    # pipeline read as "this document had no text", so the job finished
-    # "Completed - 0 chunks" with the evidence marked Indexed. An investigator
-    # then searches a case that holds nothing and concludes the evidence was
-    # clean. Force the store to fail and assert the job says so.
+    # A failed index must never read as a successful one
     print("\n=== an indexing failure is not a success ===")
     import backend.ingestion as ingestion_mod
     from backend.modules.vector_store import VectorStoreError
 
+    fail_ev_id = str(uuid.uuid4())
+    fail_stored = _seed_case(case_id, fail_ev_id, "report.txt", BODY.encode("utf-8"))
+
+    fail_job_id = str(uuid.uuid4())
+    db = SessionLocal()
+    try:
+        db.add(models.IngestionJob(
+            id=fail_job_id, evidence_id=fail_ev_id, case_id=case_id,
+            status="Running", progress_percent=0,
+            min_free_ram_mb=256, cpu_throttle_percent=100,
+            ingestion_mode="normal", created_by="verify"))
+        db.commit()
+    finally:
+        db.close()
+
     real_store = ingestion_mod.store_chunks
-    ev_id = str(uuid.uuid4())
-    tmp_dir = tempfile.mkdtemp(prefix="idfai_fail_test_")
-    src = os.path.join(tmp_dir, "report.txt")
-    with open(src, "w", encoding="utf-8") as f:
-        f.write(BODY)
-    job_id = str(uuid.uuid4())
-    db.add(models.Evidence(
-        id=ev_id, case_id=case_id,
-        filename=os.path.basename(src),
-        original_filename=os.path.basename(src),
-        file_path=src, file_size_bytes=os.path.getsize(src),
-        file_type="text", sha256_hash="3" * 64,
-        ingested_by="verify", status="Queued"))
-    db.add(models.IngestionJob(
-        id=job_id, evidence_id=ev_id, case_id=case_id,
-        status="Running", progress_percent=0,
-        min_free_ram_mb=256, cpu_throttle_percent=100,
-        ingestion_mode="normal", created_by="verify"))
-    db.commit()
-    db.close()
 
     def exploding_store(**kwargs):
         raise VectorStoreError("simulated Qdrant/Ollama outage")
@@ -320,10 +346,9 @@ def main():
     raised = None
     try:
         run_ingestion_with_progress(
-            evidence_id=ev_id, case_id=case_id, file_path=src,
-            filename=os.path.basename(src), job_id=job_id,
-            governor=ResourceGovernor(min_free_ram_mb=256,
-                                      cpu_throttle_percent=100),
+            evidence_id=fail_ev_id, case_id=case_id, file_path=fail_stored,
+            filename="report.txt", job_id=fail_job_id,
+            governor=ResourceGovernor(min_free_ram_mb=256, cpu_throttle_percent=100),
             mode=resolve_mode_for_device("normal"))
     except VectorStoreError as e:
         raised = e
@@ -334,41 +359,35 @@ def main():
           isinstance(raised, VectorStoreError), raised)
 
     db = SessionLocal()
-    job = db.query(models.IngestionJob).filter(
-        models.IngestionJob.id == job_id).first()
-    ev = db.query(models.Evidence).filter(
-        models.Evidence.id == ev_id).first()
-    check("job is Failed, not Completed", job.status == "Failed", job.status)
-    check("job did not stay stuck on Running",
-          job.status != "Running", job.status)
-    check("job records the reason",
-          bool(job.error_message) and "simulated" in (job.error_message or ""),
-          (job.error_message or "")[:90])
-    check("job has a terminal timestamp", job.completed_at is not None,
-          job.completed_at)
-    check("evidence is Failed, not Indexed", ev.status == "Failed", ev.status)
-    check("evidence is not reported as having 0 chunks as a success",
-          (ev.chunk_count or 0) == 0, ev.chunk_count)
-    db.close()
     try:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        job = db.query(models.IngestionJob).filter(
+            models.IngestionJob.id == fail_job_id).first()
+        ev = db.query(models.Evidence).filter(
+            models.Evidence.id == fail_ev_id).first()
+        check("job is Failed, not Completed", job.status == "Failed", job.status)
+        check("job did not stay stuck on Running", job.status != "Running", job.status)
+        check("job records the reason",
+              bool(job.error_message) and "simulated" in (job.error_message or ""),
+              (job.error_message or "")[:90])
+        check("job has a terminal timestamp", job.completed_at is not None, job.completed_at)
+        check("evidence is Failed, not Indexed", ev.status == "Failed", ev.status)
+        check("evidence is not reported as having 0 chunks as a success",
+              (ev.chunk_count or 0) == 0, ev.chunk_count)
+    finally:
+        db.close()
+
+    try:
+        vs.close_all_clients()
     except Exception:
         pass
 
-    # ── Report ─────────────────────────────────────────────────────────────
-    _cleanup(case_id, settings)
-    print(f"\n{'=' * 62}")
-    print(f"PASSED: {len(PASS)}    FAILED: {len(FAIL)}")
-    if FAIL:
-        for f in FAIL:
-            print(f"  FAILED: {f}")
-    print("=" * 62)
+    print("\n" + "=" * 66)
+    for label in FAILED:
+        print(f"  FAILED: {label}")
+    print(f"PASSED: {PASS}    FAILED: {FAIL}")
+    print("=" * 66)
     return 1 if FAIL else 0
 
 
 if __name__ == "__main__":
-    code = main()
-    db = SessionLocal()
-    db.close()
-    sys.exit(code)
+    raise SystemExit(main())

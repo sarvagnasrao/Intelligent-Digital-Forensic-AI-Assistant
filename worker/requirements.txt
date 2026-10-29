@@ -1,0 +1,16 @@
+# Forensic worker dependencies.
+#
+# The worker is a separate process on the same Windows machine. In the standard
+# portable install it runs from the application's .venv, so these versions are
+# already satisfied; this file exists so the worker can also be installed on its
+# own (for debugging, or to run it under a different interpreter).
+#
+# E01/EWF support comes from `libewf-python`, which provides the `pyewf` module.
+# Without it the worker still handles raw images (.001-.008, .dd, .img, .raw).
+
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic>=2.7.0
+httpx>=0.27.0
+pytsk3>=4.13.0
+libewf-python>=20240506

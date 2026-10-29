@@ -1,0 +1,184 @@
+# IDFA configuration template.
+#
+# The real file lives in your user profile, not in this folder:
+#   Windows: %APPDATA%\IDFA\config.yaml
+#   Other:   ~/.config/IDFA/config.yaml
+#
+# Only app.data_dir needs to be set. Every other path below is derived from it,
+# so the file keeps working when the project is moved, reinstalled, or copied to
+# another machine. Blank values mean "derive it".
+#
+# Environment overrides still work and win over this file, using the same names:
+#   APP__DATA_DIR, DATABASE__URL, WORKER__URL, OLLAMA__HOST, QDRANT__URL,
+#   AUTH__SECRET_KEY, EMBEDDINGS__MODEL_ID
+
+app:
+  name: IDFA
+  version: 0.1.0
+  debug: true
+  # Root folder for cases, evidence, database, logs and vector storage.
+  data_dir: ''
+  logs_dir: ''
+
+database:
+  url: ''
+  echo: false
+  pool_pre_ping: true
+
+auth:
+  # Replaced with a random value the first time IDFA starts.
+  secret_key: CHANGE_THIS_IN_PRODUCTION_USE_STRONG_RANDOM_KEY
+  algorithm: HS256
+  access_token_expire_minutes: 480
+  refresh_token_expire_days: 30
+  bcrypt_rounds: 12
+
+worker:
+  url: http://127.0.0.1:8000
+  timeout_seconds: 3600
+  evidence_root_windows: ''
+
+ollama:
+  host: http://127.0.0.1:11434
+  model: phi3:mini
+  # ollama = offline models on this machine, openai = any OpenAI-compatible
+  # endpoint (NVIDIA NIM, OpenAI, ...). Pick either in Settings; the presets
+  # there fill cloud_base_url for you.
+  provider: ollama
+  cloud_base_url: https://api.openai.com/v1
+  # Enter the key in Settings, not here. Settings encrypts it for the current
+  # Windows account and writes it back as "dpapi:<base64>", which cannot be
+  # read on another account or machine. A plain-text value is still accepted
+  # (and encrypted on the next save) for configs written by older builds.
+  # Never put a real key in a shared example file or bundle.
+  cloud_api_key: ""
+  # Exact model ID from the provider's catalog; IDFA never fetches the list.
+  cloud_model: gpt-4o-mini
+  timeout_seconds: 3600
+  temperature: 0.3
+  # Output tokens per reply and the context window sent to Ollama. phi3:mini
+  # needs roughly 384 KiB of key/value cache per token, so a 131072-token window
+  # asks for ~48 GiB and the model fails to load. Keep the window at 8192 for a
+  # laptop; IDFA_MAX_CONTEXT_TOKENS raises the worker's ceiling if needed.
+  max_tokens: 2048
+  context_window_tokens: 8192
+
+embeddings:
+  # Ollama model used for semantic search. all-minilm is the same
+  # all-MiniLM-L6-v2 weights at 384 dimensions, so existing Qdrant collections
+  # stay valid.
+  model_id: all-minilm
+  provider: ollama
+  batch_size: 64
+
+qdrant:
+  url: http://127.0.0.1:6333
+  collection_prefix: idfa_case_
+  vector_size: 384
+  distance: Cosine
+  storage_path: ''
+
+forensics:
+  hash_algorithms:
+  - sha256
+  - md5
+  chunk_size_bytes: 1048576
+  max_file_extract_mb: 10
+  supported_image_extensions:
+  - '.001'
+  - '.002'
+  - '.003'
+  - '.004'
+  - '.005'
+  - '.006'
+  - '.007'
+  - '.008'
+  - .dd
+  - .img
+  - .raw
+  text_extensions:
+  - .txt
+  - .log
+  - .csv
+  - .json
+  - .xml
+  - .html
+  - .htm
+  - .md
+  - .eml
+  doc_extensions:
+  - .pdf
+  - .docx
+  - .xlsx
+  - .pptx
+
+ui:
+  theme: dark
+  font_family: Inter, Segoe UI, system-ui, sans-serif
+  language: English
+  auto_refresh: true
+  refresh_interval_seconds: 30
+  sidebar_width: 240
+  sidebar_collapsed_width: 56
+  breakpoint_sidebar_collapse: 900
+  animation_duration_ms: 250
+
+search:
+  fts5_enabled: true
+  semantic_top_k: 20
+  keyword_top_k: 50
+  rrf_k: 60
+  max_context_chunks: 20
+  max_context_chars: 400000
+
+report:
+  logo_path: ''
+  organization: KSIT, Bengaluru
+  jurisdiction: India
+  default_template_id: court-admissible-v1
+  default_limitations: 'This report addresses only the evidence items listed in the
+    Evidence Inventory and the questions recorded in the case file.
+
+    Deleted, encrypted or damaged data may be partly or wholly unrecoverable, and
+    the absence of an artifact is not proof that it never existed.
+
+    Timestamps are reported as recorded by the device examined and depend on its clock
+    and time-zone settings.
+
+    AI-assisted output is probabilistic, is marked as unverified, and is used for
+    triage only.
+
+    The opinions expressed are limited to the material examined and the information
+    available at the date of this report.'
+
+# Background entity extraction, relationship linking and the timeline.
+#
+# This runs after every examination and again when evidence is added to an
+# existing case. The regex pass is exact and always runs; model calls are capped
+# and skipped while a scan is in progress, so analysis never competes with the
+# acquisition it follows.
+analysis:
+  enabled: true
+  auto_queue: true
+  # Hold model calls until no examination is running. Regex extraction, the
+  # timeline and relationships still proceed.
+  defer_llm_while_examining: true
+  llm_enabled: true
+  # Use the cloud model when one is configured (ollama.provider: openai);
+  # otherwise the local Ollama model is used.
+  use_cloud_when_available: true
+  # Only this many of the largest texts are sent to a model, up to this many
+  # characters each. Everything else is extracted by pattern.
+  llm_max_artifacts: 40
+  llm_max_chars: 6000
+  llm_timeout_seconds: 180
+  build_timeline: true
+  build_relationships: true
+  max_entities_per_artifact: 60
+  # An entity that appears in more than this fraction of artifacts is a hub: it
+  # would link everything to everything, so it is not used to link artifacts.
+  hub_fraction: 0.5
+  hub_min_artifacts: 8
+  max_relationship_artifacts: 40
+  # Queue polling interval, in seconds.
+  poll_seconds: 4

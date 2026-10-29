@@ -753,6 +753,7 @@ class EvidenceService:
             part.unlink(missing_ok=True)
 
         from sqlalchemy import delete
+        from sqlalchemy.orm import load_only
 
         from app.analysis.models import AnalysisJob
         from app.artifacts.models import Artifact
@@ -761,7 +762,9 @@ class EvidenceService:
         from app.audit.service import AuditService
 
         artifacts = self.session.execute(
-            select(Artifact).where(Artifact.evidence_id == evidence.id)
+            select(Artifact).options(load_only(
+                Artifact.id, Artifact.case_id, Artifact.artifact_id, Artifact.vector_id,
+            )).where(Artifact.evidence_id == evidence.id)
         ).scalars().all()
         purge_artifact_rows(self.session, artifacts)
         self.session.execute(delete(AnalysisJob).where(

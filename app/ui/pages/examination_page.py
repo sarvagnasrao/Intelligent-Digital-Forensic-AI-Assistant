@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QPushButton, QSplitter, QFrame, QComboBox,
     QLabel, QProgressBar, QTextEdit, QTabWidget, QMessageBox, QDialog,
     QFormLayout, QDialogButtonBox, QSpinBox, QCheckBox, QToolButton,
-    QGroupBox, QLineEdit, QScrollArea, QApplication
+    QGroupBox, QLineEdit, QScrollArea, QApplication, QProgressDialog
 )
 import json
 import math
@@ -167,6 +167,7 @@ class ExaminationPage(ResponsivePage):
         self._starting = False
         self._active_job_id: str | None = None
         self._job_thread = None
+        self._delete_thread = None
         # The result of a run arrives from a worker thread; this signal is
         # delivered on the GUI thread. Without this connection the button
         # stayed on a startup state and nothing ever refreshed.
@@ -539,6 +540,7 @@ class ExaminationPage(ResponsivePage):
         self.pause_btn.setEnabled(running and not pausing)
         self.delete_job_btn.setEnabled(
             not self._starting
+            and not (self._delete_thread and self._delete_thread.isRunning())
             and job is not None
             and job.status != JobStatus.RUNNING
         )
@@ -844,6 +846,8 @@ class ExaminationPage(ResponsivePage):
         self.refresh()
 
     def _on_delete_job(self):
+        if self._delete_thread and self._delete_thread.isRunning():
+            return
         if not self._selected_job or not self.exam_service:
             return
         job = self._selected_job
@@ -863,20 +867,48 @@ class ExaminationPage(ResponsivePage):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        from app.auth.models import User
-        session = self.exam_service.session
-        try:
-            user = session.get(User, 1)  # TODO: authenticated user
-            deleted = self.exam_service.delete_job(job.id, user)
-            if not deleted:
-                raise ValueError("This job can no longer be deleted")
-            session.commit()
-            session.expire_all()
-            self._selected_job = None
-            self.refresh()
-        except Exception as exc:
-            session.rollback()
-            QMessageBox.critical(self, "Delete Failed", str(exc))
+        from app.ui import qt_threads
+        from app.ui.deletion_worker import DeletionWorker
+
+        self._delete_thread = DeletionWorker("examination", job.id, 1)
+        qt_threads.track(self._delete_thread)
+        self.delete_job_btn.setEnabled(False)
+        self.delete_job_btn.setText("Deleting…")
+        self.results_log.append("Deleting the examination and its derived artifacts…")
+        self._delete_progress = QProgressDialog(
+            "Deleting the examination and its derived artifacts…", "", 0, 0, self
+        )
+        self._delete_progress.setWindowTitle("Deleting Examination")
+        self._delete_progress.setCancelButton(None)
+        self._delete_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._delete_progress.setMinimumDuration(0)
+        self._delete_progress.show()
+        self._delete_thread.succeeded.connect(self._on_delete_complete)
+        self._delete_thread.failed.connect(self._on_delete_failed)
+        self._delete_thread.finished.connect(self._on_delete_thread_finished)
+        self._delete_thread.start()
+
+    def _on_delete_complete(self, _result):
+        self._delete_progress.close()
+        self.delete_job_btn.setText("Delete Job")
+        self.exam_service.session.expire_all()
+        self._selected_job = None
+        self.refresh()
+        self.results_log.append("Examination deleted.")
+
+    def _on_delete_failed(self, error):
+        self._delete_progress.close()
+        self.delete_job_btn.setText("Delete Job")
+        self.refresh()
+        QMessageBox.critical(self, "Delete Failed", error)
+
+    def _on_delete_thread_finished(self):
+        self._delete_thread = None
+        self.refresh()
+
+    def shutdown(self):
+        from app.ui import qt_threads
+        qt_threads.stop(self._delete_thread, wait_ms=5000)
 
     def _on_new_job(self):
         if not self.exam_service or not self.case_context:

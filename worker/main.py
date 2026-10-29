@@ -1566,27 +1566,32 @@ async def generate(request: GenerateRequest):
         context_parts = []
         citations = []
 
-        for i, art in enumerate(request.context_artifacts):
+        for art in request.context_artifacts:
             content = art.get("content_text", "")
             if content and remaining_context_chars > 0:
                 content = content[:remaining_context_chars]
                 remaining_context_chars -= len(content)
+                source_number = len(citations) + 1
                 context_parts.append(
-                    f"[Source {i+1}] Artifact ID: {art.get('artifact_id', 'unknown')}\n"
+                    f"[Source {source_number}] Artifact ID: {art.get('artifact_id', 'unknown')}\n"
                     f"Name: {art.get('name', 'unknown')}\n"
                     f"Path: {art.get('path', 'N/A')}\n"
                     f"Type: {art.get('artifact_type', 'file')}\n"
                     f"Passage characters: {art.get('passage_start', 0)}-"
-                    f"{art.get('passage_end', len(content))}\n"
+                    f"{min(int(art.get('passage_start', 0) or 0) + len(content), int(art.get('passage_end', len(content)) or len(content)))}\n"
                     f"Content:\n{content}\n"
                 )
                 citations.append({
+                    "source_number": source_number,
                     "artifact_id": art.get("artifact_id"),
                     "name": art.get("name"),
                     "path": art.get("path"),
                     "type": art.get("artifact_type"),
                     "passage_start": art.get("passage_start"),
-                    "passage_end": art.get("passage_end"),
+                    "passage_end": min(
+                        int(art.get("passage_start", 0) or 0) + len(content),
+                        int(art.get("passage_end", len(content)) or len(content)),
+                    ),
                     "retrieval_source": art.get("retrieval_source"),
                 })
 
@@ -1702,7 +1707,9 @@ Additional grounding requirements:
         return GenerateResponse(
             success=True,
             answer=answer,
-            citations=request.context_artifacts[:10]  # Limit citations
+            # Report only sources that were actually included in the prompt,
+            # with the same numbering and passage offsets used above.
+            citations=citations,
         )
 
     except OllamaError as e:

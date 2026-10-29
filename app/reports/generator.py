@@ -67,6 +67,29 @@ def _rich(text: Any) -> str:
     return value
 
 
+def _markdown_inline(text: str) -> str:
+    """Convert safe inline Markdown to ReportLab Paragraph markup."""
+    value = str(text or "")
+    code_spans: list[str] = []
+
+    def hold_code(match: re.Match) -> str:
+        code_spans.append(f'<font name="Courier">{escape(match.group(1))}</font>')
+        return f"IDFAMDCODE{len(code_spans) - 1}END"
+
+    value = re.sub(r"`([^`\n]+)`", hold_code, value)
+    value = escape(value)
+    value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
+    value = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", value)
+    value = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        r'<link href="\2" color="#2563EB">\1</link>',
+        value,
+    )
+    for index, markup in enumerate(code_spans):
+        value = value.replace(f"IDFAMDCODE{index}END", markup)
+    return value
+
+
 class NumberedCanvas(canvas.Canvas):
     """Canvas that writes "Page X of Y" footers once the page count is known."""
 
@@ -302,6 +325,31 @@ class ReportGenerator:
             spaceAfter=4,
         )
         self._add_style(
+            "AIHeading",
+            parent=self.styles["Heading3"],
+            fontSize=11,
+            leading=14,
+            spaceBefore=6,
+            spaceAfter=3,
+            textColor=colors.HexColor(INK),
+        )
+        self._add_style(
+            "AIList",
+            parent=self.styles["BodyText2"],
+            leftIndent=14,
+            firstLineIndent=0,
+            spaceAfter=3,
+        )
+        self._add_style(
+            "AIQuote",
+            parent=self.styles["BodyText2"],
+            leftIndent=12,
+            borderColor=colors.HexColor(RULE),
+            borderWidth=1,
+            borderPadding=5,
+            textColor=colors.HexColor(MUTED),
+        )
+        self._add_style(
             "SignatureBlock",
             parent=body,
             fontSize=10,
@@ -438,6 +486,145 @@ class ReportGenerator:
             content = "<br/>".join(_rich(line) for line in lines)
             flowables.append(Paragraph(content, self.styles[style]))
             flowables.append(Spacer(1, 0.15 * cm))
+        return flowables
+
+    def _render_ai_answer(self, text: str) -> list:
+        """Render common Markdown blocks used by AI findings into PDF flowables.
+
+        Paragraphs and tables remain splittable by ReportLab, so long answers
+        continue cleanly across pages instead of being flattened into one block.
+        """
+        lines = (text or "").splitlines()
+        flowables: list = []
+        paragraph: list[str] = []
+        index = 0
+
+        def flush_paragraph() -> None:
+            if paragraph:
+                content = _markdown_inline(" ".join(line.strip() for line in paragraph))
+                flowables.append(Paragraph(content, self.styles["BodyText2"]))
+                paragraph.clear()
+
+        def is_table_separator(line: str) -> bool:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            return bool(cells) and all(
+                re.fullmatch(r":?-{3,}:?", cell.replace(" ", ""))
+                for cell in cells
+            )
+
+        def table_cells(line: str) -> list[str]:
+            return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line:
+                flush_paragraph()
+                index += 1
+                continue
+
+            if line.startswith("```") or line.startswith("~~~"):
+                flush_paragraph()
+                fence = line[:3]
+                code: list[str] = []
+                index += 1
+                while index < len(lines) and not lines[index].strip().startswith(fence):
+                    code.append(lines[index])
+                    index += 1
+                code_markup = "<br/>".join(escape(row) or "&#160;" for row in code)
+                if code_markup:
+                    flowables.append(Paragraph(code_markup, self.styles["CodeBlock"]))
+                index += 1
+                continue
+
+            if (
+                line.startswith("|")
+                and index + 1 < len(lines)
+                and is_table_separator(lines[index + 1])
+            ):
+                flush_paragraph()
+                headers = table_cells(line)
+                rows = [headers]
+                index += 2
+                while index < len(lines) and lines[index].strip().startswith("|"):
+                    cells = table_cells(lines[index])
+                    if len(cells) < len(headers):
+                        cells.extend([""] * (len(headers) - len(cells)))
+                    rows.append(cells[:len(headers)])
+                    index += 1
+                data = [
+                    [
+                        Paragraph(
+                            _markdown_inline(cell),
+                            self.styles["TableHeader"] if row_index == 0
+                            else self.styles["SmallCell"],
+                        )
+                        for cell in row
+                    ]
+                    for row_index, row in enumerate(rows)
+                ]
+                column_count = max(1, len(headers))
+                table = Table(
+                    data,
+                    colWidths=[17 * cm / column_count] * column_count,
+                    repeatRows=1,
+                    hAlign="LEFT",
+                    splitByRow=1,
+                )
+                table.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(ACCENT)),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor(RULE)),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+                     [colors.white, colors.HexColor("#F8FAFC")]),
+                ]))
+                flowables.extend([table, Spacer(1, 0.15 * cm)])
+                continue
+
+            heading = re.match(r"^#{1,6}\s+(.+)$", line)
+            if heading:
+                flush_paragraph()
+                level = len(line) - len(line.lstrip("#"))
+                style = "SubSectionHeading" if level <= 2 else "AIHeading"
+                flowables.append(Paragraph(_markdown_inline(heading.group(1)), self.styles[style]))
+                index += 1
+                continue
+
+            if re.fullmatch(r"(?:-{3,}|\*{3,}|_{3,})", line):
+                flush_paragraph()
+                flowables.append(HRFlowable(
+                    width="100%", thickness=0.5, color=colors.HexColor(RULE),
+                    spaceBefore=3, spaceAfter=6,
+                ))
+                index += 1
+                continue
+
+            bullet = re.match(r"^[-*+]\s+(.+)$", line)
+            numbered = re.match(r"^(\d+)[.)]\s+(.+)$", line)
+            quote = re.match(r"^>\s?(.*)$", line)
+            if bullet or numbered or quote:
+                flush_paragraph()
+                if bullet:
+                    markup = f"- {_markdown_inline(bullet.group(1))}"
+                    style = "AIList"
+                elif numbered:
+                    markup = f"{numbered.group(1)}. {_markdown_inline(numbered.group(2))}"
+                    style = "AIList"
+                else:
+                    markup = _markdown_inline(quote.group(1))
+                    style = "AIQuote"
+                flowables.append(Paragraph(markup, self.styles[style]))
+                index += 1
+                continue
+
+            paragraph.append(line)
+            index += 1
+
+        flush_paragraph()
         return flowables
 
     def _render(self, text: str, context: dict[str, str], style: str = "BodyText2") -> list:
@@ -836,7 +1023,7 @@ class ReportGenerator:
             if finding.ai_question:
                 story.append(Paragraph(_rich(f"Question: {finding.ai_question}"), self.styles["CodeBlock"]))
             if finding.ai_answer:
-                story.append(Paragraph(_rich(finding.ai_answer), self.styles["BodyText2"]))
+                story.extend(self._render_ai_answer(finding.ai_answer))
 
         if finding.artifact_links:
             story.append(Paragraph("Supporting artifacts", self.styles["SubSectionHeading"]))

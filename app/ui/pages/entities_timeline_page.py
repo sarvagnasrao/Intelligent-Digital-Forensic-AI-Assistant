@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableView,
     QTabWidget,
     QTextEdit,
@@ -77,6 +78,29 @@ class EntitiesTimelinePage(ResponsivePage):
     # ------------------------------------------------------------------
     # Layout
     # ------------------------------------------------------------------
+    @staticmethod
+    def _empty_state(title: str, description: str) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("AnalysisEmptyState")
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(Spacing.XL, Spacing.XL, Spacing.XL, Spacing.XL)
+        layout.setSpacing(Spacing.SM)
+        heading = QLabel(title)
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        heading.setFont(
+            QFont(Typography.FONT_FAMILY, Typography.HEADING_SM[0], QFont.Weight.Bold)
+        )
+        body = _muted(description)
+        body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        frame.empty_title = heading
+        frame.empty_description = body
+        layout.addStretch(1)
+        layout.addWidget(heading)
+        layout.addWidget(body)
+        layout.addStretch(1)
+        return frame
+
     def _setup_layout(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
@@ -171,7 +195,14 @@ class EntitiesTimelinePage(ResponsivePage):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.entity_table.doubleClicked.connect(self._on_entity_activated)
-        layout.addWidget(self.entity_table, 1)
+        self.entity_stack = QStackedWidget()
+        self.entity_stack.addWidget(self.entity_table)
+        self.entity_empty_state = self._empty_state(
+            "No entities extracted yet",
+            "Run analysis after examining evidence to find identifiers, accounts and named entities.",
+        )
+        self.entity_stack.addWidget(self.entity_empty_state)
+        layout.addWidget(self.entity_stack, 1)
 
         self.entity_hint = _muted(
             "Entities are extracted automatically after each examination. "
@@ -240,7 +271,14 @@ class EntitiesTimelinePage(ResponsivePage):
         self.rel_table.selectionModel().selectionChanged.connect(
             self._on_relationship_selected
         )
-        splitter.addWidget(self.rel_table)
+        self.relationship_stack = QStackedWidget()
+        self.relationship_stack.addWidget(self.rel_table)
+        self.relationship_empty_state = self._empty_state(
+            "No relationship candidates",
+            "Run analysis after examining evidence. Candidate links appear here with their supporting artifacts for review.",
+        )
+        self.relationship_stack.addWidget(self.relationship_empty_state)
+        splitter.addWidget(self.relationship_stack)
 
         detail = QFrame()
         detail.setFrameShape(QFrame.Shape.StyledPanel)
@@ -286,17 +324,23 @@ class EntitiesTimelinePage(ResponsivePage):
         buttons.addStretch()
         self.rel_review_note = _muted("")
         buttons.addWidget(self.rel_review_note)
-        detail_layout.addLayout(buttons)
+        self.rel_review_controls = QWidget()
+        self.rel_review_controls.setLayout(buttons)
+        detail_layout.addWidget(self.rel_review_controls)
 
         splitter.addWidget(detail)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, True)
+        splitter.setSizes([620, 130])
+        self.rel_evidence.hide()
+        self.rel_review_controls.hide()
         layout.addWidget(splitter, 1)
 
         self.rel_hint = _muted(
-            "A link needs at least two artifacts, or two exact identifiers "
-            "(e-mail, phone, wallet, digest) in one artifact. A value that "
-            "appears across most of the case is treated as a hub and skipped."
+            "Links are analysis suggestions. Review their source artifacts before confirming; "
+            "common identifiers are suppressed to reduce weak connections."
         )
         layout.addWidget(self.rel_hint)
         return tab
@@ -325,11 +369,12 @@ class EntitiesTimelinePage(ResponsivePage):
         self.timeline_table = QTableView()
         self.timeline_model = QStandardItemModel()
         self.timeline_model.setHorizontalHeaderLabels(
-            ["Timestamp (IST)", "Event", "Title", "Path", "Certainty"]
+            ["Timestamp", "Event", "Title", "Source path", "Source artifact", "Confidence"]
         )
         self.timeline_table.setModel(self.timeline_model)
         self.timeline_table.setAlternatingRowColors(True)
         self.timeline_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.timeline_table.setWordWrap(False)
         self.timeline_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.timeline_table.verticalHeader().setVisible(False)
         header = self.timeline_table.horizontalHeader()
@@ -337,12 +382,19 @@ class EntitiesTimelinePage(ResponsivePage):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        layout.addWidget(self.timeline_table, 1)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.timeline_stack = QStackedWidget()
+        self.timeline_stack.addWidget(self.timeline_table)
+        self.timeline_empty_state = self._empty_state(
+            "No timeline events yet",
+            "File timestamps are added after analysis. Event times use the computer's local time zone.",
+        )
+        self.timeline_stack.addWidget(self.timeline_empty_state)
+        layout.addWidget(self.timeline_stack, 1)
 
         layout.addWidget(_muted(
-            "File created, modified and accessed times from the examined "
-            "artifacts, newest first. Times shown in IST."
+            "Events are ordered newest first. Verify timestamps against the source device and its clock settings."
         ))
         return tab
 
@@ -387,7 +439,14 @@ class EntitiesTimelinePage(ResponsivePage):
         for column in (0, 1, 2, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.queue_table, 1)
+        self.queue_stack = QStackedWidget()
+        self.queue_stack.addWidget(self.queue_table)
+        self.queue_empty_state = self._empty_state(
+            "No analysis jobs",
+            "Jobs are created for completed examinations. Use Run analysis now to queue any examinations still awaiting analysis.",
+        )
+        self.queue_stack.addWidget(self.queue_empty_state)
+        layout.addWidget(self.queue_stack, 1)
 
         layout.addWidget(_muted(
             "One analysis at a time. It waits while an examination is running, "
@@ -481,6 +540,10 @@ class EntitiesTimelinePage(ResponsivePage):
 
         if total == 0:
             self.entity_summary.setText("No entities yet")
+            self.entity_empty_state.empty_title.setText("No entities extracted yet")
+            self.entity_empty_state.empty_description.setText(
+                "Run analysis after examining evidence to find identifiers, accounts and named entities."
+            )
         else:
             breakdown = ", ".join(
                 f"{_readable(key)} {value:,}" for key, value in sorted(counts.items())
@@ -489,6 +552,11 @@ class EntitiesTimelinePage(ResponsivePage):
             self.entity_summary.setText(
                 f"{shown:,} shown of {total:,} — {breakdown}"
             )
+            self.entity_empty_state.empty_title.setText("No matching entities")
+            self.entity_empty_state.empty_description.setText(
+                "Change the type filter or search text to see other extracted entities."
+            )
+        self.entity_stack.setCurrentIndex(1 if not self._entities else 0)
 
     def _refresh_relationships(self) -> None:
         if self.analysis_service is None or self.case_context is None:
@@ -538,12 +606,40 @@ class EntitiesTimelinePage(ResponsivePage):
             f"{counts.get('confirmed', 0):,} confirmed, "
             f"{counts.get('rejected', 0):,} rejected"
         )
+        self.relationship_stack.setCurrentIndex(1 if not rows else 0)
         if not rows:
+            if sum(counts.values()):
+                self.relationship_empty_state.empty_title.setText(
+                    "No candidates match these filters"
+                )
+                self.relationship_empty_state.empty_description.setText(
+                    "Change the status, kind or search filters to review other relationships."
+                )
+            else:
+                self.relationship_empty_state.empty_title.setText(
+                    "No relationship candidates yet"
+                )
+                self.relationship_empty_state.empty_description.setText(
+                    "Run analysis after examining evidence. Candidate links appear here with their supporting artifacts for review."
+                )
+            if sum(counts.values()):
+                self.rel_detail.setText(
+                    "No candidates match these filters. Adjust the filters to see other links."
+                )
+            else:
+                self.rel_detail.setText(
+                    "No relationships yet. Run analysis after examining evidence to generate candidates for review."
+                )
+            self.rel_evidence.clear()
+            self.rel_evidence.hide()
+            self.rel_review_controls.hide()
+        elif self._selected_relationship() is None:
             self.rel_detail.setText(
-                "No relationships yet. They are built after each examination; "
-                "use Run analysis now to rebuild them for this case."
+                "Select a candidate to inspect its supporting evidence."
             )
             self.rel_evidence.clear()
+            self.rel_evidence.hide()
+            self.rel_review_controls.hide()
 
     def _refresh_timeline(self) -> None:
         if self.analysis_service is None or self.case_context is None:
@@ -589,13 +685,37 @@ class EntitiesTimelinePage(ResponsivePage):
                 QStandardItem(_readable(event.event_type)),
                 QStandardItem(event.title),
                 QStandardItem(event.description or ""),
+                QStandardItem(self._timeline_source_label(event)),
                 QStandardItem(event.certainty),
             ]
             for cell in cells:
                 cell.setEditable(False)
+                cell.setToolTip(cell.text())
             self.timeline_model.appendRow(cells)
 
         self.tl_summary.setText(f"{len(visible):,} of {len(rows):,} events")
+        if rows and not visible:
+            self.timeline_empty_state.empty_title.setText("No events match these filters")
+            self.timeline_empty_state.empty_description.setText(
+                "Change the event type or search text to show other timeline events."
+            )
+        else:
+            self.timeline_empty_state.empty_title.setText("No timeline events yet")
+            self.timeline_empty_state.empty_description.setText(
+                "File timestamps are added after analysis. Event times use the computer's local time zone."
+            )
+        self.timeline_stack.setCurrentIndex(1 if not visible else 0)
+
+    @staticmethod
+    def _timeline_source_label(event) -> str:
+        artifact = getattr(event, "artifact", None)
+        if artifact is None:
+            return "—"
+        name = getattr(artifact, "name", "") or "Artifact"
+        artifact_id = getattr(artifact, "artifact_id", "") or ""
+        path = getattr(artifact, "source_path", "") or ""
+        label = f"{name} ({artifact_id})" if artifact_id else name
+        return f"{label} — {path}" if path else label
 
     def _refresh_queue(self) -> None:
         if self.analysis_service is None or self.case_context is None:
@@ -630,6 +750,7 @@ class EntitiesTimelinePage(ResponsivePage):
             f"{counts.get('pending', 0):,} queued, {counts.get('running', 0):,} running, "
             f"{counts.get('completed', 0):,} completed, {counts.get('failed', 0):,} failed"
         )
+        self.queue_stack.setCurrentIndex(1 if not self._jobs else 0)
 
     # ------------------------------------------------------------------
     # Entity → relationship drill-down
@@ -667,6 +788,8 @@ class EntitiesTimelinePage(ResponsivePage):
                 "Select a relationship to see the evidence behind it."
             )
             self.rel_evidence.clear()
+            self.rel_evidence.hide()
+            self.rel_review_controls.hide()
             return
 
         details = _loads(relationship.details_json)
@@ -721,6 +844,8 @@ class EntitiesTimelinePage(ResponsivePage):
             lines.append("Copies:")
             lines.extend(f"  • {path}" for path in details["paths"][:20])
         self.rel_evidence.setPlainText("\n".join(lines))
+        self.rel_evidence.show()
+        self.rel_review_controls.show()
 
         if relationship.status != RelationshipStatus.PENDING:
             self.rel_review_note.setText(

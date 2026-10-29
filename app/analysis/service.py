@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.analysis.extractors import (
     content_entities_for_artifact,
@@ -674,7 +674,11 @@ class AnalysisService:
         until: datetime | None = None,
         limit: int = 1000,
     ) -> list[TimelineEvent]:
-        stmt = select(TimelineEvent).where(TimelineEvent.case_id == case_id)
+        stmt = (
+            select(TimelineEvent)
+            .options(selectinload(TimelineEvent.artifact))
+            .where(TimelineEvent.case_id == case_id)
+        )
         if event_type:
             stmt = stmt.where(TimelineEvent.event_type == event_type)
         if since:

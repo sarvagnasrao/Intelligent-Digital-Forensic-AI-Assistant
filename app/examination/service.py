@@ -634,6 +634,7 @@ class ExaminationService:
         from app.artifacts.models import Artifact
         from app.artifacts.service import purge_artifact_rows
         from sqlalchemy import delete
+        from sqlalchemy.orm import load_only
 
         active_analysis = self.session.execute(
             select(AnalysisJob).where(
@@ -645,7 +646,9 @@ class ExaminationService:
             return False
 
         artifacts = list(self.session.execute(
-            select(Artifact).where(Artifact.examination_job_id == job.id)
+            select(Artifact).options(load_only(
+                Artifact.id, Artifact.case_id, Artifact.artifact_id, Artifact.vector_id,
+            )).where(Artifact.examination_job_id == job.id)
         ).scalars().all())
         artifact_count = purge_artifact_rows(self.session, artifacts)
         self.session.execute(delete(AnalysisJob).where(

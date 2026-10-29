@@ -1967,13 +1967,19 @@ class EvidencePage(ResponsivePage):
         user = self._require_user()
         if user is None:
             return
-        try:
-            result = service.delete_evidence(evidence.id, user, dialog.get_reason())
-            service.session.commit()
-        except Exception as exc:  # noqa: BLE001 - surfaced to the investigator
-            service.session.rollback()
-            QMessageBox.critical(self, "Could not delete", str(exc))
-            return
+        from app.ui.deletion_worker import DeletionWorker
+
+        worker = DeletionWorker("evidence", evidence.id, user.id, dialog.get_reason())
+        self._track(worker)
+        progress = self._open_progress("Deleting Evidence", "Deleting evidence and derived artifacts…")
+        progress.setRange(0, 0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        worker.succeeded.connect(lambda result: self._on_delete_complete(reference, result))
+        worker.failed.connect(self._on_delete_failed)
+        worker.start()
+
+    def _on_delete_complete(self, reference, result):
+        self._close_progress()
         self._expire()
         QMessageBox.information(
             self, "Deleted",
@@ -1983,6 +1989,11 @@ class EvidencePage(ResponsivePage):
             f"Also deleted {result['jobs']} examination job(s) and "
             f"{result['artifacts']} artifact(s).",
         )
+
+    def _on_delete_failed(self, error):
+        self._close_progress()
+        self._expire()
+        QMessageBox.critical(self, "Could not delete", error)
 
     # --------------------------------------------------------- transparency
     def _on_check_files(self):

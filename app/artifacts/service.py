@@ -54,6 +54,7 @@ def purge_artifact_rows(session: Session, artifacts: list[Artifact]) -> int:
     if not artifacts:
         return 0
     artifact_ids = [int(item.id) for item in artifacts]
+    artifact_id_set = set(artifact_ids)
     case_ids = {int(item.case_id) for item in artifacts}
 
     # Remove existing Qdrant points as well as SQLite rows. If the local index
@@ -64,19 +65,27 @@ def purge_artifact_rows(session: Session, artifacts: list[Artifact]) -> int:
         points = points_by_case.setdefault(int(artifact.case_id), set())
         if artifact.vector_id:
             points.add(str(artifact.vector_id))
-        for chunk in artifact.chunks:
-            if chunk.vector_id:
-                points.add(str(chunk.vector_id))
+    for start in range(0, len(artifact_ids), 500):
+        rows = session.execute(
+            select(ArtifactChunk.case_id, ArtifactChunk.vector_id).where(
+                ArtifactChunk.artifact_id.in_(artifact_ids[start:start + 500]),
+                ArtifactChunk.vector_id.is_not(None),
+            )
+        )
+        for case_id, vector_id in rows:
+            points_by_case.setdefault(int(case_id), set()).add(str(vector_id))
     if any(points_by_case.values()):
         config = get_config()
         with httpx.Client(timeout=3.0) as client:
+            unavailable = False
             for case_id, point_ids in points_by_case.items():
                 collection = f"{config.qdrant.collection_prefix}{case_id}"
+                point_list = list(point_ids)
                 for start in range(0, len(point_ids), 500):
                     try:
                         response = client.post(
                             f"{config.qdrant.url}/collections/{collection}/points/delete",
-                            json={"points": list(point_ids)[start:start + 500]},
+                            json={"points": point_list[start:start + 500]},
                         )
                         if response.status_code >= 400:
                             logging.getLogger(__name__).warning(
@@ -88,6 +97,10 @@ def purge_artifact_rows(session: Session, artifacts: list[Artifact]) -> int:
                             "Qdrant is unavailable while deleting artifact vectors",
                             exc_info=True,
                         )
+                        unavailable = True
+                        break
+                if unavailable:
+                    break
 
     from app.analysis.models import EntityRelationship
     from app.artifacts.models import Entity, TimelineEvent
@@ -128,7 +141,7 @@ def purge_artifact_rows(session: Session, artifacts: list[Artifact]) -> int:
             linked = {int(value) for value in json.loads(relationship.artifact_ids_json or "[]")}
         except (TypeError, ValueError):
             linked = set()
-        if linked.intersection(artifact_ids):
+        if linked.intersection(artifact_id_set):
             session.delete(relationship)
 
     entity_ids = select(Entity.id).where(Entity.artifact_id.in_(artifact_ids))

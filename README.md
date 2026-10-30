@@ -169,7 +169,7 @@ files; it leaves case data in the configured data folder. The standalone
 ### Manual setup (advanced)
 #### 1. Clone and setup Windows environment
 ```bash
-cd E:\Users\sarva\Documents\Final_Project
+# Open PowerShell in your cloned project folder before running these commands.
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt

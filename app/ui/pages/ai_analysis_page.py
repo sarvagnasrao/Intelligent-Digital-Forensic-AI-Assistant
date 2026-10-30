@@ -2,19 +2,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import httpx
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -25,12 +31,153 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import cloud_api_key, get_config
+from app.auth.models import UserRole
+from app.config import cloud_api_key, connection_api_key, get_config
 from app.ui import qt_threads
 from app.ui.base import CaseContext, ResponsivePage
 from app.ui.layouts import configure_detail_pane, configure_detail_splitter
 from app.ui.markdown import MarkdownView, looks_like_markdown
 from app.ui.theme.tokens import Color, Spacing, Typography
+
+logger = logging.getLogger(__name__)
+
+
+class ChatModelCombo(QComboBox):
+    """Compact selector with a searchable, grouped view of configured models."""
+
+    def showPopup(self):
+        popup = QFrame(self, Qt.WindowType.Popup)
+        popup.setObjectName("ChatModelPicker")
+        layout = QVBoxLayout(popup)
+        search = QLineEdit(popup)
+        search.setPlaceholderText("Search providers and models")
+        search.setAccessibleName("Search chat models")
+        items = QListWidget(popup)
+        items.setMouseTracking(True)
+        items.setStyleSheet(
+            "QListWidget::item { padding: 6px 10px; }"
+            "QListWidget::item:hover, QListWidget::item:selected {"
+            " background: #25466f; color: white; border-radius: 4px; }"
+        )
+        items.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        layout.addWidget(search)
+        layout.addWidget(items)
+
+        def populate(text=""):
+            items.clear()
+            last_group = None
+            for index in range(self.count()):
+                if self.itemData(index) is None:
+                    continue
+                label = self.itemText(index)
+                if text.casefold() not in label.casefold():
+                    continue
+                group, _, model = label.partition(" — ")
+                if group != last_group:
+                    header = QListWidgetItem(group, items)
+                    header.setFlags(Qt.ItemFlag.NoItemFlags)
+                    last_group = group
+                item = QListWidgetItem(model or label, items)
+                item.setData(Qt.ItemDataRole.UserRole, index)
+                item.setToolTip(label)
+            items.setMinimumWidth(min(700, max(360, items.sizeHintForColumn(0) + 55)))
+
+        def select(item):
+            index = item.data(Qt.ItemDataRole.UserRole)
+            if index is not None:
+                self.setCurrentIndex(index)
+                popup.close()
+
+        def hover(item):
+            if item.data(Qt.ItemDataRole.UserRole) is not None:
+                items.setCurrentItem(item)
+
+        def select_first():
+            item = items.currentItem()
+            if item is None or item.data(Qt.ItemDataRole.UserRole) is None:
+                item = next((items.item(i) for i in range(items.count())
+                             if items.item(i).data(Qt.ItemDataRole.UserRole) is not None), None)
+            if item is not None:
+                select(item)
+
+        class SearchKeys(QObject):
+            def eventFilter(self, watched, event):
+                if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Down:
+                    for i in range(items.count()):
+                        item = items.item(i)
+                        if item.data(Qt.ItemDataRole.UserRole) is not None:
+                            items.setCurrentItem(item)
+                            items.setFocus()
+                            return True
+                return False
+
+        key_filter = SearchKeys(popup)
+        search.installEventFilter(key_filter)
+        popup._key_filter = key_filter
+
+        search.textChanged.connect(populate)
+        search.returnPressed.connect(select_first)
+        items.itemEntered.connect(hover)
+        items.itemClicked.connect(select)
+        items.itemActivated.connect(select)
+        populate()
+        popup.resize(items.minimumWidth(), 320)
+        screen = self.screen()
+        if screen is not None:
+            bounds = screen.availableGeometry()
+            popup.resize(min(popup.width(), bounds.width()), min(popup.height(), bounds.height()))
+            below = self.mapToGlobal(self.rect().bottomLeft())
+            above = self.mapToGlobal(self.rect().topLeft())
+            x = max(bounds.left(), min(below.x(), bounds.right() - popup.width() + 1))
+            y = below.y() if below.y() + popup.height() <= bounds.bottom() + 1 else above.y() - popup.height()
+            popup.move(x, max(bounds.top(), y))
+        else:
+            popup.move(self.mapToGlobal(self.rect().bottomLeft()))
+        self._picker = popup
+        popup.show()
+        search.setFocus()
+
+
+class ModelDiscoveryWorker(QObject):
+    """Fetch model IDs only; never send case content or report server errors verbatim."""
+
+    finished = Signal(dict)
+
+    def __init__(self, local_url: str, cloud_url: str, key: str):
+        super().__init__()
+        self.local_url, self.cloud_url, self.key = local_url, cloud_url, key
+
+    def run(self):
+        result = {"ollama": [], "openai": [], "errors": []}
+        for provider, url, headers, field, name in (
+            ("ollama", f"{self.local_url.rstrip('/')}/api/tags", {}, "models", "name"),
+            ("openai", f"{self.cloud_url.rstrip('/')}/models", {"Authorization": f"Bearer {self.key}"}, "data", "id"),
+        ):
+            if provider == "openai" and (not self.key or not self.cloud_url):
+                result["errors"].append("Cloud models not configured in Settings")
+                continue
+            try:
+                response = httpx.get(url, headers=headers, timeout=5.0, follow_redirects=False)
+                response.raise_for_status()
+                data = response.json()[field]
+                if not isinstance(data, list):
+                    raise ValueError("Invalid model list")
+                result[provider] = sorted({item[name].strip() for item in data
+                                           if isinstance(item, dict) and isinstance(item.get(name), str)
+                                           and item[name].strip()})
+            except Exception:
+                result["errors"].append(f"{'Local' if provider == 'ollama' else 'Cloud'} model discovery failed")
+        self.key = ""
+        self.finished.emit(result)
+
+
+def _interactive_output_limit(configured: int) -> int:
+    """Bound interactive replies separately from background extraction jobs."""
+    try:
+        ceiling = int(os.getenv("IDFA_AI_INTERACTIVE_MAX_TOKENS", "2048"))
+    except ValueError:
+        ceiling = 2048
+    return min(configured, max(256, ceiling))
 
 if TYPE_CHECKING:
     from app.artifacts.service import SearchService
@@ -45,6 +192,50 @@ STATUS_WORDS = {
     "checking": "Checking",
     "unknown": "Unknown",
 }
+
+ARTIFACT_REFERENCE = re.compile(r"\bART-\d+-[A-Za-z0-9]+\b", re.IGNORECASE)
+
+
+class HistoryLineEdit(QLineEdit):
+    """Navigate case questions with arrow keys while retaining the draft."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._history: list[str] = []
+        self._history_index = 0
+        self._draft = ""
+
+    def set_history(self, questions: list[str]) -> None:
+        self._history = [question for question in questions if question.strip()]
+        self._history_index = len(self._history)
+        self._draft = ""
+
+    def add_question(self, question: str) -> None:
+        if question.strip():
+            self._history.append(question)
+        self._history_index = len(self._history)
+        self._draft = ""
+
+    def keyPressEvent(self, event):
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._history:
+            if event.key() == Qt.Key.Key_Up:
+                if self._history_index == len(self._history):
+                    self._draft = self.text()
+                self._history_index = max(0, self._history_index - 1)
+                self.setText(self._history[self._history_index])
+                self.setCursorPosition(len(self.text()))
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Down and self._history_index < len(self._history):
+                self._history_index += 1
+                self.setText(
+                    self._draft if self._history_index == len(self._history)
+                    else self._history[self._history_index]
+                )
+                self.setCursorPosition(len(self.text()))
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 class ChatMessageWidget(QFrame):
@@ -151,6 +342,46 @@ class ChatMessageWidget(QFrame):
                 wrapper.addWidget(bubble)
                 wrapper.addStretch()
             layout.addLayout(wrapper)
+
+
+class PendingResponseWidget(QFrame):
+    """A lightweight animated status while the assistant is working."""
+
+    def __init__(self, conversation: bool, parent: QWidget | None = None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+        bubble = QFrame()
+        bubble.setStyleSheet(
+            f"QFrame {{ background: {Color.BG_TERTIARY.name()}; "
+            f"border: 1px solid {Color.BORDER_LIGHT.name()}; "
+            f"border-radius: {Spacing.MD}px; }}"
+        )
+        content = QVBoxLayout(bubble)
+        content.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+        self.label = QLabel()
+        self.label.setStyleSheet(
+            f"color: {Color.TEXT_PRIMARY.name()}; background: transparent; border: none;"
+        )
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
+        self.label.setWordWrap(True)
+        self._message = "Thinking" if conversation else "Searching evidence and preparing a response"
+        self._phase = 0
+        content.addWidget(self.label)
+        layout.addWidget(bubble)
+        layout.addStretch()
+        self._timer = QTimer(self)
+        self._timer.setInterval(450)
+        self._timer.timeout.connect(self._advance)
+        self._advance()
+        self._timer.start()
+
+    def _advance(self):
+        self._phase = (self._phase + 1) % 4
+        self.label.setText(f"{self._message}{'.' * self._phase}")
+
+    def stop(self):
+        self._timer.stop()
 
 
 class CitationPanel(QFrame):
@@ -685,6 +916,10 @@ class AskWorker(QObject):
         conversation_history: list[dict] | None = None,
         expand_graph: bool = False,
         cloud_consent: bool = False,
+        provider: str | None = None,
+        model: str | None = None,
+        api_base_url: str | None = None,
+        api_key: str | None = None,
     ):
         super().__init__()
         self.case_id = case_id
@@ -697,6 +932,12 @@ class AskWorker(QObject):
         self.expand_graph = expand_graph
         self.cloud_consent = cloud_consent
         config = get_config()
+        self.provider = provider or config.ollama.provider
+        self.model = model or (config.ollama.cloud_model if self.provider == "openai" else config.ollama.model)
+        self.api_base_url = api_base_url
+        self.api_key = api_key
+        from threading import Event
+        self.cancelled = Event()
         self.max_artifacts = max(1, config.search.max_context_chunks)
         self.max_content_chars = max(
             1000, config.search.max_context_chars // self.max_artifacts
@@ -714,21 +955,30 @@ class AskWorker(QObject):
         }
         session = None
         try:
+            if self.provider == "openai" and not self.cloud_consent:
+                result["error"] = (
+                    "Cloud AI requires this case's consent before sending chat or evidence. "
+                    "Enable the case disclosure option."
+                )
+                return
+            if (self.provider == "ollama" and self.api_base_url
+                    and self.api_base_url.rstrip("/") != get_config().ollama.host.rstrip("/")):
+                result["error"] = "The worker cannot yet route to this Ollama endpoint. Select the configured local Ollama connection."
+                return
             if self.conversation:
                 result["answer"], _ = self._generate([], mode="conversation")
             else:
                 config = get_config()
-                if (config.ollama.provider == "openai" and not self.cloud_consent):
-                    result["error"] = (
-                        "Cloud AI is configured, but this case has not consented "
-                        "to sending evidence text. Enable the case disclosure option."
-                    )
-                    return
                 from app.db.session import get_session_factory
 
                 session = get_session_factory()()
                 try:
+                    retrieval_started = time.perf_counter()
                     retrieved = self._retrieve(session)
+                    logger.info(
+                        "AI retrieval: duration_ms=%.1f sources=%d",
+                        (time.perf_counter() - retrieval_started) * 1000, len(retrieved),
+                    )
                 except Exception as exc:
                     result["error"] = (
                         "Evidence search failed, so no answer was generated. "
@@ -736,6 +986,8 @@ class AskWorker(QObject):
                     )
                     return
                 result["citations"] = [item["citation"] for item in retrieved]
+                if self.cancelled.is_set():
+                    return
                 if not retrieved:
                     result["error"] = (
                         "Search found no relevant examined passages for this question. "
@@ -763,7 +1015,7 @@ class AskWorker(QObject):
         except Exception as exc:
             if self.conversation:
                 result["error"] = (
-                    "I couldn't get a reply from the local model just now. "
+                    "I couldn't get a reply from the selected model just now. "
                     f"Please try again in a moment. (Details: {exc})"
                 )
             else:
@@ -781,6 +1033,33 @@ class AskWorker(QObject):
         A no-hit result stays empty; unrelated recent artifacts are not a safe
         substitute for retrieved evidence.
         """
+        references = list(dict.fromkeys(
+            match.group().upper() for match in ARTIFACT_REFERENCE.finditer(self.question)
+        ))
+        if references:
+            from sqlalchemy import func, select
+            from app.artifacts.models import Artifact
+            from app.evidence.models import Evidence
+
+            rows = session.execute(
+                select(Artifact).join(Evidence, Artifact.evidence_id == Evidence.id).where(
+                    Artifact.case_id == self.case_id,
+                    Evidence.removed_at.is_(None),
+                    func.upper(Artifact.artifact_id).in_(references),
+                )
+            ).scalars().all()
+            found = {artifact.artifact_id.upper(): artifact for artifact in rows}
+            missing = [reference for reference in references if reference not in found]
+            if missing:
+                raise ValueError(
+                    "These artifact IDs were not found in active evidence for this case: "
+                    + ", ".join(missing)
+                )
+            if len(references) > self.max_artifacts:
+                raise ValueError(f"Ask about at most {self.max_artifacts} artifact IDs at a time.")
+            return [self._as_item(session, found[reference], score=None, source="exact artifact ID")
+                    for reference in references]
+
         results: list[dict] = []
         try:
             from app.artifacts.service import SearchService
@@ -824,9 +1103,10 @@ class AskWorker(QObject):
         artifact_type = getattr(artifact_type, "value", artifact_type) or "file"
         name = getattr(artifact, "name", "") or "artifact"
         path = getattr(artifact, "source_path", "") or ""
-        content = (getattr(artifact, "content_text", "") or "").strip()
+        # Passage offsets refer to the original stored text, including whitespace.
+        content = getattr(artifact, "content_text", "") or ""
 
-        if not content:
+        if not content.strip():
             # Artifacts without extracted text still give the model useful
             # metadata instead of an empty context block.
             parts = [f"{name} ({artifact_type})"]
@@ -883,6 +1163,10 @@ class AskWorker(QObject):
             "name": name,
             "path": path,
             "artifact_type": artifact_type,
+            "content_warning": (
+                "This image's visual contents have not been inspected. Do not infer what it depicts."
+                if str(artifact_type).lower() == "image" else ""
+            ),
             "content_text": content,
             "passage_start": char_start,
             "passage_end": char_start + len(content),
@@ -963,23 +1247,25 @@ class AskWorker(QObject):
             "conversation_history": (
                 self.conversation_history if mode == "conversation" else []
             ),
-            "model": (
-                config.ollama.cloud_model
-                if config.ollama.provider == "openai"
-                else config.ollama.model
-            ),
-            "provider": config.ollama.provider,
-            "api_base_url": config.ollama.cloud_base_url,
-            "api_key": cloud_api_key(config),
-            "max_tokens": config.ollama.max_tokens,
+            "model": self.model,
+            "provider": self.provider,
+            "api_base_url": (self.api_base_url if self.api_base_url is not None else
+                             (config.ollama.cloud_base_url if self.provider == "openai" else "")),
+            "api_key": (self.api_key if self.api_key is not None else cloud_api_key(config)) if self.provider == "openai" else "",
+            "max_tokens": _interactive_output_limit(config.ollama.max_tokens),
             "context_window_tokens": config.ollama.context_window_tokens,
             "timeout_seconds": config.ollama.timeout_seconds,
             "temperature": config.ollama.temperature,
         }
         url = f"{config.worker.url}/generate"
         try:
+            request_started = time.perf_counter()
             with httpx.Client(timeout=config.worker.timeout_seconds) as client:
                 response = client.post(url, json=payload)
+            logger.info(
+                "AI worker round trip: duration_ms=%.1f",
+                (time.perf_counter() - request_started) * 1000,
+            )
         except httpx.ConnectError as exc:
             raise RuntimeError(
                 f"Cannot reach the forensic worker at {config.worker.url}. "
@@ -1002,7 +1288,7 @@ class AskWorker(QObject):
             raise RuntimeError(f"The worker returned an invalid response: {exc}") from exc
         if not data.get("success"):
             raise RuntimeError(
-                data.get("error") or "The AI model did not return an answer."
+                "The selected AI provider could not generate an answer. Check its connection in Settings."
             )
         answer = (data.get("answer") or "").strip()
         if not answer:
@@ -1012,7 +1298,7 @@ class AskWorker(QObject):
 class AIAnalysisPage(ResponsivePage):
     CASE_TOPIC_TERMS = re.compile(
         r"\b(case|evidence|artifact|suspect|device|file|email|timeline|event|hash|"
-        r"examin\w*|forensic|report|finding|activity|log|image|disk|partition|"
+        r"examin\w*|forensic|report|finding|activit(?:y|ies)|log|image|disk|partition|"
         r"deleted|browser|account|network|malware|document|docx|pdf|xlsx|pptx|"
         r"photo|metadata|timestamp|custody|"
         r"investigation|investigat\w*)\b",
@@ -1025,6 +1311,11 @@ class AIAnalysisPage(ResponsivePage):
     def _setup_layout(self):
         self._status_thread: QThread | None = None
         self._status_worker: StatusCheckWorker | None = None
+        self._model_thread: QThread | None = None
+        self._model_worker: ModelDiscoveryWorker | None = None
+        self._model_refresh_pending = False
+        self._model_selection = None
+        self._model_shutting_down = False
         self._status_case_id: int | None = None
         self._embedding_download_thread: QThread | None = None
         self._embedding_download_worker: EmbeddingModelPullWorker | None = None
@@ -1034,7 +1325,7 @@ class AIAnalysisPage(ResponsivePage):
         self._last_exchange: dict | None = None
         self._last_exchange_saved = False
         self._conversation_history: list[dict[str, str]] = []
-        self._pending_widget: ChatMessageWidget | None = None
+        self._pending_widget: PendingResponseWidget | None = None
         self._messages: list[QWidget] = []
 
         layout = QVBoxLayout(self)
@@ -1083,10 +1374,19 @@ class AIAnalysisPage(ResponsivePage):
         self.chat_scroll.setWidget(self.chat_container)
         chat_layout.addWidget(self.chat_scroll, 1)
 
-        # Keep options and actions on separate rows so the chat controls remain
-        # usable when the window or citation pane is narrow.
+        # Keep case-wide options above the composer; the model belongs beside
+        # the message it will be used to send.
         options_column = QVBoxLayout()
         options_column.setSpacing(Spacing.XS)
+        self.model_combo = ChatModelCombo()
+        self.model_combo.setAccessibleName("Chat model")
+        self.model_combo.setFixedWidth(180)
+        self.model_combo.setToolTip(
+            "Select a configured model for this session. Configure providers in Settings. "
+            "The status strip shows the Settings default; local chat requires Ollama running."
+        )
+        self.model_combo.addItem("Models not yet checked", None)
+        self.model_combo.currentIndexChanged.connect(self._remember_model_selection)
         self.graph_expansion_check = QCheckBox("Expand through entity graph")
         self.graph_expansion_check.setToolTip(
             "Include up to 10 active artifacts linked to retrieved artifacts by recorded entity relationships."
@@ -1104,23 +1404,37 @@ class AIAnalysisPage(ResponsivePage):
         options_column.addWidget(self.cloud_consent_check)
         chat_layout.addLayout(options_column)
 
-        input_row = QHBoxLayout()
-        self.input_edit = QLineEdit()
+        composer = QFrame()
+        composer.setObjectName("ChatComposer")
+        composer.setStyleSheet(
+            "QFrame#ChatComposer { background: palette(base); "
+            "border: 1px solid palette(mid); border-radius: 12px; }"
+            "QFrame#ChatComposer QLineEdit { background: transparent; border: none; }"
+        )
+        composer_layout = QVBoxLayout(composer)
+        composer_layout.setContentsMargins(12, 8, 12, 8)
+        composer_layout.setSpacing(4)
+        self.input_edit = HistoryLineEdit()
         self.input_edit.setPlaceholderText(
             "Chat naturally, or ask me to look into this case..."
         )
         self.input_edit.setToolTip(
             "Chat naturally. When you ask about this case, I’ll search its examined evidence. "
-            "Press Enter or Send."
+            "Press Enter or Send. Use Up and Down to recall previous questions."
         )
         self.input_edit.returnPressed.connect(self._on_send)
-        input_row.addWidget(self.input_edit, 1)
+        self.input_edit.setMinimumHeight(40)
+        composer_layout.addWidget(self.input_edit)
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.model_combo)
+        input_row.addStretch(1)
 
         self.send_btn = QPushButton("Send")
-        self.send_btn.setToolTip("Send your message to the local AI assistant.")
-        self.send_btn.clicked.connect(self._on_send)
+        self.send_btn.setToolTip("Send your message to the selected AI model.")
+        self.send_btn.clicked.connect(self._send_or_stop)
         input_row.addWidget(self.send_btn)
-        chat_layout.addLayout(input_row)
+        composer_layout.addLayout(input_row)
+        chat_layout.addWidget(composer)
 
         action_row = QHBoxLayout()
         action_row.addStretch()
@@ -1153,6 +1467,7 @@ class AIAnalysisPage(ResponsivePage):
         configure_detail_splitter(splitter, preferred_detail_width=340)
         layout.addWidget(splitter, 1)
 
+        self._refresh_models()
         self._reset_conversation()
 
     # ------------------------------------------------------------------
@@ -1164,13 +1479,42 @@ class AIAnalysisPage(ResponsivePage):
         if previous != getattr(context, "case_id", None):
             self._reset_conversation()
             self._load_saved_conversation()
-        config = get_config()
-        self.cloud_consent_check.setVisible(
-            config.ollama.provider == "openai"
-            or config.embeddings.provider == "openai"
-        )
+        self._refresh_models()
         self._load_cloud_consent()
+        self._update_write_controls()
         self._refresh_status()
+
+    def _update_write_controls(self):
+        """Disable write controls for READ_ONLY users."""
+        getter = getattr(self.nav, "get_current_user", None)
+        user = getter() if callable(getter) else None
+        is_read_only = user is not None and user.role == UserRole.READ_ONLY
+        self.model_combo.setEnabled(not is_read_only)
+        self.graph_expansion_check.setEnabled(not is_read_only)
+        self.cloud_consent_check.setEnabled(not is_read_only)
+        if is_read_only:
+            self.model_combo.setToolTip("Read-only users cannot change the chat model.")
+            self.graph_expansion_check.setToolTip("Read-only users cannot enable graph expansion.")
+            self.cloud_consent_check.setToolTip("Read-only users cannot change cloud consent.")
+
+    def _require_writer(self):
+        """Check if the current user can perform write actions.
+
+        Returns the user if they have write permission, otherwise shows a warning
+        and returns None.
+        """
+        getter = getattr(self.nav, "get_current_user", None)
+        user = getter() if callable(getter) else None
+        if user is None:
+            QMessageBox.warning(self, "No User", "Could not identify the signed-in user")
+            return None
+        from app.auth.models import UserRole
+        if user.role == UserRole.READ_ONLY:
+            QMessageBox.warning(
+                self, "Permission denied", "Read-only users cannot perform AI analysis."
+            )
+            return None
+        return user
 
     def _load_cloud_consent(self) -> None:
         """Load the persisted, case-specific cloud data consent state."""
@@ -1195,6 +1539,11 @@ class AIAnalysisPage(ResponsivePage):
     def _on_cloud_consent_toggled(self, enabled: bool) -> None:
         """Record or revoke cloud consent for the currently open case."""
         if not self._case_id:
+            return
+        if self._require_writer() is None:
+            self.cloud_consent_check.blockSignals(True)
+            self.cloud_consent_check.setChecked(not enabled)
+            self.cloud_consent_check.blockSignals(False)
             return
         if enabled:
             answer = QMessageBox.question(
@@ -1252,17 +1601,84 @@ class AIAnalysisPage(ResponsivePage):
 
     def on_page_shown(self):
         """Re-check the services whenever the page is opened."""
+        self._refresh_models()
         self._refresh_status()
 
     def shutdown(self) -> None:
         """Stop the status/ask threads so closing the window cannot abort Qt."""
+        if self._pending_widget is not None:
+            self._pending_widget.stop()
         qt_threads.stop(self._status_thread)
+        self._model_shutting_down = True
+        qt_threads.stop(self._model_thread)
         qt_threads.stop(self._embedding_download_thread)
         for thread in list(self._ask_threads):
             qt_threads.stop(thread, wait_ms=1000)
 
     def refresh(self):
+        self._refresh_models()
         self._refresh_status()
+
+    def _refresh_models(self):
+        config = get_config()
+        connections = getattr(config.ollama, "chat_connections", None)
+        cloud_ready = any(c.provider == "openai" and getattr(c, "enabled", True) for c in connections or [])
+        self.cloud_consent_check.setVisible(cloud_ready or config.embeddings.provider == "openai")
+        if self._model_shutting_down:
+            return
+        if self._model_selection is None and connections is None:
+            self._model_selection = (config.ollama.provider, config.ollama.cloud_model.strip()
+                                     if config.ollama.provider == "openai" else config.ollama.model.strip())
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        if connections is not None:
+            for connection in connections:
+                if not getattr(connection, "enabled", True) or connection.provider not in ("ollama", "openai"):
+                    continue
+                if connection.provider == "openai" and not connection_api_key(connection).strip():
+                    # A saved model ID without usable credentials is not a
+                    # configured cloud connection. Keep it in Settings, but
+                    # do not offer it as an actionable chat model.
+                    continue
+                if (connection.provider == "ollama" and getattr(connection, "base_url", "")
+                        and connection.base_url.rstrip("/") != getattr(config.ollama, "host", connection.base_url).rstrip("/")):
+                    continue
+                if connection.provider == "openai" and hasattr(connection, "base_url") and not connection.base_url.strip():
+                    continue
+                seen = set()
+                for model in connection.models:
+                    model_id = model.id.strip()
+                    if model.enabled and model_id and model_id not in seen:
+                        seen.add(model_id)
+                        self.model_combo.addItem(f"{connection.name} — {model_id}", (connection.id, model_id))
+        else:
+            for provider, label, models in (
+                ("ollama", "Local", config.ollama.chat_local_models or []),
+                ("openai", "Cloud", config.ollama.chat_cloud_models or []),
+            ):
+                for model in dict.fromkeys(m.strip() for m in models if m.strip()):
+                    self.model_combo.addItem(f"{label} — {model}", (provider, model))
+        index = next((i for i in range(self.model_combo.count())
+                      if self.model_combo.itemData(i) == self._model_selection), -1)
+        if not self.model_combo.count():
+            self.model_combo.addItem("No configured models", None)
+        self.model_combo.setCurrentIndex(max(index, 0))
+        self.model_combo.blockSignals(False)
+        self._remember_model_selection()
+        self._update_write_controls()
+
+    def _remember_model_selection(self):
+        self._model_selection = self.model_combo.currentData()
+        if isinstance(self.model_combo, QComboBox):
+            getter = getattr(self.nav, "get_current_user", None)
+            user = getter() if callable(getter) else None
+            is_read_only = user is not None and user.role == UserRole.READ_ONLY
+            if is_read_only:
+                self.model_combo.setToolTip("Read-only users cannot change the chat model.")
+            else:
+                self.model_combo.setToolTip(
+                    f"{self.model_combo.currentText()}\nModels configured in Settings; availability is not verified."
+                )
 
     @property
     def _case_id(self) -> int:
@@ -1273,7 +1689,9 @@ class AIAnalysisPage(ResponsivePage):
         self._last_exchange = None
         self._last_exchange_saved = False
         self._conversation_history = []
-        self._pending_widget = None
+        self.input_edit.set_history([])
+        self.input_edit.clear()
+        self._remove_pending()
         self._clear_chat()
         self.citation_panel.set_citations([])
         self._set_busy(False)
@@ -1336,6 +1754,9 @@ class AIAnalysisPage(ResponsivePage):
             if service is not None:
                 service.session.close()
 
+        self.input_edit.set_history([
+            message.get("content") or "" for message in messages if message.get("role") == "user"
+        ])
         if not messages:
             return
         self._remove_hint()
@@ -1361,6 +1782,8 @@ class AIAnalysisPage(ResponsivePage):
     def _on_clear_context(self):
         if not self._case_id:
             self._reset_conversation()
+            return
+        if self._require_writer() is None:
             return
         answer = QMessageBox.question(
             self,
@@ -1535,17 +1958,38 @@ class AIAnalysisPage(ResponsivePage):
     # Chat
     # ------------------------------------------------------------------
     def _set_busy(self, busy: bool):
-        self.send_btn.setEnabled(not busy)
-        self.send_btn.setText("Thinking…" if busy else "Send")
-        self.input_edit.setEnabled(not busy)
+        getter = getattr(self.nav, "get_current_user", None)
+        user = getter() if callable(getter) else None
+        is_read_only = user is not None and user.role == UserRole.READ_ONLY
+
+        self.send_btn.setEnabled(not is_read_only)
+        self.send_btn.setText("Stop" if busy else "Send")
+        self.input_edit.setEnabled(not busy and not is_read_only)
+        self.model_combo.setEnabled(not busy and not is_read_only)
+        self.graph_expansion_check.setEnabled(not is_read_only)
+        self.cloud_consent_check.setEnabled(not is_read_only)
         self.save_finding_btn.setEnabled(
             (not busy)
+            and (not is_read_only)
             and self._last_exchange is not None
             and not self._last_exchange_saved
         )
 
+    def _send_or_stop(self):
+        if self._active_request is None:
+            self._on_send()
+            return
+        self._ask_worker.cancelled.set()
+        self._active_request = None
+        self._remove_pending()
+        self._set_busy(False)
+        self._add_message("Response stopped.", is_user=False)
+        self.citation_panel.set_message("Response stopped; no results were saved.")
+
     def _download_embedding_model(self):
         if self._embedding_download_thread is not None:
+            return
+        if self._require_writer() is None:
             return
         config = get_config()
         if config.embeddings.provider == "openai":
@@ -1607,13 +2051,38 @@ class AIAnalysisPage(ResponsivePage):
             )
             return
 
+        if self._require_writer() is None:
+            return
+
+        selection = self.model_combo.currentData()
+        if not selection:
+            QMessageBox.warning(self, "No chat model", "Configure a chat model in Settings first.")
+            return
+
+        connections = getattr(get_config().ollama, "chat_connections", None)
+        connection = None
+        if connections is not None:
+            connection = next((c for c in connections if c.id == selection[0]
+                               and getattr(c, "enabled", True)
+                               and any(m.enabled and m.id.strip() == selection[1] for m in c.models)), None)
+            if connection is None:
+                QMessageBox.warning(self, "Chat model unavailable", "Refresh the models configured in Settings.")
+                return
+        provider = connection.provider if connection else selection[0]
+        if provider == "openai" and not self.cloud_consent_check.isChecked():
+            QMessageBox.warning(self, "Cloud consent required", "Allow cloud AI for this case before sending any chat or evidence.")
+            return
+
+        self.input_edit.add_question(question)
         self.input_edit.clear()
         self._remove_hint()
 
         # Only explicit case-related messages trigger evidence retrieval.
         # Ordinary conversation is answered naturally without adding case
         # details or forcing the user back to the investigation.
-        is_conversation = not self.CASE_TOPIC_TERMS.search(question)
+        is_conversation = not (
+            self.CASE_TOPIC_TERMS.search(question) or ARTIFACT_REFERENCE.search(question)
+        )
         mode = "conversation" if is_conversation else "analysis"
         self._add_message(question, is_user=True)
         self._save_chat_message("user", question, mode=mode)
@@ -1622,12 +2091,7 @@ class AIAnalysisPage(ResponsivePage):
             self._last_exchange_saved = False
             self.save_finding_btn.setEnabled(False)
 
-        self._pending_widget = ChatMessageWidget(
-            "💬 Thinking…" if is_conversation else
-            "⏳ Retrieving case artifacts and asking the local model… "
-            "a long answer can take a few minutes on a CPU.",
-            is_user=False,
-        )
+        self._pending_widget = PendingResponseWidget(conversation=is_conversation)
         self.chat_layout.addWidget(self._pending_widget)
         self._messages.append(self._pending_widget)
         self._scroll_to_bottom()
@@ -1654,6 +2118,10 @@ class AIAnalysisPage(ResponsivePage):
             conversation_history=self._conversation_history,
             expand_graph=self.graph_expansion_check.isChecked(),
             cloud_consent=self.cloud_consent_check.isChecked(),
+            provider=provider,
+            model=selection[1],
+            api_base_url=connection.base_url if connection else None,
+            api_key=connection_api_key(connection) if connection and provider == "openai" else None,
         )
         self._ask_worker.moveToThread(self._ask_thread)
         self._ask_thread.started.connect(self._ask_worker.run)
@@ -1725,6 +2193,7 @@ class AIAnalysisPage(ResponsivePage):
         self._pending_widget = None
         if widget is None:
             return
+        widget.stop()
         self.chat_layout.removeWidget(widget)
         if widget in self._messages:
             self._messages.remove(widget)
@@ -1790,6 +2259,8 @@ class AIAnalysisPage(ResponsivePage):
             )
             return
         if self._case_id == 0:
+            return
+        if self._require_writer() is None:
             return
 
         try:

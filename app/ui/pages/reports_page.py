@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from app.reports.models import Report
 from app.reports.templates import (
+    BUILTIN_DEFAULT_ID,
     SECTION_LABELS,
     ReportTemplate,
     TemplateError,
@@ -150,8 +151,8 @@ class ReportGenerateDialog(QDialog):
         template_row = QHBoxLayout()
         self.template_combo = QComboBox()
         self.template_combo.setToolTip(
-            "The court-admissible default includes authority and scope, examiner "
-            "declaration, methodology, integrity hashes and a signed certification."
+            "Choose a layout and review its sections. Admissibility is not guaranteed; "
+            "investigator and legal review under applicable jurisdiction rules is required."
         )
         template_row.addWidget(self.template_combo, 1)
 
@@ -204,7 +205,7 @@ class ReportGenerateDialog(QDialog):
         self.template_combo.clear()
         selected_index = 0
         for index, template in enumerate(self.templates):
-            label = template.name + ("  (default)" if template.builtin else "")
+            label = template.name + ("  (default)" if template.template_id == BUILTIN_DEFAULT_ID else "")
             self.template_combo.addItem(label, template.template_id)
             if template.template_id == selected_template_id:
                 selected_index = index
@@ -222,7 +223,7 @@ class ReportGenerateDialog(QDialog):
         template = self._selected_template()
         if template is None:
             return
-        source = "Built-in default template" if template.builtin else template.source_label
+        source = template.source_label
         self.template_info.setText(
             f"{template.description}\n\n"
             f"Organisation: {template.organization}  ·  Jurisdiction: {template.jurisdiction}\n"
@@ -322,11 +323,9 @@ class ReportTemplatesDialog(QDialog):
         layout.addWidget(heading)
 
         intro = QLabel(
-            "The built-in default produces a court-oriented report: authority and scope, "
-            "examiner declaration, methodology and standards, evidence integrity hashes, "
-            "verified findings kept apart from unverified work product, limitations and a "
-            "signed certification page. Upload your laboratory's template to reuse its "
-            "wording; placeholders such as {{case_id}} are filled in automatically."
+            "Choose a built-in layout or upload your laboratory's template. Investigator "
+            "and legal review under the applicable jurisdiction's rules is required; "
+            "admissibility is not guaranteed. Placeholders such as {{case_id}} are filled in automatically."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
@@ -451,7 +450,7 @@ class ReportTemplatesDialog(QDialog):
             warning = (
                 "<p style='color:#f59e0b;'><b>Court checklist:</b> this template omits "
                 + html.escape(", ".join(missing_core))
-                + ". Consider keeping those sections for an admissible report.</p>"
+                + ". Review which sections are needed for the intended purpose.</p>"
             )
         self.details.setText(
             f"<p><b>{html.escape(template.name)}</b><br>"
@@ -468,7 +467,7 @@ class ReportTemplatesDialog(QDialog):
         self.save_btn.setEnabled(True)
         self.delete_btn.setEnabled(not template.builtin)
         self.delete_btn.setToolTip(
-            "The built-in default template cannot be deleted."
+            "Built-in templates cannot be deleted."
             if template.builtin else "Delete this uploaded template."
         )
 
@@ -706,6 +705,24 @@ class ReportsPage(ResponsivePage):
         self._refresh_template_label()
         self.refresh()
 
+    def _require_writer(self) -> User | None:
+        """Check if current user has write permissions. Returns user if allowed, None if denied."""
+        # ReportsPage receives current_user via set_report_service; fallback to nav if available
+        user = getattr(self, "current_user", None)
+        if user is None:
+            getter = getattr(self.nav, "get_current_user", None) if hasattr(self, "nav") else None
+            user = getter() if callable(getter) else None
+        if user is None:
+            QMessageBox.warning(self, "No User", "Could not identify the signed-in user")
+            return None
+        from app.auth.models import UserRole
+        if user.role == UserRole.READ_ONLY:
+            QMessageBox.warning(
+                self, "Permission denied", "Read-only users cannot perform this action."
+            )
+            return None
+        return user
+
     def on_page_shown(self):
         self.refresh()
 
@@ -728,7 +745,7 @@ class ReportsPage(ResponsivePage):
         except Exception as exc:
             self.template_label.setText(f"Active template: unavailable ({exc})")
             return
-        uploaded = max(0, len(templates) - 1)
+        uploaded = sum(not template.builtin for template in templates)
         self.template_label.setText(
             f"Active template: {default.name}  ·  {uploaded} uploaded template(s)  ·  "
             "use Report Templates to upload or inspect a template"
@@ -740,6 +757,9 @@ class ReportsPage(ResponsivePage):
 
     # -------------------------------------------------------------- actions
     def _on_manage_templates(self):
+        user = self._require_writer()
+        if user is None:
+            return
         if not self.report_service:
             QMessageBox.warning(self, "Not Ready", "Report service not available")
             return
@@ -754,6 +774,9 @@ class ReportsPage(ResponsivePage):
             self._refresh_template_label()
 
     def _on_generate(self):
+        user = self._require_writer()
+        if user is None:
+            return
         if not self.case_context or not self.report_service or not self.current_user:
             QMessageBox.warning(self, "Not Ready", "Report service not available")
             return

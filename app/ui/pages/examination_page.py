@@ -1,33 +1,54 @@
 """Examination Page."""
 from __future__ import annotations
 
-from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableView, QHeaderView,
-    QAbstractItemView, QPushButton, QSplitter, QFrame, QComboBox,
-    QLabel, QProgressBar, QTextEdit, QTabWidget, QMessageBox, QDialog,
-    QFormLayout, QDialogButtonBox, QSpinBox, QCheckBox, QToolButton,
-    QGroupBox, QLineEdit, QScrollArea, QApplication, QProgressDialog
-)
 import json
 import math
 from datetime import datetime, timezone
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QFont
 
-from app.ui.base import ResponsivePage, CaseContext
-from app.ui.theme.tokens import Color, Spacing, Typography
-from app.util.time import format_local
+from PySide6.QtCore import QItemSelectionModel, Qt, QTimer, Signal
+from PySide6.QtGui import QFont, QStandardItem, QStandardItemModel
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressBar,
+    QProgressDialog,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTableView,
+    QTabWidget,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from app.evidence.models import Evidence, EvidenceStatus
+from app.evidence.service import EvidenceService
 from app.examination.models import ExaminationJob, ExaminationOperation, JobStatus
 from app.examination.profiles import (
-    PROFILES,
     DEFAULT_PROFILE,
+    PROFILES,
     parameter_summary,
     profile_parameters,
     validate_parameters,
 )
 from app.examination.service import ExaminationService
-from app.evidence.service import EvidenceService
-from app.evidence.models import Evidence, EvidenceStatus
+from app.ui.base import CaseContext, ResponsivePage
+from app.ui.theme.tokens import Color, Spacing, Typography
+from app.util.time import format_local
 
 
 def _enum_text(value) -> str:
@@ -155,8 +176,9 @@ def _job_time_text(job, now: datetime | None = None) -> tuple[str, str]:
 class ExaminationPage(ResponsivePage):
     start_finished = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, nav=None, parent: QWidget | None = None):
         super().__init__(parent=parent)
+        self.nav = nav
         self.case_context: CaseContext | None = None
         self.exam_service: ExaminationService | None = None
         self.evidence_service: EvidenceService | None = None
@@ -180,14 +202,27 @@ class ExaminationPage(ResponsivePage):
 
         # Evidence selector
         selector_row = QHBoxLayout()
-        selector_row.addWidget(QLabel("Evidence:"))
+        evidence_title = QLabel("Evidence")
+        evidence_title.setFont(QFont(Typography.FONT_FAMILY, Typography.HEADING_SM[0], Typography.HEADING_SM[1]))
+        selector_row.addWidget(evidence_title)
         self.evidence_combo = QComboBox()
-        self.evidence_combo.setMinimumWidth(300)
-        selector_row.addWidget(self.evidence_combo)
-        selector_row.addSpacing(Spacing.LG)
+        self.evidence_combo.hide()
 
         selector_row.addStretch()
         layout.addLayout(selector_row)
+
+        self.evidence_table = QTableView()
+        self.evidence_model = QStandardItemModel()
+        self.evidence_model.setHorizontalHeaderLabels(["Evidence ID", "Name", "Integrity", "Status"])
+        self.evidence_table.setModel(self.evidence_model)
+        self.evidence_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.evidence_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.evidence_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.evidence_table.verticalHeader().hide()
+        self.evidence_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.evidence_table.setMaximumHeight(200)
+        self.evidence_table.selectionModel().selectionChanged.connect(self._on_evidence_row_selected)
+        layout.addWidget(self.evidence_table)
 
         self.selector_hint = QLabel()
         self.selector_hint.setWordWrap(True)
@@ -200,7 +235,7 @@ class ExaminationPage(ResponsivePage):
         self._update_hint()
 
         # Jobs table
-        jobs_label = QLabel("Examination Jobs")
+        jobs_label = QLabel("Examination history")
         jobs_label.setFont(QFont(Typography.FONT_FAMILY, Typography.HEADING_SM[0], Typography.HEADING_SM[1]))
         layout.addWidget(jobs_label)
 
@@ -208,7 +243,10 @@ class ExaminationPage(ResponsivePage):
         self.jobs_model = JobTableModel(self.jobs_table)
         self.jobs_table.setModel(self.jobs_model)
         self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.jobs_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.jobs_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.jobs_table.setToolTip(
+            "Select one job for its details. Hold Ctrl or Shift to select several jobs for deletion."
+        )
         self.jobs_table.setAlternatingRowColors(True)
         self.jobs_table.verticalHeader().setVisible(False)
         jobs_header = self.jobs_table.horizontalHeader()
@@ -222,14 +260,14 @@ class ExaminationPage(ResponsivePage):
         # Action buttons
         btn_row = QHBoxLayout()
         
-        self.new_job_btn = QPushButton("New Job")
+        self.new_job_btn = QPushButton("Choose examination and start")
         self.new_job_btn.setToolTip(
-            "Choose evidence and configure the operation for a new job."
+            "Choose an examination for the selected verified evidence and start it."
         )
         self.new_job_btn.clicked.connect(self._on_new_job)
         btn_row.addWidget(self.new_job_btn)
 
-        self.start_btn = QPushButton("Start Examination")
+        self.start_btn = QPushButton("Retry selected job")
         self.start_btn.setToolTip(
             "Run the selected pending or failed job on the forensic worker."
         )
@@ -345,13 +383,16 @@ class ExaminationPage(ResponsivePage):
         """
         previous = self.evidence_combo.currentData()
         self.evidence_combo.blockSignals(True)
+        self.evidence_table.selectionModel().blockSignals(True)
         self.evidence_combo.clear()
+        self.evidence_model.removeRows(0, self.evidence_model.rowCount())
         self._evidence_list = []
 
         if not self.evidence_service or not self.case_context:
             self.evidence_combo.addItem("No evidence available", None)
             self.evidence_combo.setEnabled(False)
             self.evidence_combo.blockSignals(False)
+            self.evidence_table.selectionModel().blockSignals(False)
             self._update_hint()
             return
 
@@ -367,6 +408,7 @@ class ExaminationPage(ResponsivePage):
             self.evidence_combo.addItem("Evidence could not be loaded", None)
             self.evidence_combo.setEnabled(False)
             self.evidence_combo.blockSignals(False)
+            self.evidence_table.selectionModel().blockSignals(False)
             self.results_log.append(
                 f"Unable to load evidence for this case: {exc}"
             )
@@ -374,7 +416,7 @@ class ExaminationPage(ResponsivePage):
             return
 
         if not self._evidence_list:
-            self.evidence_combo.addItem("No evidence registered", None)
+            self.evidence_combo.addItem("No active evidence", None)
         else:
             self.evidence_combo.addItem("Select evidence...", None)
         for ev in self._evidence_list:
@@ -384,6 +426,12 @@ class ExaminationPage(ResponsivePage):
                 f"{getattr(ev, 'name', 'Unnamed evidence')}"
             )
             self.evidence_combo.addItem(evidence_label, evidence_pk)
+            self.evidence_model.appendRow([
+                QStandardItem(str(getattr(ev, "evidence_id", evidence_pk))),
+                QStandardItem(getattr(ev, "name", "Unnamed evidence")),
+                QStandardItem(self._integrity_label(ev)),
+                QStandardItem(_enum_text(getattr(ev, "status", "")).replace("_", " ").title()),
+            ])
 
         self.evidence_combo.setEnabled(bool(self._evidence_list))
         # Keep the current choice across refreshes so "Start Examination" on the
@@ -392,13 +440,37 @@ class ExaminationPage(ResponsivePage):
             index = self.evidence_combo.findData(previous)
             if index >= 0:
                 self.evidence_combo.setCurrentIndex(index)
+                self.evidence_table.selectRow(index - 1)
         self.evidence_combo.setToolTip(
             "Choose evidence registered to the active case."
             if self._evidence_list
             else "No registered evidence was found for the active case."
         )
         self.evidence_combo.blockSignals(False)
+        self.evidence_table.selectionModel().blockSignals(False)
         self._update_hint()
+
+    @staticmethod
+    def _is_verified_evidence(evidence) -> bool:
+        if evidence.status in (EvidenceStatus.ARCHIVED, EvidenceStatus.INTEGRITY_FAILED):
+            return False
+        references = [item for item in evidence.hashes if item.is_reference]
+        return bool(references) and all(
+            item.verified_at is not None and item.match_result is True for item in references
+        )
+
+    @classmethod
+    def _integrity_label(cls, evidence) -> str:
+        if evidence.status == EvidenceStatus.INTEGRITY_FAILED or any(
+            item.is_reference and item.match_result is False for item in evidence.hashes
+        ):
+            return "Verification failed"
+        return "Verified" if cls._is_verified_evidence(evidence) else "Verification required"
+
+    def _on_evidence_row_selected(self, *_args):
+        rows = self.evidence_table.selectionModel().selectedRows()
+        index = rows[0].row() + 1 if rows else 0
+        self.evidence_combo.setCurrentIndex(index)
 
     def _update_hint(self):
         """Explain what the selectors and buttons do in the current state."""
@@ -408,38 +480,36 @@ class ExaminationPage(ResponsivePage):
         evidence_list = getattr(self, "_evidence_list", [])
         if not evidence_list:
             hint.setText(
-                "No evidence is registered for this case yet — register it on "
-                "the Evidence page, then come back here."
+                "No active evidence is available. Register evidence on the Evidence page first."
             )
             return
         chosen = self.evidence_combo.currentData()
         if chosen is None:
             hint.setText(
-                "Choose evidence, then use New Job to configure its operation "
-                "and create an examination job. Select a pending or failed job to start it."
+                "Select evidence above. Verify its integrity before starting an examination."
             )
             return
         for ev in evidence_list:
             if getattr(ev, "id", None) == chosen:
+                if not self._is_verified_evidence(ev):
+                    hint.setText(
+                        f"{getattr(ev, 'evidence_id', chosen)}: {self._integrity_label(ev)}. "
+                        "On the Evidence page, select this item and choose Verify integrity."
+                    )
+                    return
                 status = _enum_text(getattr(ev, "status", ""))
                 hint.setText(
                     f"Selected: {getattr(ev, 'evidence_id', chosen)} — "
                     f"{getattr(ev, 'name', 'evidence')} ({status}). "
-                    "Use New Job, or select a job below to start it."
+                    "Choose an examination to start, or review its history below."
                 )
                 return
 
     def _on_evidence_changed(self, _index: int = 0):
         """Keep the hint and the selected job in step with the evidence."""
         self._update_hint()
-        evidence_pk = self.evidence_combo.currentData()
-        if evidence_pk is None:
-            return
-        # Jobs are newest first, so this picks the latest one for the evidence.
-        for job in getattr(self, "_jobs", []):
-            if job.evidence_id == evidence_pk:
-                self._select_job(job.job_id)
-                return
+        if getattr(self, "exam_service", None) and getattr(self, "case_context", None):
+            self.refresh()
 
     def start_examination_for(self, evidence_pk: int) -> None:
         """Show this page ready for ``evidence_pk`` (used by the Evidence page)."""
@@ -485,12 +555,29 @@ class ExaminationPage(ResponsivePage):
             self._update_buttons()
             return
 
-        previous = self._selected_job.job_id if self._selected_job else None
         try:
-            jobs = self.exam_service.list_jobs(self.case_context.case_id)
+            previous = {job.job_id for job in self._selected_jobs()}
+        except Exception:
+            previous = set()
+
+        try:
+            evidence_id = self.evidence_combo.currentData()
+            jobs = (
+                self.exam_service.list_jobs(self.case_context.case_id, evidence_id=evidence_id)
+                if evidence_id is not None else []
+            )
             self._jobs = list(jobs or [])
+            self.jobs_table.selectionModel().blockSignals(True)
             self.jobs_model.populate(self._jobs)
+            for row, job in enumerate(self._jobs):
+                if job.job_id in previous:
+                    self.jobs_table.selectionModel().select(
+                        self.jobs_model.index(row, 0),
+                        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                    )
+            self.jobs_table.selectionModel().blockSignals(False)
         except Exception as exc:
+            self.jobs_table.selectionModel().blockSignals(False)
             self._jobs = []
             self.jobs_model.populate([])
             self._selected_job = None
@@ -498,21 +585,30 @@ class ExaminationPage(ResponsivePage):
             self.results_log.append(f"Unable to refresh examination jobs: {exc}")
             return
 
-        if previous and self._select_job(previous):
+        if previous:
+            self._on_job_selected()
             return
         self._selected_job = None
         self._update_buttons()
 
     def _update_buttons(self):
         job = self._selected_job
+        selected = self._selected_jobs()
+        selected_evidence = next(
+            (item for item in self._evidence_list if item.id == self.evidence_combo.currentData()),
+            None,
+        )
+        verified = selected_evidence is not None and self._is_verified_evidence(selected_evidence)
         running = job is not None and job.status == JobStatus.RUNNING
         progress_message = (job.progress_message or "").lower() if job else ""
         paused = progress_message.startswith("paused")
         pausing = progress_message.startswith("pausing")
         cancelling = progress_message.startswith("cancelling")
-        self.start_btn.setText("Running..." if self._starting else "Start Examination")
+        self.start_btn.setText("Running..." if self._starting else "Retry selected job")
+        self.new_job_btn.setEnabled(verified and not self._starting)
         self.start_btn.setEnabled(
             not self._starting
+            and verified
             and job is not None
             and job.status in (
                 JobStatus.PENDING,
@@ -541,9 +637,14 @@ class ExaminationPage(ResponsivePage):
         self.delete_job_btn.setEnabled(
             not self._starting
             and not (self._delete_thread and self._delete_thread.isRunning())
-            and job is not None
-            and job.status != JobStatus.RUNNING
+            and bool(selected)
+            and all(item.status != JobStatus.RUNNING for item in selected)
         )
+        self.delete_job_btn.setText(f"Delete {len(selected)} Jobs" if len(selected) > 1 else "Delete Job")
+
+    def _selected_jobs(self):
+        return [self._jobs[index.row()] for index in self.jobs_table.selectionModel().selectedRows()
+                if 0 <= index.row() < len(self._jobs)]
 
     def _select_job(self, job_id: str) -> bool:
         """Select the row for ``job_id`` in the jobs table."""
@@ -560,6 +661,15 @@ class ExaminationPage(ResponsivePage):
         if not indexes:
             self._selected_job = None
             self._update_buttons()
+            return
+        if len(indexes) > 1:
+            self._selected_job = None
+            self._update_buttons()
+            self.results_log.setPlainText(
+                f"{len(indexes)} jobs selected. Select one job to see its details, "
+                "or delete the selected jobs."
+            )
+            self.results_summary.clear()
             return
         row = indexes[0].row()
         if 0 <= row < len(self._jobs):
@@ -594,7 +704,8 @@ class ExaminationPage(ResponsivePage):
         self.results_log.append("---")
 
         self.results_summary.clear()
-        for result in job.results:
+        results = self.exam_service.get_job_result_summaries(job.id)
+        for result in results:
             self.results_summary.append(f"Type: {result.result_type}")
             self.results_summary.append(f"Summary: {result.summary or 'N/A'}")
             self.results_summary.append(f"Artifacts: {result.artifact_count}")
@@ -615,6 +726,14 @@ class ExaminationPage(ResponsivePage):
             )
             return
 
+        selected_evidence = next(
+            (item for item in self._evidence_list if item.id == self._selected_job.evidence_id),
+            None,
+        )
+        if selected_evidence is None or not self._is_verified_evidence(selected_evidence):
+            QMessageBox.warning(self, "Verification required", "Verify this evidence on the Evidence page before starting an examination.")
+            return
+
         if self._selected_job.status not in (
             JobStatus.PENDING, JobStatus.FAILED, JobStatus.INTERRUPTED
         ):
@@ -625,6 +744,10 @@ class ExaminationPage(ResponsivePage):
             return
 
         if self._starting:
+            return
+
+        user = self._require_writer()
+        if user is None:
             return
 
         import threading
@@ -795,6 +918,10 @@ class ExaminationPage(ResponsivePage):
             )
             return
 
+        user = self._require_writer()
+        if user is None:
+            return
+
         session = self.exam_service.session
         try:
             cancelled = self.exam_service.cancel_job(job.id)
@@ -832,6 +959,11 @@ class ExaminationPage(ResponsivePage):
             job = self.exam_service.get_job_by_job_id(self._active_job_id)
         if job is None or job.status != JobStatus.RUNNING:
             return
+
+        user = self._require_writer()
+        if user is None:
+            return
+
         paused = (job.progress_message or "").lower().startswith("paused")
         if not self.exam_service.pause_job(job.id, pause=not paused):
             self.results_log.append(
@@ -848,19 +980,24 @@ class ExaminationPage(ResponsivePage):
     def _on_delete_job(self):
         if self._delete_thread and self._delete_thread.isRunning():
             return
-        if not self._selected_job or not self.exam_service:
+        selected = self._selected_jobs()
+        if not selected or not self.exam_service:
             return
-        job = self._selected_job
-        if job.status == JobStatus.RUNNING:
+        if any(job.status == JobStatus.RUNNING for job in selected):
             QMessageBox.information(
                 self, "Job cannot be deleted",
                 "A running examination cannot be deleted. Wait for it to finish first.",
             )
             return
+
+        user = self._require_writer()
+        if user is None:
+            return
+
         answer = QMessageBox.question(
             self, "Delete Examination Job",
-            f"Delete job {job.job_id} ({_enum_text(job.operation)})?\n\n"
-            "This removes the job, artifacts produced by that run, and their derived "
+            f"Delete {len(selected)} selected examination job(s)?\n\n"
+            "This removes the selected jobs, artifacts produced by those runs, and their derived "
             "analysis results. The source evidence remains. This action is audited.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -870,7 +1007,7 @@ class ExaminationPage(ResponsivePage):
         from app.ui import qt_threads
         from app.ui.deletion_worker import DeletionWorker
 
-        self._delete_thread = DeletionWorker("examination", job.id, 1)
+        self._delete_thread = DeletionWorker("examination_batch", [job.id for job in selected], 1)
         qt_threads.track(self._delete_thread)
         self.delete_job_btn.setEnabled(False)
         self.delete_job_btn.setText("Deleting…")
@@ -894,7 +1031,9 @@ class ExaminationPage(ResponsivePage):
         self.exam_service.session.expire_all()
         self._selected_job = None
         self.refresh()
-        self.results_log.append("Examination deleted.")
+        self.results_log.append(f"Deleted {_result.get('deleted', 0)} examination job(s).")
+        if _result.get("errors"):
+            QMessageBox.warning(self, "Some jobs were not deleted", "\n".join(_result["errors"]))
 
     def _on_delete_failed(self, error):
         self._delete_progress.close()
@@ -910,6 +1049,18 @@ class ExaminationPage(ResponsivePage):
         from app.ui import qt_threads
         qt_threads.stop(self._delete_thread, wait_ms=5000)
 
+    def _require_writer(self):
+        getter = getattr(self.nav, "get_current_user", None)
+        user = getter() if callable(getter) else None
+        if user is None:
+            QMessageBox.warning(self, "No User", "Could not identify the signed-in user")
+            return None
+        from app.auth.models import UserRole
+        if getattr(user, "role", None) == UserRole.READ_ONLY:
+            QMessageBox.warning(self, "Permission denied", "Read-only users cannot perform this action.")
+            return None
+        return user
+
     def _on_new_job(self):
         if not self.exam_service or not self.case_context:
             QMessageBox.warning(
@@ -920,19 +1071,21 @@ class ExaminationPage(ResponsivePage):
 
         # Reload so evidence registered while this page was open is offered.
         self._populate_evidence_combo()
-        if not self._evidence_list:
+        selected = self.evidence_combo.currentData()
+        selected_evidence = next((item for item in self._evidence_list if item.id == selected), None)
+        if selected_evidence is None or not self._is_verified_evidence(selected_evidence):
             QMessageBox.information(
-                self, "No evidence",
-                "Register evidence for this case on the Evidence page first."
+                self, "Select verified evidence",
+                "Select verified evidence from the list before starting an examination."
             )
             return
 
         dialog = NewExamJobDialog(
-            self._evidence_list, self, operations=self._supported_operations()
+            [selected_evidence], self, operations=self._supported_operations(),
+            selected_evidence=selected_evidence,
         )
         # Start from whatever is chosen in the page's evidence selector; with
         # nothing chosen, default to the first registered evidence.
-        selected = self.evidence_combo.currentData()
         if selected is None and dialog.evidence_combo.count() > 1:
             dialog.evidence_combo.setCurrentIndex(1)
         elif selected is not None:
@@ -951,16 +1104,13 @@ class ExaminationPage(ResponsivePage):
             QMessageBox.warning(self, "Validation Error", "Select evidence")
             return
 
+        user = self._require_writer()
+        if user is None:
+            return
+
         # Write through the service's own session and commit that session.
         session = self.exam_service.session
         try:
-            from app.auth.models import User
-            user = session.get(User, 1)  # TODO: get actual current user
-            if not user:
-                QMessageBox.warning(
-                    self, "No User", "Could not identify the signed-in user"
-                )
-                return
             job = self.exam_service.create_job(
                 case_id=self.case_context.case_id,
                 evidence_id=data["evidence_id"],
@@ -976,7 +1126,7 @@ class ExaminationPage(ResponsivePage):
 
         self.refresh()
         self._select_job(job.job_id)
-        QMessageBox.information(self, "Success", f"Job created: {job.job_id}")
+        self._on_start()
 
 
 class NewExamJobDialog(QDialog):
@@ -985,9 +1135,10 @@ class NewExamJobDialog(QDialog):
         evidence_list: list[Evidence],
         parent: QWidget | None = None,
         operations: list[dict] | None = None,
+        selected_evidence: Evidence | None = None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("New Examination Job")
+        self.setWindowTitle("Choose examination")
         self.setModal(True)
         screen = QApplication.primaryScreen()
         available_height = screen.availableGeometry().height() if screen else 800
@@ -1000,10 +1151,12 @@ class NewExamJobDialog(QDialog):
 
         self.form_scroll = QScrollArea()
         self.form_scroll.setWidgetResizable(True)
+        self.form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.form_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.form_content = QWidget()
         form_layout = QFormLayout(self.form_content)
         form_layout.setSpacing(Spacing.MD)
+        form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form_layout.setContentsMargins(0, 0, 0, 0)
         self.form_scroll.setWidget(self.form_content)
         layout.addWidget(self.form_scroll, 1)
@@ -1012,7 +1165,12 @@ class NewExamJobDialog(QDialog):
         self.evidence_combo.addItem("Select evidence...", 0)
         for ev in evidence_list:
             self.evidence_combo.addItem(f"{ev.evidence_id} — {ev.name}", ev.id)
-        form_layout.addRow("Evidence:", self.evidence_combo)
+        if selected_evidence is not None:
+            self.evidence_combo.setCurrentIndex(self.evidence_combo.findData(selected_evidence.id))
+            self.evidence_combo.hide()
+            form_layout.addRow("Evidence:", QLabel(f"{selected_evidence.evidence_id} — {selected_evidence.name}"))
+        else:
+            form_layout.addRow("Evidence:", self.evidence_combo)
 
         # Examination walks a filesystem, so disk images get the full pipeline.
         # Any other evidence is examined as a single artifact.
@@ -1023,7 +1181,7 @@ class NewExamJobDialog(QDialog):
         )
         hint.setWordWrap(True)
         hint.setProperty("muted", True)
-        form_layout.addRow("", hint)
+        form_layout.addRow(hint)
 
         self.operation_combo = QComboBox()
         if operations is None:
@@ -1052,7 +1210,7 @@ class NewExamJobDialog(QDialog):
         self.profile_description = QLabel()
         self.profile_description.setWordWrap(True)
         self.profile_description.setProperty("muted", True)
-        form_layout.addRow("", self.profile_description)
+        form_layout.addRow(self.profile_description)
 
         self.advanced_toggle = QToolButton()
         self.advanced_toggle.setText("Advanced parameters")
@@ -1062,76 +1220,34 @@ class NewExamJobDialog(QDialog):
             Qt.ToolButtonStyle.ToolButtonTextBesideIcon
         )
         self.advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        form_layout.addRow("", self.advanced_toggle)
+        form_layout.addRow(self.advanced_toggle)
 
         self.advanced_box = QGroupBox()
         advanced_form = QFormLayout(self.advanced_box)
         advanced_form.setContentsMargins(0, 0, 0, 0)
         advanced_form.setSpacing(Spacing.SM)
-
-        self.max_files_spin = QSpinBox()
-        self.max_files_spin.setRange(1, 2_000_000)
-        self.max_files_spin.setSingleStep(1000)
-        self.max_files_spin.setGroupSeparatorShown(True)
-        self.max_files_spin.setToolTip(
-            "Compatibility field for saved jobs. Current examinations inventory every "
-            "discovered entry; this value does not cap the walk."
-        )
-        advanced_form.addRow("Legacy file cap (not enforced):", self.max_files_spin)
-
-        self.max_file_size_spin = QSpinBox()
-        self.max_file_size_spin.setRange(1, 4096)
-        self.max_file_size_spin.setSuffix(" MB")
-        self.max_file_size_spin.setToolTip(
-            "Compatibility field for saved jobs. Readable files are not skipped based "
-            "on size; very large files may require substantial memory and time."
-        )
-        advanced_form.addRow("Legacy size cap (not enforced):", self.max_file_size_spin)
-
-        self.max_text_chars_spin = QSpinBox()
-        self.max_text_chars_spin.setRange(0, 2_000_000)
-        self.max_text_chars_spin.setSingleStep(1000)
-        self.max_text_chars_spin.setGroupSeparatorShown(True)
-        self.max_text_chars_spin.setToolTip(
-            "Compatibility field for saved jobs. All extracted readable text is retained "
-            "and stored in passages; this value does not truncate it."
-        )
-        advanced_form.addRow("Legacy text cap (not enforced):", self.max_text_chars_spin)
-        self.max_files_spin.setEnabled(False)
-        self.max_file_size_spin.setEnabled(False)
-        self.max_text_chars_spin.setEnabled(False)
+        advanced_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         completeness_note = QLabel(
-            "Current scans inventory all discovered files, including deleted entries "
-            "(metadata only), and retain all readable extracted text. Unsupported "
-            "formats are reported as having no extracted text. PDF text, OCR/EXIF, "
+            "Scans inventory every discovered entry, hash all allocated regular files, "
+            "and retain all supported readable text. Deleted entries are metadata-only. Unsupported "
+            "formats are reported as having no extracted text. PDF embedded text is extracted "
+            "when available; OCR/EXIF "
             "and media transcription are not currently provided."
         )
         completeness_note.setWordWrap(True)
         completeness_note.setProperty("muted", True)
-        advanced_form.addRow("Coverage:", completeness_note)
-
-        self.include_deleted = QCheckBox("Include deleted files (metadata only; always inventoried)")
-        self.include_deleted.setEnabled(False)
-        advanced_form.addRow("", self.include_deleted)
-
-        self.skip_media = QCheckBox("Skip media content (compatibility option; not enforced)")
-        self.skip_media.setEnabled(False)
-        advanced_form.addRow("", self.skip_media)
-
-        self.hash_large_files = QCheckBox("Hash large files (readable files are always hashed)")
-        self.hash_large_files.setEnabled(False)
-        advanced_form.addRow("", self.hash_large_files)
+        advanced_form.addRow(completeness_note)
 
         self.deep_extraction = QCheckBox(
             "Extract SQLite database table text"
         )
         self.deep_extraction.setToolTip(
             "When enabled, IDFA extracts SQLite table names and row values. This "
-            "does not perform OCR, PDF text extraction, EXIF parsing, archive "
+            "does not perform OCR, EXIF parsing, archive "
             "expansion, or media transcription."
         )
-        advanced_form.addRow("", self.deep_extraction)
+        advanced_form.addRow(self.deep_extraction)
 
         self.partition_offset_edit = QLineEdit()
         self.partition_offset_edit.setPlaceholderText("Auto (first mountable partition)")
@@ -1147,12 +1263,12 @@ class NewExamJobDialog(QDialog):
         advanced_form.addRow("Job timeout:", self.timeout_spin)
 
         self.advanced_box.setVisible(False)
-        form_layout.addRow("", self.advanced_box)
+        form_layout.addRow(self.advanced_box)
 
-        self.hash_note = QLabel("SHA-256 is always computed for stored content.")
+        self.hash_note = QLabel("Full-file SHA-256 is computed for every allocated regular file.")
         self.hash_note.setProperty("muted", True)
         self.hash_note.setWordWrap(True)
-        form_layout.addRow("", self.hash_note)
+        form_layout.addRow(self.hash_note)
 
         self.profile_combo.currentIndexChanged.connect(self._apply_profile)
         self.advanced_toggle.toggled.connect(self._toggle_advanced)
@@ -1161,6 +1277,8 @@ class NewExamJobDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        if selected_evidence is not None:
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Start examination")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -1181,12 +1299,6 @@ class NewExamJobDialog(QDialog):
         self.profile_description.setText(profile.description)
         params = profile_parameters(profile_key)
 
-        self.max_files_spin.setValue(int(params["max_files"]))
-        self.max_file_size_spin.setValue(int(profile.max_file_size_mb))
-        self.max_text_chars_spin.setValue(int(params["max_text_chars"]))
-        self.include_deleted.setChecked(bool(params["include_deleted"]))
-        self.skip_media.setChecked(bool(params["skip_media"]))
-        self.hash_large_files.setChecked(bool(params["hash_large_files"]))
         self.deep_extraction.setChecked(bool(params["deep_extraction"]))
         self.partition_offset_edit.clear()
         self.timeout_spin.setValue(int(params["timeout_seconds"]))
@@ -1215,12 +1327,6 @@ class NewExamJobDialog(QDialog):
 
         parameters = {
             "profile": self.profile_combo.currentData() or DEFAULT_PROFILE,
-            "max_files": self.max_files_spin.value(),
-            "max_file_size": self.max_file_size_spin.value() * 1024 * 1024,
-            "max_text_chars": self.max_text_chars_spin.value(),
-            "include_deleted": self.include_deleted.isChecked(),
-            "skip_media": self.skip_media.isChecked(),
-            "hash_large_files": self.hash_large_files.isChecked(),
             "deep_extraction": self.deep_extraction.isChecked(),
             "partition_offset": partition_offset,
             "timeout_seconds": self.timeout_spin.value(),

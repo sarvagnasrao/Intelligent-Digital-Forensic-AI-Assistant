@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
@@ -36,6 +36,8 @@ from app.analysis.models import (
 )
 from app.analysis.relationships import RelationshipBuilder, RelationshipSettings
 from app.artifacts.models import Artifact, Entity, EntityType, TimelineEvent
+from app.auth.models import User
+from app.auth.service import AuthService
 from app.config import get_config
 from app.examination.models import ExaminationJob, JobStatus
 
@@ -54,7 +56,7 @@ class AnalysisCancelled(Exception):
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _short_id(prefix: str, case_id: int) -> str:
@@ -81,12 +83,18 @@ class AnalysisService:
         case_id: int,
         evidence_id: int,
         examination_job_id: int | None,
+        created_by: User,
         *,
         parameters: dict | None = None,
+        manual: bool = False,
     ) -> AnalysisJob | None:
         """Create the analysis job for one completed examination."""
-        if not self.config.analysis.enabled or not self.config.analysis.auto_queue:
+        if not self.config.analysis.enabled or (not self.config.analysis.auto_queue and not manual):
             return None
+
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(created_by, case_id):
+            raise PermissionError("Read-only users cannot perform analysis")
 
         if examination_job_id is not None:
             existing = self.session.execute(
@@ -109,23 +117,39 @@ class AnalysisService:
         self.session.flush()
         return job
 
-    def enqueue_missing(self, case_id: int) -> list[AnalysisJob]:
+    def enqueue_missing(self, case_id: int, created_by: User | None = None, *, manual: bool = False) -> list[AnalysisJob]:
         """Queue analysis for completed examinations that have none.
 
         This is what keeps a growing case current: a new evidence item gets a
         new examination job, and the next poll picks it up here.
         """
-        if not self.config.analysis.enabled or not self.config.analysis.auto_queue:
+        if not self.config.analysis.enabled or (not self.config.analysis.auto_queue and not manual):
             return []
+
+        # Use a system user if not provided (for background auto-queue)
+        if created_by is None:
+            created_by = self.session.execute(
+                select(User).where(User.is_active == True).order_by(User.id)
+            ).scalars().first()
+            if created_by is None:
+                return []
+
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(created_by, case_id):
+            raise PermissionError("Read-only users cannot perform analysis")
+
+        from app.evidence.models import Evidence
 
         analysed = select(AnalysisJob.examination_job_id).where(
             AnalysisJob.examination_job_id.is_not(None)
         )
         rows = self.session.execute(
             select(ExaminationJob)
+            .join(Evidence, ExaminationJob.evidence_id == Evidence.id)
             .where(
                 ExaminationJob.case_id == case_id,
                 ExaminationJob.status == JobStatus.COMPLETED,
+                Evidence.removed_at.is_(None),
                 ExaminationJob.id.not_in(analysed),
             )
             .order_by(ExaminationJob.id)
@@ -135,7 +159,9 @@ class AnalysisService:
         for exam in rows:
             job = self.enqueue_for_examination(
                 exam.case_id, exam.evidence_id, exam.id,
+                created_by=created_by,
                 parameters=self._parameters_from_examination(exam),
+                manual=manual,
             )
             if job is not None:
                 created.append(job)
@@ -191,7 +217,7 @@ class AnalysisService:
         stmt = select(AnalysisJob.status, func.count()).group_by(AnalysisJob.status)
         if case_id is not None:
             stmt = stmt.where(AnalysisJob.case_id == case_id)
-        totals = {status: 0 for status in AnalysisJobStatus}
+        totals = dict.fromkeys(AnalysisJobStatus, 0)
         for status, count in self.session.execute(stmt).all():
             totals[status] = count
         return {status.value: value for status, value in totals.items()}
@@ -269,13 +295,17 @@ class AnalysisService:
         job.progress_message = message
         self.session.commit()
 
-    async def run(self, job_pk: int) -> dict:
+    async def run(self, job_pk: int, user: User) -> dict:
         """Analyse one evidence item. Returns a small summary dictionary."""
         job = self.get_job(job_pk)
         if job is None:
             return {"ok": False, "error": "The analysis job no longer exists."}
         if job.status not in (AnalysisJobStatus.PENDING, AnalysisJobStatus.RUNNING):
             return {"ok": False, "error": f"Job is {job.status.value}"}
+
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(user, job.case_id):
+            raise PermissionError("Read-only users cannot perform analysis")
 
         _CANCELLED.discard(job_pk)
         job.status = AnalysisJobStatus.RUNNING
@@ -533,10 +563,8 @@ class AnalysisService:
                         job, 72, "names",
                         f"Model extraction unavailable: {result.error}"[:500],
                     )
-                # A missing model is not a reason to fail the whole job.
-                if failures >= 3:
-                    break
-                continue
+                # Earlier windows may already contain source-verified leads.
+                # Persist those even when a later request fails.
 
             existing = {
                 (entity.entity_type.value, (entity.normalized_value or "").lower())
@@ -550,6 +578,8 @@ class AnalysisService:
                 self._add_entity(job, artifact, entity)
                 written += 1
             self.session.commit()
+            if result.error and failures >= 3:
+                break
             percent = 70 + int(20 * index / max(1, len(candidates)))
             self._progress(
                 job, percent, "names",
@@ -608,7 +638,10 @@ class AnalysisService:
         min_score: float = 0.0,
         limit: int = 500,
     ) -> list[EntityRelationship]:
-        stmt = select(EntityRelationship).where(EntityRelationship.case_id == case_id)
+        stmt = select(EntityRelationship).where(
+            EntityRelationship.case_id == case_id,
+            self._active_relationship_condition(case_id),
+        )
         if status is not None:
             stmt = stmt.where(EntityRelationship.status == status)
         if kind:
@@ -625,13 +658,41 @@ class AnalysisService:
     def relationship_counts(self, case_id: int) -> dict[str, int]:
         rows = self.session.execute(
             select(EntityRelationship.status, func.count())
-            .where(EntityRelationship.case_id == case_id)
+            .where(
+                EntityRelationship.case_id == case_id,
+                self._active_relationship_condition(case_id),
+            )
             .group_by(EntityRelationship.status)
         ).all()
         totals = {status.value: 0 for status in RelationshipStatus}
         for status, count in rows:
             totals[status] = count
         return totals
+
+    @staticmethod
+    def _active_relationship_condition(case_id: int):
+        """Hide links supported by evidence removed from the active case."""
+        from sqlalchemy import case, exists
+
+        from app.evidence.models import Evidence
+
+        ids = func.json_each(case(
+            (func.json_valid(EntityRelationship.evidence_ids_json) == 1,
+             EntityRelationship.evidence_ids_json),
+            else_="[]",
+        )).table_valued("value")
+        removed = select(Evidence.id).where(
+            Evidence.case_id == case_id, Evidence.removed_at.is_not(None)
+        )
+        details = case(
+            (func.json_valid(EntityRelationship.details_json) == 1,
+             EntityRelationship.details_json),
+            else_="{}",
+        )
+        return (
+            ~exists(select(1).select_from(ids).where(ids.c.value.in_(removed)).correlate(EntityRelationship))
+            & (func.coalesce(func.json_extract(details, "$.unsupported_after_rebuild"), 0) != 1)
+        )
 
     def list_entities(
         self,
@@ -641,7 +702,14 @@ class AnalysisService:
         query: str | None = None,
         limit: int = 500,
     ) -> list[Entity]:
-        stmt = select(Entity).where(Entity.case_id == case_id)
+        from app.evidence.models import Evidence
+
+        stmt = (
+            select(Entity)
+            .join(Artifact, Entity.artifact_id == Artifact.id)
+            .join(Evidence, Artifact.evidence_id == Evidence.id)
+            .where(Entity.case_id == case_id, Evidence.removed_at.is_(None))
+        )
         if entity_type is not None:
             stmt = stmt.where(Entity.entity_type == entity_type)
         if query:
@@ -654,9 +722,13 @@ class AnalysisService:
         )
 
     def entity_type_counts(self, case_id: int) -> dict[str, int]:
+        from app.evidence.models import Evidence
+
         rows = self.session.execute(
             select(Entity.entity_type, func.count())
-            .where(Entity.case_id == case_id)
+            .join(Artifact, Entity.artifact_id == Artifact.id)
+            .join(Evidence, Artifact.evidence_id == Evidence.id)
+            .where(Entity.case_id == case_id, Evidence.removed_at.is_(None))
             .group_by(Entity.entity_type)
         ).all()
         totals: dict[str, int] = {}
@@ -674,10 +746,19 @@ class AnalysisService:
         until: datetime | None = None,
         limit: int = 1000,
     ) -> list[TimelineEvent]:
+        from sqlalchemy import or_
+
+        from app.evidence.models import Evidence
+
         stmt = (
             select(TimelineEvent)
             .options(selectinload(TimelineEvent.artifact))
-            .where(TimelineEvent.case_id == case_id)
+            .outerjoin(Artifact, TimelineEvent.artifact_id == Artifact.id)
+            .outerjoin(Evidence, Artifact.evidence_id == Evidence.id)
+            .where(
+                TimelineEvent.case_id == case_id,
+                or_(TimelineEvent.artifact_id.is_(None), Evidence.removed_at.is_(None)),
+            )
         )
         if event_type:
             stmt = stmt.where(TimelineEvent.event_type == event_type)

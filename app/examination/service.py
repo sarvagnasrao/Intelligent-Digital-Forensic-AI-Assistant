@@ -1,11 +1,11 @@
 """Examination service for job management and worker communication."""
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING
+from contextlib import suppress
+from datetime import UTC, datetime
 
 import httpx
 from sqlalchemy import select
@@ -14,16 +14,45 @@ from sqlalchemy.orm import Session
 from app.auth.models import User
 from app.config import get_config
 from app.evidence.models import Evidence, EvidenceStatus
-from app.examination.models import ExaminationJob, ExaminationOperation, ExaminationResult, JobStatus
-from app.examination.profiles import parameter_summary, validate_parameters
+from app.examination.models import (
+    ExaminationJob,
+    ExaminationOperation,
+    ExaminationResult,
+    JobStatus,
+)
+from app.examination.profiles import validate_parameters
 
-if TYPE_CHECKING:
-    from app.auth.models import Case
-    from app.artifacts.models import Artifact, ArtifactType, IndexStatus
 
-
-class ExaminationCancelled(Exception):
+class ExaminationCancelled(Exception):  # noqa: N818 - retain the existing exception API
     """The worker stopped a scan because the investigator cancelled it."""
+
+
+def extraction_coverage(rows: list[dict]) -> dict[str, int]:
+    """Summarize worker-reported coverage without treating missing text as success."""
+    counts = {
+        "total": 0,
+        "text": 0,
+        "deleted": 0,
+        "read_errors": 0,
+        "partial": 0,
+        "unsupported_or_no_text": 0,
+        "no_text": 0,
+    }
+    for row in rows:
+        counts["total"] += 1
+        if row.get("deleted"):
+            counts["deleted"] += 1
+        elif row.get("extraction_status") == "partial":
+            counts["partial"] += 1
+        elif row.get("read_error") or row.get("extraction_status") == "error":
+            counts["read_errors"] += 1
+        elif row.get("extraction_status") == "unsupported_or_no_text":
+            counts["unsupported_or_no_text"] += 1
+        elif row.get("content_text"):
+            counts["text"] += 1
+        else:
+            counts["no_text"] += 1
+    return counts
 
 
 class ExaminationService:
@@ -54,13 +83,19 @@ class ExaminationService:
         evidence_id: int,
         operation: ExaminationOperation,
         parameters: dict | None = None,
-        created_by: User = None,
+        created_by: User | None = None,
     ) -> ExaminationJob:
         evidence = self.session.get(Evidence, evidence_id)
         if not evidence or evidence.case_id != case_id:
             raise ValueError("Evidence not found or does not belong to case")
         if evidence.status == EvidenceStatus.ARCHIVED:
-            raise ValueError("Archived evidence must be restored before creating an examination job")
+            raise ValueError(
+                "Archived evidence must be restored before creating an examination job"
+            )
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(created_by, case_id):
+            raise PermissionError("Read-only users cannot create examination jobs")
 
         # Qt hands str-based enums back as plain strings, so coerce here rather
         # than storing a string in an enum column.
@@ -99,7 +134,9 @@ class ExaminationService:
         stmt = select(ExaminationJob).where(ExaminationJob.case_id == case_id)
         if evidence_id:
             stmt = stmt.where(ExaminationJob.evidence_id == evidence_id)
-        return list(self.session.execute(stmt.order_by(ExaminationJob.created_at.desc())).scalars().all())
+        return list(
+            self.session.execute(stmt.order_by(ExaminationJob.created_at.desc())).scalars().all()
+        )
 
     def mark_interrupted_jobs(self) -> int:
         """Mark jobs left running by a previous session as interrupted.
@@ -114,7 +151,7 @@ class ExaminationService:
         if not jobs:
             return 0
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for job in jobs:
             job.status = JobStatus.INTERRUPTED
             job.progress_message = (
@@ -139,12 +176,18 @@ class ExaminationService:
             job.status = JobStatus.FAILED
             job.error_message = "Archived evidence must be restored before examination"
             job.progress_message = job.error_message
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             self.session.commit()
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        created_by = self.session.get(User, job.created_by_id)
+        if not auth_service.user_can_write_case(created_by, job.case_id):
+            raise PermissionError("Read-only users cannot start examinations")
 
         job.status = JobStatus.RUNNING
-        job.started_at = datetime.now(timezone.utc)
+        job.started_at = datetime.now(UTC)
+        job.completed_at = None
         job.progress_percent = 0
         job.progress_message = "Starting examination..."
         # A retried job must not keep the previous failure's message.
@@ -164,15 +207,20 @@ class ExaminationService:
         AuditService(self.session).log_examination_start(
             job.created_by, job.case_id, job.id
         )
+        # Recovery must see RUNNING even if the GUI exits before the worker
+        # publishes its first batch or progress update.
+        self.session.commit()
 
+        request_task = None
         try:
             # For old records that registered only .002/.003 as a fragment,
             # use the original source set when a complete adjacent sequence is
             # available; newly registered evidence stores the full sequence.
             image_path = evidence.stored_path or evidence.source_path
             try:
-                from app.evidence.service import EvidenceService
                 from pathlib import Path
+
+                from app.evidence.service import EvidenceService
                 original_parts = EvidenceService._split_image_parts(Path(evidence.source_path))
                 if len(original_parts) > 1:
                     try:
@@ -189,10 +237,8 @@ class ExaminationService:
                 "job_id": job.job_id,
                 "image_path": image_path,
                 "operation": job.operation.value,
-                "parameters": parameters,
+                "parameters": {**parameters, "progressive_ingestion": True},
             }
-
-            import asyncio
 
             timeout_seconds = float(
                 parameters.get("timeout_seconds")
@@ -204,39 +250,72 @@ class ExaminationService:
                 timeout=timeout_seconds,
             ))
             progress_url = f"{self.config.worker.url}/examine/{job.job_id}/progress"
+            batch_url = f"{self.config.worker.url}/examine/{job.job_id}/batch"
+            created = 0
+            updated = 0
+            coverage = extraction_coverage([])
+            last_batch = 0
             while not request_task.done():
                 await asyncio.sleep(0.75)
                 try:
-                        progress_response = await self.client.get(progress_url, timeout=3.0)
-                        if progress_response.status_code == 200:
-                            progress = progress_response.json()
-                            if progress.get("status") not in ("failed", "completed"):
-                                new_percent = max(
-                                    job.progress_percent, min(99, int(progress.get("progress", 0)))
-                                )
-                                progress_status = progress.get("status")
-                                if progress_status == "paused":
-                                    new_message = "Paused — waiting to resume"
-                                elif progress_status == "pausing":
-                                    new_message = "Pausing — finishing current step"
-                                else:
-                                    new_message = (
-                                        progress.get("message") or "Examining evidence"
-                                    )
-                                # The worker is polled frequently for a live UI,
-                                # but unchanged progress should not acquire a
-                                # SQLite write lock on every polling tick.
-                                if (
-                                    new_percent != job.progress_percent
-                                    or new_message != job.progress_message
-                                ):
-                                    job.progress_percent = new_percent
-                                    job.progress_message = new_message
-                                    self.session.commit()
+                    batch_response = await self.client.get(batch_url, timeout=3.0)
+                    batch = batch_response.json() if batch_response.status_code == 200 else {}
+                except Exception:
+                    batch = {}
+                if batch and batch.get("sequence", 0) > last_batch:
+                    try:
+                        rows = batch.get("artifacts", [])
+                        stats = await self._create_artifact_records(
+                            job.case_id, job.evidence_id, job.id,
+                            {"artifacts": rows,
+                             "partition_offset": batch.get("partition_offset", 0)},
+                            parameters,
+                            commit_interval=False,
+                        )
+                        created += stats["created"]
+                        updated += stats["updated"]
+                        for key, count in extraction_coverage(rows).items():
+                            coverage[key] += count
+                        self.session.commit()
+                        last_batch = batch["sequence"]
+                    except Exception:
+                        request_task.cancel()
+                        with suppress(Exception):
+                            await self.client.post(
+                                f"{self.config.worker.url}/examine/{job.job_id}/cancel", timeout=3.0
+                            )
+                        with suppress(asyncio.CancelledError):
+                            await request_task
+                        raise
+                if batch and batch.get("sequence") == last_batch:
+                    with suppress(Exception):
+                        await self.client.post(f"{batch_url}/{last_batch}/ack", timeout=3.0)
+                try:
+                    progress_response = await self.client.get(progress_url, timeout=3.0)
+                    progress = (
+                        progress_response.json() if progress_response.status_code == 200 else {}
+                    )
+                    new_percent = max(
+                        job.progress_percent, min(99, int(progress.get("progress", 0)))
+                    )
                 except Exception:
                     # Older worker versions do not expose progress polling;
                     # the examination request remains valid without it.
-                    pass
+                    progress = {}
+                if progress and progress.get("status") not in ("failed", "completed"):
+                    progress_status = progress.get("status")
+                    if progress_status == "paused":
+                        new_message = "Paused — waiting to resume"
+                    elif progress_status == "pausing":
+                        new_message = "Pausing — finishing current step"
+                    else:
+                        new_message = progress.get("message") or "Examining evidence"
+                    # Persistence errors must abort the scan, not be mistaken
+                    # for an unavailable optional progress endpoint.
+                    if new_percent != job.progress_percent or new_message != job.progress_message:
+                        job.progress_percent = new_percent
+                        job.progress_message = new_message
+                        self.session.commit()
             response = await request_task
 
             if response.status_code != 200:
@@ -253,8 +332,6 @@ class ExaminationService:
                     raise ExaminationCancelled(error_text)
                 raise Exception(error_text)
 
-            created = 0
-            updated = 0
             for res in result.get("results", []):
                 exam_result = ExaminationResult(
                     job_id=job.id,
@@ -270,26 +347,55 @@ class ExaminationService:
                 # Only the first used to be ingested, so a traversal job left
                 # nothing to search.
                 if res.get("type") in ("artifacts", "file_list"):
+                    data = res.get("data", {})
+                    partition_coverage = extraction_coverage(
+                        data.get("artifacts") or data.get("files") or []
+                    )
+                    for key, count in partition_coverage.items():
+                        coverage[key] += count
+                    def import_progress(processed: int, total: int) -> None:
+                        job.progress_percent = max(
+                            job.progress_percent,
+                            min(99, 90 + (processed * 9 // max(1, total))),
+                        )
+                        job.progress_message = f"Saving artifacts {processed:,}/{total:,}"
+                        self.session.commit()
+
                     stats = await self._create_artifact_records(
                         job.case_id,
                         job.evidence_id,
                         job.id,
-                        res.get("data", {}),
+                        data,
                         parameters,
+                        progress_callback=import_progress,
                     )
                     created += stats["created"]
                     updated += stats["updated"]
 
             job.status = JobStatus.COMPLETED
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             job.progress_percent = 100
             if created or updated:
                 job.progress_message = (
                     f"Examination completed — {created:,} new, "
-                    f"{updated:,} updated artifacts"
+                    f"{updated:,} updated artifacts; "
+                    f"{coverage['text']:,} with text, {coverage['no_text']:,} without text, "
+                    f"{coverage['unsupported_or_no_text']:,} unsupported or no text, "
+                    f"{coverage['deleted']:,} deleted metadata-only, "
+                    f"{coverage['read_errors']:,} read errors, "
+                    f"{coverage['partial']:,} partial extractions"
                 )
             else:
                 job.progress_message = "Examination completed — no artifacts found"
+
+            partition_warnings = sum(
+                res.get("type") == "partition_warning"
+                for res in result.get("results", [])
+            )
+            if partition_warnings:
+                job.progress_message += (
+                    f"; incomplete coverage: {partition_warnings} partition(s) not examined"
+                )
 
             evidence.status = EvidenceStatus.EXAMINED  # type: ignore[assignment]
             AuditService(self.session).log_examination_complete(
@@ -317,9 +423,27 @@ class ExaminationService:
 
             return True
 
+        except asyncio.CancelledError:
+            # Cancelling the client coroutine does not stop the separate worker
+            # process. Ask it to stop before allowing a retry of this job ID.
+            if request_task is not None:
+                request_task.cancel()
+                with suppress(Exception):
+                    await self.client.post(
+                        f"{self.config.worker.url}/examine/{job.job_id}/cancel", timeout=3.0
+                    )
+                with suppress(asyncio.CancelledError, Exception):
+                    await request_task
+            self.session.rollback()
+            job.status = JobStatus.INTERRUPTED
+            job.completed_at = datetime.now(UTC)
+            job.progress_message = "Examination interrupted. Start it again to retry."
+            self.session.commit()
+            raise
+
         except ExaminationCancelled:
             job.status = JobStatus.CANCELLED
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             job.progress_percent = 0
             job.error_message = None
             job.progress_message = "Cancelled by investigator"
@@ -334,9 +458,22 @@ class ExaminationService:
             return False
 
         except Exception as e:
+            # A client timeout or transport failure does not imply the worker
+            # stopped scanning (or waiting for an acknowledgement).
+            if request_task is not None:
+                request_task.cancel()
+                with suppress(Exception):
+                    await self.client.post(
+                        f"{self.config.worker.url}/examine/{job.job_id}/cancel", timeout=3.0
+                    )
+                with suppress(asyncio.CancelledError, Exception):
+                    await request_task
+            # A failed flush leaves SQLAlchemy's transaction unusable. Keep
+            # previously committed import batches, then persist the failure.
+            self.session.rollback()
             message = self._describe_worker_error(e)
             job.status = JobStatus.FAILED
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             job.progress_percent = 0
             job.error_message = message
             job.progress_message = f"Failed: {message}"
@@ -372,6 +509,8 @@ class ExaminationService:
         exam_job_id: int,
         data: dict,
         parameters: dict | None = None,
+        progress_callback=None,
+        commit_interval: bool = True,
     ) -> dict[str, int]:
         """Ingest worker artifact rows, updating rows a re-run already created.
 
@@ -380,8 +519,6 @@ class ExaminationService:
         its source path inside the evidence and updated in place; only paths
         that were not there before get a new artifact id.
         """
-        from datetime import datetime, timezone
-
         from sqlalchemy import delete
 
         from app.artifacts.models import (
@@ -404,7 +541,8 @@ class ExaminationService:
             row.source_path: row for row in existing_rows if row.source_path
         }
 
-        for art_data in artifacts_data:
+        total_artifacts = len(artifacts_data)
+        for item_number, art_data in enumerate(artifacts_data, start=1):
             try:
                 # Map artifact type
                 artifact_type_str = art_data.get("artifact_type", "file")
@@ -418,7 +556,7 @@ class ExaminationService:
                     if ts is None:
                         return None
                     try:
-                        return datetime.fromtimestamp(ts, tz=timezone.utc)
+                        return datetime.fromtimestamp(ts, tz=UTC)
                     except Exception:
                         return None
 
@@ -453,12 +591,16 @@ class ExaminationService:
                 path = art_data.get("path")
                 previous = by_path.get(path)
                 if previous is not None:
+                    text_changed = previous.content_text != values["content_text"]
                     content_changed = (previous.content_hash or None) != (
                         art_data.get("content_hash") or None
-                    )
+                    ) or (previous.content_text or None) != (values["content_text"] or None)
                     for field, value in values.items():
                         setattr(previous, field, value)
                     previous.examination_job_id = exam_job_id
+                    if text_changed:
+                        from app.findings.identity import invalidate_reviewed_sources
+                        invalidate_reviewed_sources(self.session, artifact_id=previous.id)
                     if content_changed:
                         # Entities and vectors describe the old bytes; drop
                         # them so the analysis and index rebuild for the new
@@ -475,7 +617,10 @@ class ExaminationService:
                         previous.vector_id = None
                         previous.indexed_at = None
                         self.session.flush()
-                        self._persist_text_chunks(previous, values["content_text"], case_id)
+                        self._persist_text_chunks(
+                            previous, values["content_text"], case_id,
+                            self.config.embeddings.chunk_size,
+                        )
                     stats["updated"] += 1
                 else:
                     # The counter is advanced here rather than re-queried: the
@@ -494,19 +639,34 @@ class ExaminationService:
                     )
                     self.session.add(artifact)
                     self.session.flush()
-                    self._persist_text_chunks(artifact, values["content_text"], case_id)
+                    self._persist_text_chunks(
+                        artifact, values["content_text"], case_id,
+                        self.config.embeddings.chunk_size,
+                    )
                     by_path[path] = artifact
                     stats["created"] += 1
 
             except Exception as e:
-                # Log but don't fail the examination
-                import logging
-                logging.getLogger(__name__).error(f"Failed to create artifact record: {e}")
+                # Never silently claim complete coverage after an import error.
+                # Earlier committed batches remain available for review.
+                self.session.rollback()
+                path = art_data.get("path", "unknown") if isinstance(art_data, dict) else "unknown"
+                raise RuntimeError(
+                    f"Artifact import failed at item {item_number}/{total_artifacts} "
+                    f"({path}); earlier committed batches were retained: {e}"
+                ) from e
+
+            if commit_interval and (item_number % 200 == 0 or item_number == total_artifacts):
+                self.session.commit()
+            if progress_callback and (item_number % 100 == 0 or item_number == total_artifacts):
+                progress_callback(item_number, total_artifacts)
 
         return stats
 
     @staticmethod
-    def _persist_text_chunks(artifact, text: str | None, case_id: int) -> None:
+    def _persist_text_chunks(
+        artifact, text: str | None, case_id: int, chunk_size: int = 20_000
+    ) -> None:
         """Persist extraction passages immediately, independently of indexing.
 
         Chunk size is a storage boundary only; concatenating the rows reproduces
@@ -516,7 +676,7 @@ class ExaminationService:
             return
         from app.artifacts.models import ArtifactChunk
 
-        chunk_size = 20_000
+        chunk_size = max(1, chunk_size)
         for index, start in enumerate(range(0, len(text), chunk_size)):
             passage = text[start : start + chunk_size]
             artifact.chunks.append(ArtifactChunk(
@@ -546,17 +706,20 @@ class ExaminationService:
         except (AttributeError, ValueError):
             return last.id + 1
 
-        self.session.flush()
-
     def cancel_job(self, job_id: int) -> bool:
         """Cancel a pending job, or ask the worker to stop a running scan."""
         job = self.get_job(job_id)
         if not job:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        created_by = self.session.get(User, job.created_by_id)
+        if not auth_service.user_can_write_case(created_by, job.case_id):
+            raise PermissionError("Read-only users cannot cancel examinations")
 
         if job.status == JobStatus.PENDING:
             job.status = JobStatus.CANCELLED
-            job.completed_at = datetime.now(timezone.utc)
+            job.completed_at = datetime.now(UTC)
             job.progress_message = "Cancelled by investigator"
             self.session.commit()
             return True
@@ -594,6 +757,11 @@ class ExaminationService:
         job = self.get_job(job_id)
         if not job or job.status != JobStatus.RUNNING:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        created_by = self.session.get(User, job.created_by_id)
+        if not auth_service.user_can_write_case(created_by, job.case_id):
+            raise PermissionError("Read-only users cannot pause/resume examinations")
         action = "pause" if pause else "resume"
         try:
             response = httpx.post(
@@ -621,6 +789,10 @@ class ExaminationService:
         job = self.get_job(job_id)
         if not job or job.status == JobStatus.RUNNING:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(deleted_by, job.case_id):
+            raise PermissionError("Read-only users cannot delete examinations")
 
         result_summary = [
             {
@@ -630,11 +802,12 @@ class ExaminationService:
             }
             for result in job.results
         ]
+        from sqlalchemy import delete
+        from sqlalchemy.orm import load_only
+
         from app.analysis.models import AnalysisJob, AnalysisJobStatus
         from app.artifacts.models import Artifact
         from app.artifacts.service import purge_artifact_rows
-        from sqlalchemy import delete
-        from sqlalchemy.orm import load_only
 
         active_analysis = self.session.execute(
             select(AnalysisJob).where(
@@ -678,6 +851,16 @@ class ExaminationService:
         if not job:
             return []
         return list(job.results)
+
+    def get_job_result_summaries(self, job_id: int):
+        """Return display fields without loading potentially huge result JSON."""
+        stmt = (
+            select(ExaminationResult.result_type, ExaminationResult.summary,
+                   ExaminationResult.artifact_count)
+            .where(ExaminationResult.job_id == job_id)
+            .order_by(ExaminationResult.id)
+        )
+        return self.session.execute(stmt).all()
 
     def get_supported_operations(self) -> list[dict]:
         return [

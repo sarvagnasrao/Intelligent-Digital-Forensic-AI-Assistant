@@ -190,6 +190,9 @@ class _VerifyThread(QThread):
                     outcome = service.verify_integrity(
                         evidence_pk, user, progress_callback=report
                     )
+                    if not outcome:
+                        raise ValueError("Verification did not return any hash results")
+                    session.commit()
                     passed = all(outcome.values())
                     detail = ", ".join(
                         f"{algo.value.upper()} {'PASS' if ok else 'FAIL'}"
@@ -200,7 +203,6 @@ class _VerifyThread(QThread):
                     session.rollback()
                     results.append((reference, False, str(exc)))
 
-            session.commit()
             self.done.emit(results)
         except Exception as exc:  # noqa: BLE001 - surfaced to the investigator
             session.rollback()
@@ -857,13 +859,18 @@ class EvidenceDetailPane(QFrame):
         evidence: Evidence | None,
         file_state: str = EvidenceService.STORED_MISSING,
         parts: list[Path] | None = None,
+        selection_count: int = 0,
     ) -> None:
         self._clear()
         self._evidence_id = evidence.id if evidence else None
 
         if evidence is None:
             self._actions_host.setVisible(False)
-            placeholder = QLabel("Select an item to see its full record and actions.")
+            placeholder = QLabel(
+                f"{selection_count} items selected. Right-click the list for available actions."
+                if selection_count > 1 else
+                "Select an item to see its full record and actions."
+            )
             placeholder.setWordWrap(True)
             placeholder.setProperty("sectionHint", True)
             self._body_layout.addWidget(placeholder)
@@ -1197,6 +1204,10 @@ class EvidencePage(ResponsivePage):
         header_row.addWidget(self.summary_label)
         header_row.addStretch()
 
+        self.devices_btn = QPushButton("Physical devices")
+        self.devices_btn.clicked.connect(self._on_devices)
+        header_row.addWidget(self.devices_btn)
+
         self.register_btn = QPushButton("Register Evidence")
         self.register_btn.clicked.connect(self._on_register)
         header_row.addWidget(self.register_btn)
@@ -1234,6 +1245,20 @@ class EvidencePage(ResponsivePage):
 
         filter_row.addStretch()
 
+        self.select_all_btn = QPushButton("Select all shown")
+        self.select_all_btn.setProperty("secondary", True)
+        self.select_all_btn.setToolTip(
+            "Select all evidence currently visible after the search and filters."
+        )
+        self.select_all_btn.clicked.connect(self._select_all_visible)
+        filter_row.addWidget(self.select_all_btn)
+
+        self.clear_selection_btn = QPushButton("Clear selection")
+        self.clear_selection_btn.setProperty("secondary", True)
+        self.clear_selection_btn.setEnabled(False)
+        self.clear_selection_btn.clicked.connect(self._clear_selection)
+        filter_row.addWidget(self.clear_selection_btn)
+
         self.check_files_btn = QPushButton("Check files")
         self.check_files_btn.setProperty("secondary", True)
         self.check_files_btn.setToolTip(
@@ -1263,7 +1288,10 @@ class EvidencePage(ResponsivePage):
         self.table_view = QTableView()
         self.table_view.setModel(self.table_model)
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table_view.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.table_view.setToolTip(
+            "Click rows to select or deselect them. Select all shown applies to the visible list."
+        )
         self.table_view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSortingEnabled(False)
@@ -1360,7 +1388,14 @@ class EvidencePage(ResponsivePage):
         visible = self._visible_evidence()
         self.table_model.populate(visible, self._file_states)
         self.empty_hint.setVisible(not visible)
+        self.select_all_btn.setEnabled(bool(visible))
         self._on_selection_changed()
+
+    def _select_all_visible(self):
+        self.table_view.selectAll()
+
+    def _clear_selection(self):
+        self.table_view.clearSelection()
 
     def _update_summary(self):
         if not self.evidence_service or not self.case_context:
@@ -1420,12 +1455,16 @@ class EvidencePage(ResponsivePage):
                 )
 
     def _on_selection_changed(self, *_args):
+        self.clear_selection_btn.setEnabled(bool(self._selected_rows()))
         pane = getattr(self, "detail_pane", None)
         if pane is None:  # selection cannot change before the layout is built
             return
         evidence = self._single_selection()
         if evidence is None:
-            pane.set_evidence(None, EvidenceService.STORED_MISSING, [])
+            pane.set_evidence(
+                None, EvidenceService.STORED_MISSING, [],
+                selection_count=len(self._selected_rows()),
+            )
             return
         pane.set_evidence(
             evidence,
@@ -1458,6 +1497,16 @@ class EvidencePage(ResponsivePage):
                 "No investigator",
                 "A signed-in investigator is required to change evidence.",
             )
+        return user
+
+    def _require_writer(self):
+        user = self._current_user()
+        if user is None:
+            return None
+        from app.auth.models import UserRole
+        if user.role == UserRole.READ_ONLY:
+            QMessageBox.warning(self, "Permission denied", "Read-only users cannot perform this action.")
+            return None
         return user
 
     # ------------------------------------------------------------ context menu
@@ -1534,6 +1583,17 @@ class EvidencePage(ResponsivePage):
         menu.exec(self.table_view.viewport().mapToGlobal(position))
 
     # ------------------------------------------------------------- register
+    def _on_devices(self):
+        if not self.case_context or not self.evidence_service:
+            return
+        user = self._require_writer()
+        if user is None:
+            return
+        from app.ui.device_dialog import DeviceDialog
+
+        DeviceDialog(self.evidence_service.session, self.case_context.case_id, user,
+                     self.evidence_service.get_evidence_by_case(self.case_context.case_id), self).exec()
+
     def _on_register(self):
         if not self.case_context or not self.evidence_service:
             return
@@ -1544,7 +1604,7 @@ class EvidencePage(ResponsivePage):
         if not data["name"] or not data["source_path"]:
             QMessageBox.warning(self, "Validation Error", "Name and source file are required")
             return
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
 
@@ -1578,14 +1638,14 @@ class EvidencePage(ResponsivePage):
         if not selection:
             QMessageBox.warning(self, "No Selection", "Select evidence to verify")
             return
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
 
         self._open_progress(
             "Verifying Integrity",
             f"Hashing {len(selection)} item(s)…",
-            cancelable=True,
+            cancelable=False,
         )
         self._verify_thread = _VerifyThread([pk for pk, _ in selection], user.id)
         self._verify_thread.progress.connect(
@@ -1598,6 +1658,12 @@ class EvidencePage(ResponsivePage):
 
     def _verification_complete(self, results: list[tuple[str, bool, str]]):
         self._close_progress()
+        # The verifier writes through its own session. End an idle read
+        # transaction before reloading so the page sees the committed hashes.
+        if self.evidence_service is not None:
+            session = self.evidence_service.session
+            if not session.new and not session.dirty and not session.deleted:
+                session.rollback()
         self._expire()
         if not results:
             QMessageBox.information(self, "Verification", "Nothing to verify.")
@@ -1638,7 +1704,7 @@ class EvidencePage(ResponsivePage):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
         service = self.evidence_service
@@ -1756,7 +1822,7 @@ class EvidencePage(ResponsivePage):
                 "The file for this record is missing, so there is nothing to copy.",
             )
             return
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
 
@@ -1815,7 +1881,7 @@ class EvidencePage(ResponsivePage):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         data = dialog.get_data()
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
 
@@ -1865,7 +1931,7 @@ class EvidencePage(ResponsivePage):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         data = dialog.get_data()
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
         service = self.evidence_service
@@ -1909,7 +1975,7 @@ class EvidencePage(ResponsivePage):
                 return
             reason = "removed from the evidence list"
 
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
         service = self.evidence_service
@@ -1933,7 +1999,7 @@ class EvidencePage(ResponsivePage):
         evidence = self._single_selection()
         if evidence is None or not evidence.is_removed:
             return
-        user = self._require_user()
+        user = self._require_writer()
         if user is None:
             return
         service = self.evidence_service
@@ -1951,25 +2017,34 @@ class EvidencePage(ResponsivePage):
         if evidence is None:
             QMessageBox.information(self, "Select Evidence", "Select one evidence record first.")
             return
-        service = self.evidence_service
-        files = service.case_store_files(evidence)
-        blockers = service.deletion_blockers(evidence)
-        impact = service.deletion_impact(evidence)
-        # Captured before the row is deleted: the instance is detached once the
-        # delete is committed, so reading a field afterwards would raise.
-        reference = evidence.evidence_id
+        user = self._require_writer()
+        if user is None:
+            return
+        from app.ui.deletion_worker import EvidenceDeletionPreviewWorker
 
+        worker = EvidenceDeletionPreviewWorker(evidence.id)
+        self._track(worker)
+        progress = self._open_progress("Preparing deletion", "Checking evidence and examination records…")
+        progress.setRange(0, 0)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        worker.succeeded.connect(
+            lambda preview: self._on_delete_prepared(evidence, user.id, preview)
+        )
+        worker.failed.connect(self._on_delete_failed)
+        worker.start()
+
+    def _on_delete_prepared(self, evidence, user_id, preview):
+        self._close_progress()
+        reference = evidence.evidence_id
         dialog = DeleteEvidenceDialog(
-            evidence, files, blockers, self, impact=impact
+            evidence, [Path(path) for path in preview["files"]],
+            preview["blockers"], self, impact=preview["impact"]
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        user = self._require_user()
-        if user is None:
-            return
         from app.ui.deletion_worker import DeletionWorker
 
-        worker = DeletionWorker("evidence", evidence.id, user.id, dialog.get_reason())
+        worker = DeletionWorker("evidence", evidence.id, user_id, dialog.get_reason())
         self._track(worker)
         progress = self._open_progress("Deleting Evidence", "Deleting evidence and derived artifacts…")
         progress.setRange(0, 0)
@@ -2022,6 +2097,9 @@ class EvidencePage(ResponsivePage):
 
     def _on_export_manifest(self):
         if not self.evidence_service or not self.case_context:
+            return
+        user = self._require_writer()
+        if user is None:
             return
         path, selected_filter = QFileDialog.getSaveFileName(
             self,

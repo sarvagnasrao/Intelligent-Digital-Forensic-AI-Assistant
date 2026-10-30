@@ -1,18 +1,15 @@
 """Findings service for investigation findings workflow."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.artifacts.models import Artifact
 from app.auth.models import User
 from app.findings.models import Finding, FindingArtifactLink, FindingOrigin, FindingStatus
-from app.artifacts.models import Artifact
-
-if TYPE_CHECKING:
-    from app.cases.models import Case
 
 
 class FindingService:
@@ -48,6 +45,10 @@ class FindingService:
         ai_confidence: float | None = None,
     ) -> Finding:
         """Create a new finding."""
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(created_by, case_id):
+            raise PermissionError("Read-only users cannot create findings")
         finding = Finding(
             finding_id=self._generate_finding_id(case_id),
             case_id=case_id,
@@ -94,10 +95,35 @@ class FindingService:
         description: str | None = None,
         conclusion: str | None = None,
         status: FindingStatus | None = None,
+        updated_by: User | None = None,
     ) -> Finding | None:
         finding = self.get_finding(finding_id)
         if not finding:
             return None
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(updated_by, finding.case_id):
+            raise PermissionError("Read-only users cannot update findings")
+        from app.findings.identity import is_identity_hypothesis, validate_identity_hypothesis
+
+        if is_identity_hypothesis(finding):
+            if status in (FindingStatus.VERIFIED, FindingStatus.REJECTED):
+                raise ValueError(
+                    "Use the review operations to verify or reject an identity hypothesis."
+                )
+            validate_identity_hypothesis(self.session, finding, description)
+        changed = (
+            (title is not None and title != finding.title)
+            or (description is not None and description != finding.description)
+            or (conclusion is not None and conclusion != finding.conclusion)
+        )
+        if changed and finding.status in (FindingStatus.VERIFIED, FindingStatus.REJECTED):
+            finding.status = FindingStatus.DRAFT
+            finding.verified_by = None
+            finding.verified_at = None
+            finding.verification_notes = None
+        if changed and status == FindingStatus.VERIFIED:
+            raise ValueError("Edit and verification must be separate operations.")
         if title is not None:
             finding.title = title
         if description is not None:
@@ -107,36 +133,88 @@ class FindingService:
         if status is not None:
             finding.status = status
             if status == FindingStatus.VERIFIED:
-                finding.verified_at = datetime.now(timezone.utc)
+                finding.verified_at = datetime.now(UTC)
+            elif status in (FindingStatus.DRAFT, FindingStatus.UNDER_REVIEW):
+                finding.verified_by = None
+                finding.verified_by_id = None
+                finding.verified_at = None
+                finding.verification_notes = None
         self.session.flush()
         return finding
 
-    def verify_finding(self, finding_id: int, verified_by: User, notes: str | None = None) -> Finding | None:
+    def verify_finding(
+        self, finding_id: int, verified_by: User, notes: str | None = None
+    ) -> Finding | None:
         """Mark finding as verified."""
         finding = self.get_finding(finding_id)
         if not finding:
             return None
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(verified_by, finding.case_id):
+            raise PermissionError("Read-only users cannot verify findings")
+        from app.findings.identity import is_identity_hypothesis, validate_identity_hypothesis
+
+        if is_identity_hypothesis(finding):
+            validate_identity_hypothesis(self.session, finding)
         finding.status = FindingStatus.VERIFIED
-        finding.verified_by_id = verified_by.id
-        finding.verified_at = datetime.now(timezone.utc)
+        finding.verified_by = verified_by
+        finding.verified_at = datetime.now(UTC)
         finding.verification_notes = notes
         self.session.flush()
         return finding
 
-    def reject_finding(self, finding_id: int, verified_by: User, notes: str | None = None) -> Finding | None:
+    def reject_finding(
+        self, finding_id: int, verified_by: User, notes: str | None = None
+    ) -> Finding | None:
         """Reject a finding."""
         finding = self.get_finding(finding_id)
         if not finding:
             return None
+        from app.findings.identity import is_identity_hypothesis, validate_identity_hypothesis
+
+        if is_identity_hypothesis(finding):
+            validate_identity_hypothesis(self.session, finding)
         finding.status = FindingStatus.REJECTED
-        finding.verified_by_id = verified_by.id
-        finding.verified_at = datetime.now(timezone.utc)
+        finding.verified_by = verified_by
+        finding.verified_at = datetime.now(UTC)
         finding.verification_notes = notes
         self.session.flush()
         return finding
 
-    def link_artifact(self, finding_id: int, artifact_id: int, relevance: str = "supports", notes: str | None = None, cited_in_ai: bool = False) -> FindingArtifactLink:
+    def link_artifact(
+        self,
+        finding_id: int,
+        artifact_id: int,
+        relevance: str = "supports",
+        notes: str | None = None,
+        cited_in_ai: bool = False,
+        *,
+        _identity_creation: bool = False,
+    ) -> FindingArtifactLink:
         """Link an artifact to a finding."""
+        from app.evidence.models import Evidence
+
+        finding = self.get_finding(finding_id)
+        from app.findings.identity import is_identity_hypothesis
+
+        if finding is not None and is_identity_hypothesis(finding) and not _identity_creation:
+            raise ValueError(
+                "Identity sources cannot be changed here; create a new hypothesis "
+                "with the revised sources."
+            )
+        artifact = self.session.execute(
+            select(Artifact)
+            .join(Evidence, Artifact.evidence_id == Evidence.id)
+            .where(
+                Artifact.id == artifact_id,
+                Evidence.removed_at.is_(None),
+            )
+        ).scalar_one_or_none()
+        if finding is None or artifact is None or artifact.case_id != finding.case_id:
+            raise ValueError(
+                "Artifact must belong to active evidence in the same case as the finding."
+            )
         link = FindingArtifactLink(
             finding_id=finding_id,
             artifact_id=artifact_id,
@@ -150,6 +228,14 @@ class FindingService:
 
     def unlink_artifact(self, finding_id: int, artifact_id: int) -> bool:
         """Remove artifact link from finding."""
+        from app.findings.identity import is_identity_hypothesis
+
+        finding = self.get_finding(finding_id)
+        if finding is not None and is_identity_hypothesis(finding):
+            raise ValueError(
+                "Identity sources cannot be changed here; create a new hypothesis "
+                "with the revised sources."
+            )
         stmt = select(FindingArtifactLink).where(
             FindingArtifactLink.finding_id == finding_id,
             FindingArtifactLink.artifact_id == artifact_id,
@@ -163,13 +249,21 @@ class FindingService:
 
     def get_finding_artifacts(self, finding_id: int) -> list[Artifact]:
         """Get all artifacts linked to a finding."""
-        stmt = select(Artifact).join(FindingArtifactLink).where(FindingArtifactLink.finding_id == finding_id)
+        stmt = (
+            select(Artifact)
+            .join(FindingArtifactLink)
+            .where(FindingArtifactLink.finding_id == finding_id)
+        )
         return list(self.session.execute(stmt).scalars().all())
 
-    def delete_finding(self, finding_id: int) -> bool:
+    def delete_finding(self, finding_id: int, deleted_by: User) -> bool:
         finding = self.get_finding(finding_id)
         if not finding:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(deleted_by, finding.case_id):
+            raise PermissionError("Read-only users cannot delete findings")
         self.session.delete(finding)
         self.session.flush()
         return True

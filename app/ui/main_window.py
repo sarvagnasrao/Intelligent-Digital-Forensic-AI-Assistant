@@ -377,7 +377,7 @@ class CaseShell(QWidget):
         self.pages_stack = QStackedWidget()
         self.overview_page = OverviewPage()
         self.evidence_page = EvidencePage(nav=self)
-        self.examination_page = ExaminationPage()
+        self.examination_page = ExaminationPage(nav=self)
         self.artifacts_page = ArtifactsSearchPage()
         self.ai_page = AIAnalysisPage(nav=self)
         self.entities_page = EntitiesTimelinePage()
@@ -561,14 +561,6 @@ class CaseShell(QWidget):
                 search_service = SearchService(session)
                 self.artifacts_page.set_search_service(search_service)
 
-        # Wire up finding service for findings page
-        if self.findings_page and hasattr(self.findings_page, "set_finding_service"):
-            from app.db.session import session_scope
-            with session_scope() as session:
-                from app.findings.service import FindingService
-                finding_service = FindingService(session)
-                self.findings_page.set_finding_service(finding_service)
-
         # Start the analysis queue for this case. It runs one job at a time in
         # the background and waits whenever an examination is running.
         runner = getattr(self, "_analysis_runner", None)
@@ -591,12 +583,14 @@ class CaseShell(QWidget):
             from app.db.session import get_session_factory
             from app.evidence.service import EvidenceService
             from app.examination.service import ExaminationService
+            from app.findings.service import FindingService
 
             factory = get_session_factory()
             self._evidence_service = EvidenceService(factory())
             self._exam_service = ExaminationService(factory())
             self._audit_service = AuditService(factory())
             self._case_overview_service = CaseService(factory())
+            self._finding_service = FindingService(factory())
         except Exception:
             return
 
@@ -608,6 +602,8 @@ class CaseShell(QWidget):
             self.examination_page.set_exam_service(self._exam_service)
         if hasattr(self.examination_page, "set_evidence_service"):
             self.examination_page.set_evidence_service(self._evidence_service)
+        if hasattr(self.findings_page, "set_finding_service"):
+            self.findings_page.set_finding_service(self._finding_service)
         if self.audit_page and hasattr(self.audit_page, "set_audit_service"):
             self.audit_page.set_audit_service(self._audit_service)
 
@@ -661,6 +657,7 @@ class NavigationController(QObject):
         super().__init__(main_window)
         self.main_window = main_window
         self.sidebar_collapsed = False
+        self._current_user: User | None = None
         self._stack = QStackedWidget()
         self.main_window.setCentralWidget(self._stack)
 
@@ -674,8 +671,6 @@ class NavigationController(QObject):
         self.global_shell.open_case_requested.connect(self.open_case)
         self.global_shell.logout_requested.connect(self.logout)
         self.case_shell.back_requested.connect(self.show_global)
-
-        self._current_user: User | None = None
 
     def set_user(self, user: User):
         self._current_user = user
@@ -696,12 +691,29 @@ class NavigationController(QObject):
         """Add an entry to the header's notification bell."""
         self.global_shell.header.add_notification(title, message, level)
 
-    def open_case(self, case_id: int, title: str, status: str, priority: str, investigator: str):
+    def open_case(self, case_id: int, title: str, status: str, priority: str, investigator: str, *, notify: bool = True):
         context = CaseContext(case_id, f"CASE-{case_id:04d}", title, status, priority, investigator)
         self.case_shell.set_case_context(context)
         self._stack.setCurrentWidget(self.case_shell)
         self.main_window.statusBar().showMessage(f"Case: {title} ({context.case_id_str})")
-        self.notify("Case opened", f"{context.case_id_str} - {title}", "info")
+        if notify:
+            self.global_shell.header.add_notification(
+                "Case opened", f"{context.case_id_str} - {title}", "info",
+                on_click=lambda: self._open_notified_case(case_id),
+            )
+
+    def _open_notified_case(self, case_id: int) -> None:
+        """Reopen an accessible case using its current details."""
+        page = self.global_shell.case_mgmt_page
+        page.refresh()
+        case = next((item for item in page._cases_cache if item.id == case_id), None)
+        if case is None:
+            QMessageBox.warning(self.main_window, "Case unavailable",
+                                "This case no longer exists or is no longer accessible.")
+            return
+        self.open_case(case.id, case.title, case.status, case.priority,
+                       case.assignee.full_name if case.assignee else "Unassigned", notify=False)
+        self.case_shell.show_page_by_key("overview")
 
     def show_global(self):
         self._stack.setCurrentWidget(self.global_shell)

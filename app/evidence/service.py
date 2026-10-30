@@ -230,9 +230,15 @@ class EvidenceService:
         """Register new evidence item."""
         # Verify case exists
         from app.auth.models import Case
+        from app.auth.service import AuthService
         case = self.session.get(Case, case_id)
         if not case:
             raise ValueError(f"Case {case_id} not found")
+        
+        # Check write permission
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(registered_by, case_id):
+            raise PermissionError("Read-only users cannot register evidence")
 
         # Verify source file exists
         source = Path(source_path)
@@ -455,6 +461,10 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence or evidence.status == EvidenceStatus.ARCHIVED:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot archive evidence")
         previous_status = evidence.status.value
         evidence.status = EvidenceStatus.ARCHIVED
         self.session.add(CustodyEvent(
@@ -482,6 +492,10 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence or evidence.status != EvidenceStatus.ARCHIVED:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot restore evidence")
         archive_event = next(
             (event for event in reversed(evidence.custody_events)
              if event.event_type == "archived"), None
@@ -599,10 +613,16 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence or evidence.is_removed:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot remove evidence")
 
         evidence.removed_at = datetime.now(timezone.utc)
         evidence.removed_by_id = performed_by.id
         evidence.removal_reason = reason.strip() or None
+        from app.findings.identity import invalidate_reviewed_sources
+        invalidate_reviewed_sources(self.session, evidence_id=evidence.id, user=performed_by)
         self.session.add(CustodyEvent(
             evidence_id=evidence.id,
             event_type="removed",
@@ -630,6 +650,10 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence or not evidence.is_removed:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot return evidence")
 
         evidence.removed_at = None
         evidence.removed_by_id = None
@@ -736,6 +760,10 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence:
             raise ValueError("That evidence no longer exists.")
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot delete evidence")
 
         blockers = self.deletion_blockers(evidence)
         if blockers:
@@ -807,6 +835,10 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence:
             return False
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot update evidence details")
         name = name.strip()
         if not name:
             raise ValueError("The evidence name cannot be empty.")
@@ -855,6 +887,10 @@ class EvidenceService:
         evidence = self.get_evidence_by_id(evidence_id)
         if not evidence:
             raise ValueError("That evidence no longer exists.")
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(performed_by, evidence.case_id):
+            raise PermissionError("Read-only users cannot set reference hash")
 
         value = hash_value.strip().lower()
         expected = self._HEX_LENGTH[algorithm]

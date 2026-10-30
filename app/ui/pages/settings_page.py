@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 
 import httpx
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -33,6 +34,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QInputDialog,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -41,12 +45,18 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QToolButton,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from app.config import (
     cloud_api_key,
+    connection_api_key,
+    AIConnectionConfig,
+    AIModelConfig,
     database_path,
     describe_layout_paths,
     free_space_bytes,
@@ -148,6 +158,42 @@ class _StatusWorker(QThread):
         self.finished_with_result.emit(result)
 
 
+class _ModelDiscoveryWorker(QThread):
+    """List model IDs without transmitting evidence or exposing provider errors."""
+
+    finished_with_result = Signal(object, object, str)
+
+    def __init__(self, request, token):
+        super().__init__()
+        self._request = request
+        self._token = token
+
+    def run(self):
+        provider, base_url, api_key = self._request
+        try:
+            headers = {"Authorization": f"Bearer {api_key}"} if provider == MODE_CLOUD else {}
+            path = "/models" if provider == MODE_CLOUD else "/api/tags"
+            response = httpx.get(
+                f"{base_url}{path}", headers=headers,
+                timeout=httpx.Timeout(5.0, connect=3.0), follow_redirects=False,
+            )
+            if response.status_code != 200:
+                self.finished_with_result.emit(self._token, [], "Could not load models from the provider.")
+                return
+            payload = response.json()
+            entries = payload.get("data" if provider == MODE_CLOUD else "models")
+            if not isinstance(entries, list):
+                raise ValueError("Invalid model list")
+            field = "id" if provider == MODE_CLOUD else "name"
+            ids = list(dict.fromkeys(
+                entry[field].strip() for entry in entries
+                if isinstance(entry, dict) and isinstance(entry.get(field), str) and entry[field].strip()
+            ))
+            self.finished_with_result.emit(self._token, ids, "")
+        except Exception:  # noqa: BLE001 - request and response details may contain secrets
+            self.finished_with_result.emit(self._token, [], "Could not load models from the provider.")
+
+
 class _CloudTestWorker(QThread):
     """Send a one-token request so a bad key is found before the demo."""
 
@@ -175,8 +221,8 @@ class _CloudTestWorker(QThread):
         except httpx.TimeoutException:
             self.finished_with_result.emit(False, "Timed out after 20 seconds.")
             return
-        except Exception as exc:  # noqa: BLE001 - shown verbatim to the user
-            self.finished_with_result.emit(False, f"Could not connect: {exc}")
+        except Exception:  # noqa: BLE001 - exception details can contain credentials
+            self.finished_with_result.emit(False, "Could not connect to the provider.")
             return
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -185,9 +231,8 @@ class _CloudTestWorker(QThread):
         elif response.status_code in (401, 403):
             self.finished_with_result.emit(False, "The provider rejected this API key.")
         else:
-            detail = response.text.strip().replace("\n", " ")[:160]
             self.finished_with_result.emit(
-                False, f"HTTP {response.status_code}: {detail}"
+                False, f"HTTP {response.status_code} from provider."
             )
 
 
@@ -221,6 +266,10 @@ class SettingsPage(ResponsivePage):
         self._test_worker: _CloudTestWorker | None = None
         self._services_index = 0
         self.ai_mode = MODE_LOCAL
+        self._connections = []
+        self._connection_index = -1
+        self._discovery_generation = 0
+        self._discovery_worker = None
         super().__init__(parent=parent)
         # Quitting the application must not leave a poll or a connection test
         # running: the page's slots would disappear before the thread ends.
@@ -379,40 +428,36 @@ class SettingsPage(ResponsivePage):
     def _build_ai_pane(self):
         layout = self._add_pane()
 
-        _card, grid = self._add_card(
-            layout,
-            "AI mode",
-            "Offline runs both models on this machine and works without a "
-            "network. Cloud sends your question and the selected evidence text "
-            "to a provider you configure.",
+        # Keep the saved background provider for compatibility, without a
+        # separate mode selector in the chat-connection workflow.
+        self.analysis_provider = QComboBox(self)
+        self.analysis_provider.addItem("Local (Ollama)", MODE_LOCAL)
+        self.analysis_provider.addItem("Cloud", MODE_CLOUD)
+        self.analysis_provider.currentIndexChanged.connect(
+            lambda _index: setattr(self, "ai_mode", self.analysis_provider.currentData())
         )
+        self.analysis_provider.hide()
 
-        self._offline_btn = QPushButton("Offline (local)")
-        self._cloud_btn = QPushButton("Cloud")
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.setExclusive(True)
+        self._build_connections_card(layout)
 
-        switch = QWidget()
-        switch.setObjectName("SettingsFieldCell")
-        switch_layout = QHBoxLayout(switch)
-        switch_layout.setContentsMargins(0, 0, 0, 0)
-        switch_layout.setSpacing(0)
-        for button, mode, side in (
-            (self._offline_btn, MODE_LOCAL, "left"),
-            (self._cloud_btn, MODE_CLOUD, "right"),
-        ):
-            button.setCheckable(True)
-            button.setProperty("segment", side)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, m=mode: self.set_ai_mode(m))
-            self._mode_group.addButton(button)
-            switch_layout.addWidget(button)
-        switch_layout.addStretch(1)
-        grid.addWidget(switch, 0, 0, 1, 2)
+        background_toggle = QToolButton()
+        background_toggle.setText("Background analysis and embedding settings")
+        background_toggle.setCheckable(True)
+        background_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        background_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        layout.addWidget(background_toggle)
+        background = QWidget()
+        background_layout = QVBoxLayout(background)
+        background_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(background)
+        background.hide()
+        background_toggle.toggled.connect(background.setVisible)
+        background_toggle.toggled.connect(lambda expanded: background_toggle.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow))
 
         # --- Offline -----------------------------------------------------
         self._offline_card, grid = self._add_card(
-            layout,
+            background_layout,
             "Offline models",
             "Served by Ollama on this machine. The offline bundle already "
             "contains both models, so nothing is downloaded here.",
@@ -422,7 +467,7 @@ class SettingsPage(ResponsivePage):
         self.ollama_model.setEditable(True)
         self.ollama_model.addItems(["phi3:mini", "llama3.2:3b", "qwen2.5:3b"])
         self.ollama_model.setCurrentText("phi3:mini")
-        self._add_field(grid, 0, 0, "Chat model", self.ollama_model)
+        self._add_field(grid, 0, 0, "Background chat model", self.ollama_model)
 
         self.embedding_model = QComboBox()
         self.embedding_model.setEditable(True)
@@ -430,19 +475,50 @@ class SettingsPage(ResponsivePage):
         self.embedding_model.setCurrentText("all-minilm")
         self._add_field(grid, 0, 1, "Embedding model", self.embedding_model)
 
+        self.embedding_chunk_size = QSpinBox()
+        self.embedding_chunk_size.setRange(100, 20_000)
+        self.embedding_chunk_size.setSingleStep(100)
+        self.embedding_chunk_size.setSuffix(" chars")
+        self.embedding_chunk_size.setToolTip(
+            "Characters per semantic passage. Larger passages carry more context; "
+            "smaller passages can improve topical precision. Changing this requires re-indexing."
+        )
+        self._add_field(grid, 1, 0, "Search chunk size", self.embedding_chunk_size)
+
+        self.embedding_chunk_overlap = QSpinBox()
+        self.embedding_chunk_overlap.setRange(0, 19_900)
+        self.embedding_chunk_overlap.setSingleStep(50)
+        self.embedding_chunk_overlap.setSuffix(" chars")
+        self.embedding_chunk_overlap.setToolTip(
+            "Repeated characters between passages. Must remain smaller than chunk size."
+        )
+        self._add_field(grid, 1, 1, "Chunk overlap", self.embedding_chunk_overlap)
+
+        self.embedding_chunk_size.valueChanged.connect(
+            lambda size: self.embedding_chunk_overlap.setMaximum(size - 1)
+        )
+
+        self.embedding_batch_size = QSpinBox()
+        self.embedding_batch_size.setRange(1, 512)
+        self.embedding_batch_size.setToolTip(
+            "Passages sent per embedding request. Reduce this if the model runs out of memory."
+        )
+        self._add_field(grid, 2, 0, "Embedding batch size", self.embedding_batch_size)
+
         hint = QLabel(
             "all-minilm produces the 384-dimension vectors the existing search "
-            "index expects. A different model needs the artifacts re-indexed."
+            "index expects. Changing the model or chunk settings requires re-indexing "
+            "the affected case artifacts."
         )
         hint.setProperty("sectionHint", True)
         hint.setWordWrap(True)
-        grid.addWidget(hint, 1, 0, 1, 2)
+        grid.addWidget(hint, 3, 0, 1, 2)
 
         # --- Cloud -------------------------------------------------------
         self._cloud_card, grid = self._add_card(
-            layout,
-            "Cloud provider",
-            "Any OpenAI-compatible endpoint works. The key is encrypted for this "
+            background_layout,
+            "Background cloud provider",
+            "Used only for background analysis and cloud embeddings. The key is encrypted for this "
             "Windows account before it is written to disk.",
         )
 
@@ -495,10 +571,380 @@ class SettingsPage(ResponsivePage):
         test_layout.addWidget(self.test_btn)
         test_layout.addWidget(self.test_status, 1)
         grid.addWidget(test_row, 3, 0, 1, 2)
+        test_hint = QLabel("Testing does not save settings. Select Save to keep them.")
+        test_hint.setProperty("sectionHint", True)
+        test_hint.setWordWrap(True)
+        grid.addWidget(test_hint, 4, 0, 1, 2)
 
         # --- Advanced ----------------------------------------------------
-        self._build_advanced_card(layout)
+        self._build_advanced_card(background_layout)
         layout.addStretch(1)
+
+    def _build_connections_card(self, layout):
+        _card, grid = self._add_card(
+            layout, "AI Analysis connections",
+            "Manage chat connections and enable individual models. Cloud models need a usable API key "
+            "to appear in AI Analysis. Changes are kept only after Save Settings. "
+            "These choices do not change background analysis or embeddings.",
+        )
+        tabs = QTabWidget()
+        providers = QWidget()
+        provider_layout = QVBoxLayout(providers)
+        models = QWidget()
+        models_layout = QVBoxLayout(models)
+        tabs.addTab(providers, "Providers")
+        tabs.addTab(models, "Models")
+        grid.addWidget(tabs, 0, 0, 1, 2)
+        self.connection_combo = QListWidget()
+        self.connection_combo.setMaximumHeight(120)
+        self.connection_combo.currentRowChanged.connect(self._select_connection)
+        provider_layout.addWidget(self.connection_combo)
+        actions = QWidget()
+        row = QHBoxLayout(actions)
+        row.setContentsMargins(0, 0, 0, 0)
+        add = QPushButton("Connect provider")
+        add.clicked.connect(self._connect_provider)
+        manage = QPushButton("Manage")
+        manage.clicked.connect(self._manage_connection)
+        self.remove_connection_btn = QPushButton("Remove connection")
+        self.remove_connection_btn.clicked.connect(self._remove_connection)
+        row.addWidget(add)
+        row.addWidget(manage)
+        row.addWidget(self.remove_connection_btn)
+        provider_layout.addWidget(actions)
+        self.connection_dialog = QDialog(self)
+        self.connection_dialog.setWindowTitle("Manage provider")
+        dialog_layout = QVBoxLayout(self.connection_dialog)
+        editor = QGridLayout()
+        dialog_layout.addLayout(editor)
+        self.connection_name = QLineEdit()
+        self.connection_name.textChanged.connect(self._update_connection_label)
+        self.connection_provider = QComboBox()
+        self.connection_provider.addItem("Ollama", MODE_LOCAL)
+        self.connection_provider.addItem("NVIDIA NIM", MODE_CLOUD)
+        self.connection_provider.addItem("OpenAI", MODE_CLOUD)
+        self.connection_provider.addItem("Custom OpenAI-compatible", MODE_CLOUD)
+        self.connection_provider.currentIndexChanged.connect(self._provider_preset_changed)
+        self.connection_endpoint = QLineEdit()
+        self.connection_endpoint.setToolTip(
+            "Local connections must use the Ollama host configured under Advanced. "
+            "Cloud connections use their own endpoint."
+        )
+        self.connection_key = QLineEdit()
+        self.connection_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._add_field(editor, 0, 0, "Name", self.connection_name)
+        self._add_field(editor, 0, 1, "Provider", self.connection_provider)
+        self._add_field(editor, 1, 0, "Endpoint", self.connection_endpoint, colspan=2, width=None)
+        self._add_field(editor, 2, 0, "API key", self.connection_key, colspan=2, width=None)
+        self.connection_model_filter = QLineEdit()
+        self.connection_model_filter.setPlaceholderText("Filter models by name…")
+        self.connection_model_filter.textChanged.connect(self._filter_connection_models)
+        models_layout.addWidget(self.connection_model_filter)
+        self.connection_models = QListWidget()
+        self.connection_models.hide()
+        self.connection_models.setParent(self)
+        self.model_tree = QTreeWidget()
+        self.model_tree.setHeaderHidden(True)
+        self.model_tree.itemChanged.connect(self._model_tree_changed)
+        self.model_tree.itemClicked.connect(self._model_tree_selected)
+        models_layout.addWidget(self.model_tree)
+        model_actions = QWidget()
+        row = QHBoxLayout(model_actions)
+        row.setContentsMargins(0, 0, 0, 0)
+        add_model = QPushButton("Add model")
+        add_model.clicked.connect(self._add_connection_model)
+        remove_model = QPushButton("Remove model")
+        remove_model.clicked.connect(self._remove_connection_model)
+        row.addWidget(add_model)
+        row.addWidget(remove_model)
+        self.load_models_btn = QPushButton("Refresh models")
+        self.load_models_btn.clicked.connect(self._load_available_models)
+        row.addWidget(self.load_models_btn)
+        row.addStretch(1)
+        models_layout.addWidget(model_actions)
+        self.connection_test_btn = QPushButton("Test connection")
+        self.connection_test_btn.clicked.connect(self._test_chat_connection)
+        self.connection_test_status = QLabel("")
+        self.connection_test_status.setWordWrap(True)
+        dialog_layout.addWidget(self.connection_test_btn)
+        dialog_layout.addWidget(self.connection_test_status)
+        self.connection_enabled = QCheckBox("Enable this connection in AI Analysis")
+        dialog_layout.addWidget(self.connection_enabled)
+        done = QPushButton("Done")
+        done.clicked.connect(self.connection_dialog.accept)
+        dialog_layout.addWidget(done)
+        self.model_discovery_status = QLabel("")
+        self.model_discovery_status.setWordWrap(True)
+        models_layout.addWidget(self.model_discovery_status)
+        self.background_cloud_warning = QLabel(
+            "Background analysis is currently configured to use cloud AI; "
+            "case consent is required before evidence is sent."
+        )
+        self.background_cloud_warning.setWordWrap(True)
+        self.background_cloud_warning.setProperty("sectionHint", True)
+        self.background_cloud_warning.hide()
+        grid.addWidget(self.background_cloud_warning, 1, 0, 1, 2)
+        tabs.currentChanged.connect(lambda _: self._rebuild_model_tree())
+
+    def _connect_provider(self):
+        self._add_connection()
+        self._manage_connection()
+
+    def _provider_preset_changed(self, index):
+        if getattr(self, "_loading_connection", False) or index < 0:
+            return
+        presets = {
+            0: ("Ollama", get_config().ollama.host),
+            1: ("NVIDIA NIM", "https://integrate.api.nvidia.com/v1"),
+            2: ("OpenAI", "https://api.openai.com/v1"),
+            3: ("Custom", ""),
+        }
+        name, endpoint = presets[index]
+        self.connection_name.setText(name)
+        self.connection_endpoint.setText(endpoint)
+
+    def _manage_connection(self):
+        if self._connection_index < 0:
+            return
+        self.connection_dialog.exec()
+        self._store_connection()
+        self._rebuild_model_tree()
+
+    def _rebuild_model_tree(self):
+        self._store_connection()
+        self.model_tree.blockSignals(True)
+        self.model_tree.clear()
+        needle = self.connection_model_filter.text().strip().casefold()
+        for index, connection in enumerate(self._connections):
+            group = QTreeWidgetItem([connection.name])
+            self.model_tree.addTopLevelItem(group)
+            for model in connection.models:
+                if needle and needle not in model.id.casefold() and needle not in connection.name.casefold():
+                    continue
+                item = QTreeWidgetItem([model.id])
+                item.setData(0, Qt.ItemDataRole.UserRole, (index, model.id))
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Checked if model.enabled else Qt.CheckState.Unchecked)
+                group.addChild(item)
+            group.setHidden(bool(needle) and group.childCount() == 0)
+            group.setExpanded(True)
+        self.model_tree.blockSignals(False)
+
+    def _model_tree_changed(self, item, _column):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data is None:
+            return
+        index, model_id = data
+        for model in self._connections[index].models:
+            if model.id == model_id:
+                model.enabled = item.checkState(0) == Qt.CheckState.Checked
+        if index == self._connection_index:
+            for i in range(self.connection_models.count()):
+                entry = self.connection_models.item(i)
+                if entry.text() == model_id:
+                    entry.setCheckState(item.checkState(0))
+
+    def _model_tree_selected(self, item, _column):
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        group = item.parent() or item
+        index = data[0] if data is not None else self.model_tree.indexOfTopLevelItem(group)
+        if index >= 0:
+            self.connection_combo.setCurrentRow(index)
+            if data is not None:
+                for row in range(self.connection_models.count()):
+                    if self.connection_models.item(row).text() == data[1]:
+                        self.connection_models.setCurrentRow(row)
+                        break
+
+    def _load_available_models(self):
+        if self._discovery_worker is not None or not 0 <= self._connection_index < len(self._connections):
+            return
+        provider = self.connection_provider.currentData()
+        url = self.connection_endpoint.text().strip().rstrip("/")
+        key = self.connection_key.text().strip()
+        if not url.startswith(("http://", "https://")) or (provider == MODE_CLOUD and not key):
+            self.model_discovery_status.setText("Enter a valid endpoint and, for cloud connections, an API key.")
+            return
+        self._discovery_generation += 1
+        token = (self._discovery_generation, self._connections[self._connection_index].id,
+                 provider, url, key)
+        worker = _ModelDiscoveryWorker((provider, url, key), token)
+        self._discovery_worker = worker
+        self.load_models_btn.setEnabled(False)
+        self.model_discovery_status.setText("Loading models…")
+        worker.finished_with_result.connect(self._on_models_discovered)
+        _track(worker)
+        worker.start()
+
+    def _on_models_discovered(self, token, ids, error):
+        self._discovery_worker = None
+        self.load_models_btn.setEnabled(True)
+        if not 0 <= self._connection_index < len(self._connections):
+            return
+        current = (self._discovery_generation, self._connections[self._connection_index].id,
+                   self.connection_provider.currentData(), self.connection_endpoint.text().strip().rstrip("/"),
+                   self.connection_key.text().strip())
+        if token != current:
+            return
+        if error:
+            self.model_discovery_status.setText(error)
+            return
+        existing = {self.connection_models.item(i).text() for i in range(self.connection_models.count())}
+        added = 0
+        for model_id in ids:
+            if model_id not in existing:
+                self._append_model(model_id, False)
+                existing.add(model_id)
+                added += 1
+        self.model_discovery_status.setText(f"Added {added} model(s), disabled until selected. Save to keep changes.")
+        self._rebuild_model_tree()
+
+    def _test_chat_connection(self):
+        if self._connection_index < 0:
+            return
+        url = self.connection_endpoint.text().strip().rstrip("/")
+        provider = self.connection_provider.currentData()
+        key = self.connection_key.text().strip()
+        if not url.startswith(("http://", "https://")) or (provider == MODE_CLOUD and not key):
+            self.connection_test_status.setText("Enter a valid endpoint and API key.")
+            return
+        self.connection_test_btn.setEnabled(False)
+        self.connection_test_status.setText("Testing…")
+        def test():
+            started = time.perf_counter()
+            try:
+                if provider == MODE_LOCAL:
+                    response = httpx.get(f"{url}/api/tags", timeout=20.0)
+                else:
+                    response = httpx.get(f"{url}/models",
+                        headers={"Authorization": f"Bearer {key}"},
+                        timeout=20.0)
+                elapsed = round((time.perf_counter() - started) * 1000)
+                ok = response.status_code == 200
+                result = "Success" if ok else "Failure"
+                return ok, f"{result} — {elapsed} ms (HTTP {response.status_code}; model list only)"
+            except Exception:  # noqa: BLE001 - never expose request details or secrets
+                elapsed = round((time.perf_counter() - started) * 1000)
+                return False, f"Failure — {elapsed} ms (could not connect)"
+        worker = _TaskWorker(test)
+        worker.finished_with_result.connect(self._on_chat_test_result)
+        _track(worker)
+        worker.start()
+
+    def _on_chat_test_result(self, _ok, message):
+        self.connection_test_btn.setEnabled(True)
+        self.connection_test_status.setText(message)
+
+    def _store_connection(self):
+        if not 0 <= self._connection_index < len(self._connections):
+            return
+        connection = self._connections[self._connection_index]
+        connection.name = self.connection_name.text().strip()
+        connection.provider = self.connection_provider.currentData()
+        connection.base_url = self.connection_endpoint.text().strip()
+        connection.enabled = self.connection_enabled.isChecked()
+        key = self.connection_key.text()
+        if key or not (connection.api_key.startswith("dpapi:") and not connection_api_key(connection)):
+            connection.api_key = key
+        connection.models = [AIModelConfig(id=self.connection_models.item(i).text().strip(),
+                             enabled=self.connection_models.item(i).checkState() == Qt.CheckState.Checked)
+                             for i in range(self.connection_models.count())]
+
+    def _select_connection(self, index):
+        if getattr(self, "_loading_connection", False):
+            return
+        self._discovery_generation += 1
+        self.model_discovery_status.clear()
+        self._store_connection()
+        self._connection_index = index
+        self._loading_connection = True
+        valid = 0 <= index < len(self._connections)
+        for widget in (self.connection_name, self.connection_provider, self.connection_endpoint,
+                       self.connection_key, self.connection_models, self.connection_model_filter,
+                       self.connection_enabled):
+            widget.setEnabled(valid)
+        self.remove_connection_btn.setEnabled(valid and self._connections[index].id != "local")
+        self.connection_models.clear()
+        self.connection_model_filter.clear()
+        if not valid:
+            self.connection_name.clear()
+            self.connection_endpoint.clear()
+            self.connection_key.clear()
+            self._loading_connection = False
+            return
+        connection = self._connections[index]
+        self.connection_name.setText(connection.name)
+        self.connection_enabled.setChecked(connection.enabled)
+        endpoint = connection.base_url.rstrip("/").lower()
+        if connection.provider == MODE_LOCAL:
+            preset = 0
+        elif endpoint == "https://integrate.api.nvidia.com/v1":
+            preset = 1
+        elif endpoint == "https://api.openai.com/v1":
+            preset = 2
+        else:
+            preset = 3
+        self.connection_provider.setCurrentIndex(preset)
+        self.connection_provider.setEnabled(connection.id != "local")
+        self.connection_endpoint.setText(connection.base_url)
+        self.connection_key.setText(connection_api_key(connection))
+        for model in connection.models:
+            self._append_model(model.id, model.enabled)
+        self._loading_connection = False
+
+    def _update_connection_label(self, text):
+        if not getattr(self, "_loading_connection", False) and 0 <= self._connection_index < self.connection_combo.count():
+            self.connection_combo.item(self._connection_index).setText(
+                text.strip() or "New connection"
+            )
+
+    def _append_model(self, model_id, enabled=True):
+        item = QListWidgetItem(model_id)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked)
+        self.connection_models.addItem(item)
+        item.setHidden(self.connection_model_filter.text().strip().casefold() not in model_id.casefold())
+
+    def _filter_connection_models(self, text):
+        needle = text.strip().casefold()
+        for index in range(self.connection_models.count()):
+            item = self.connection_models.item(index)
+            item.setHidden(needle not in item.text().casefold())
+        if hasattr(self, "model_tree") and not getattr(self, "_loading_connection", False):
+            self._rebuild_model_tree()
+
+    def _add_connection(self):
+        self._store_connection()
+        self._connection_index = -1
+        self._connections.append(AIConnectionConfig(id=str(uuid.uuid4()), name="New connection",
+                                 provider=MODE_LOCAL, base_url="http://127.0.0.1:11434"))
+        self.connection_combo.addItem("New connection")
+        self.connection_combo.setCurrentRow(len(self._connections) - 1)
+
+    def _remove_connection(self):
+        index = self._connection_index
+        if index < 0 or self._connections[index].id == "local":
+            return
+        self._connection_index = -1
+        self._connections.pop(index)
+        self.connection_combo.takeItem(index)
+        self._select_connection(self.connection_combo.currentRow())
+
+    def _add_connection_model(self):
+        if self._connection_index < 0:
+            return
+        value, ok = QInputDialog.getText(self, "Add model", "Exact model ID:")
+        value = value.strip()
+        if ok and value and not any(self.connection_models.item(i).text() == value
+                                    for i in range(self.connection_models.count())):
+            self._append_model(value)
+            self._rebuild_model_tree()
+
+    def _remove_connection_model(self):
+        row = self.connection_models.currentRow()
+        if row >= 0:
+            self.connection_models.takeItem(row)
+            self._rebuild_model_tree()
 
     def _build_advanced_card(self, layout: QVBoxLayout) -> None:
         card = QFrame()
@@ -585,12 +1031,10 @@ class SettingsPage(ResponsivePage):
         self._add_field(grid, 2, 1, "Embedding source", self.embedding_provider)
 
     def set_ai_mode(self, mode: str) -> None:
+        """Set the background provider (legacy callers use this method)."""
         self.ai_mode = MODE_CLOUD if mode == MODE_CLOUD else MODE_LOCAL
-        self._offline_btn.setChecked(self.ai_mode == MODE_LOCAL)
-        self._cloud_btn.setChecked(self.ai_mode == MODE_CLOUD)
-        self._offline_card.setVisible(self.ai_mode == MODE_LOCAL)
-        self._cloud_card.setVisible(self.ai_mode == MODE_CLOUD)
-        self._fit_column()
+        self.analysis_provider.setCurrentIndex(self.analysis_provider.findData(self.ai_mode))
+        self.background_cloud_warning.setVisible(self.ai_mode == MODE_CLOUD)
 
     def _toggle_advanced(self, expanded: bool) -> None:
         self._advanced_content.setVisible(expanded)
@@ -802,12 +1246,6 @@ class SettingsPage(ResponsivePage):
         self.worker_timeout.setSuffix(" seconds")
         self.worker_timeout.setValue(300)
         self._add_field(grid, 1, 0, "Timeout", self.worker_timeout)
-
-        self.max_file_size = QSpinBox()
-        self.max_file_size.setRange(1, 1000)
-        self.max_file_size.setSuffix(" MB")
-        self.max_file_size.setValue(10)
-        self._add_field(grid, 1, 1, "Max file extract size", self.max_file_size)
 
         layout.addStretch(1)
 
@@ -1301,12 +1739,27 @@ class SettingsPage(ResponsivePage):
         # Worker
         self.worker_url.setText(config.worker.url)
         self.worker_timeout.setValue(config.worker.timeout_seconds)
-        self.max_file_size.setValue(config.forensics.max_file_extract_mb)
 
         # AI
         self.ollama_host.setText(config.ollama.host)
         self.ollama_model.setCurrentText(config.ollama.model)
+        self._connection_index = -1
+        self._connections = [item.model_copy(deep=True) for item in config.ollama.chat_connections or []]
+        self.connection_combo.blockSignals(True)
+        self.connection_combo.clear()
+        for item in self._connections:
+            self.connection_combo.addItem(item.name)
+        self.connection_combo.blockSignals(False)
+        self.connection_combo.setCurrentRow(0 if self._connections else -1)
+        self._select_connection(self.connection_combo.currentRow())
         self.embedding_model.setCurrentText(config.embeddings.model_id)
+        self.embedding_chunk_size.setValue(config.embeddings.chunk_size)
+        self.embedding_chunk_overlap.setMaximum(
+            max(self.embedding_chunk_overlap.value(), config.embeddings.chunk_size - 1)
+        )
+        self.embedding_chunk_overlap.setValue(config.embeddings.chunk_overlap)
+        self.embedding_chunk_overlap.setMaximum(config.embeddings.chunk_size - 1)
+        self.embedding_batch_size.setValue(config.embeddings.batch_size)
         self.embedding_provider.setCurrentIndex(
             max(0, self.embedding_provider.findData(config.embeddings.provider))
         )
@@ -1350,9 +1803,33 @@ class SettingsPage(ResponsivePage):
         """Save all settings to config.yaml."""
         config = get_config()
 
+        self._store_connection()
+        for connection in self._connections:
+            ids = [model.id for model in connection.models]
+            if (not connection.name or not connection.base_url.startswith(("http://", "https://"))
+                    or not all(ids) or len(ids) != len(set(ids))):
+                QMessageBox.warning(self, "Invalid connection", "Each connection needs a name, a valid endpoint and unique nonempty model IDs.")
+                return
+
+        if self.embedding_chunk_overlap.value() >= self.embedding_chunk_size.value():
+            QMessageBox.warning(
+                self,
+                "Invalid chunk settings",
+                "Chunk overlap must be smaller than chunk size.",
+            )
+            return
+
+        indexing_changed = (
+            config.embeddings.chunk_size != self.embedding_chunk_size.value()
+            or config.embeddings.chunk_overlap != self.embedding_chunk_overlap.value()
+            or config.embeddings.model_id != self.embedding_model.currentText().strip()
+            or config.embeddings.provider
+            != (self.embedding_provider.currentData() or "ollama")
+        )
+
         # Cloud providers fail only when the investigator asks a question, so
         # reject incomplete cloud settings here rather than at the demo.
-        chat_provider = self.ai_mode
+        chat_provider = self.analysis_provider.currentData() or MODE_LOCAL
         embedding_provider = self.embedding_provider.currentData() or "ollama"
         cloud_model = self.cloud_model.currentText().strip()
         cloud_url = self.cloud_endpoint.text().strip().rstrip("/")
@@ -1363,7 +1840,7 @@ class SettingsPage(ResponsivePage):
                     self,
                     "API key required",
                     "A cloud provider is selected, but the API key is empty. "
-                    "Paste the provider key, or switch back to Offline.",
+                    "Paste the provider key, or select local providers.",
                 )
                 return
             if not cloud_url.startswith(("https://", "http://")):
@@ -1390,17 +1867,24 @@ class SettingsPage(ResponsivePage):
         # Worker
         config.worker.url = self.worker_url.text()
         config.worker.timeout_seconds = self.worker_timeout.value()
-        config.forensics.max_file_extract_mb = self.max_file_size.value()
 
         # AI
         config.ollama.host = self.ollama_host.text().strip()
         config.ollama.provider = chat_provider
         config.ollama.model = self.ollama_model.currentText().strip()
         config.ollama.cloud_model = cloud_model
+        config.ollama.chat_connections = [item.model_copy(deep=True) for item in self._connections]
         config.ollama.cloud_base_url = cloud_url
-        config.ollama.cloud_api_key = cloud_key
+        # A DPAPI value may be unreadable under another Windows account. An
+        # empty field in that case is not an instruction to erase the original.
+        if cloud_key or not (config.ollama.cloud_api_key.startswith("dpapi:")
+                             and not cloud_api_key(config)):
+            config.ollama.cloud_api_key = cloud_key
         config.embeddings.provider = embedding_provider
         config.embeddings.model_id = self.embedding_model.currentText().strip()
+        config.embeddings.chunk_size = self.embedding_chunk_size.value()
+        config.embeddings.chunk_overlap = self.embedding_chunk_overlap.value()
+        config.embeddings.batch_size = self.embedding_batch_size.value()
         config.ollama.temperature = self.ai_temperature.value() / 100
         config.ollama.max_tokens = self.ai_max_tokens.value()
         config.ollama.context_window_tokens = self.ai_context_tokens.value()
@@ -1414,6 +1898,7 @@ class SettingsPage(ResponsivePage):
         config.auth.bcrypt_rounds = self.bcrypt_rounds.value()
 
         save_config(config)
+        self._load_current_settings()
         self._refresh_paths()
 
         ThemeManager().set_mode(config.ui.theme)
@@ -1422,7 +1907,12 @@ class SettingsPage(ResponsivePage):
         QMessageBox.information(
             self,
             "Settings Saved",
-            "Settings have been saved. Some changes may require a restart.",
+            "Settings have been saved. "
+            + (
+                "Existing semantic vectors keep their previous settings until those artifacts are re-indexed. "
+                if indexing_changed else ""
+            )
+            + "Some changes may require a restart.",
         )
 
     def _preview_theme(self, _index: int = -1) -> None:

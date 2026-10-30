@@ -11,10 +11,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.auth.models import User, UserRole
+from app.cases.models import Case
 from app.config import get_config
-
-if TYPE_CHECKING:
-    from app.cases.models import Case
 
 
 def hash_password(password: str) -> str:
@@ -198,6 +196,19 @@ class AuthService:
 
     def user_can_modify_case(self, user: User, case_id: int) -> bool:
         """Check if user can modify a case (admin, creator, or assignee)."""
+        return self.user_can_access_case(user, case_id)
+
+    def user_can_write_case(self, user: User | None, case_id: int) -> bool:
+        """Check if user can perform write operations on a case.
+        
+        READ_ONLY users can never write, regardless of case assignment.
+        ADMIN and INVESTIGATOR users can write if they have case access.
+        None user returns False.
+        """
+        if user is None:
+            return False
+        if user.role == UserRole.READ_ONLY:
+            return False
         return self.user_can_access_case(user, case_id)
 
     def user_is_admin(self, user: User) -> bool:

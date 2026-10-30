@@ -99,6 +99,10 @@ class ReportService:
         case = self.session.get(Case, case_id)
         if not case:
             raise ValueError(f"Case {case_id} not found")
+        from app.auth.service import AuthService
+        auth_service = AuthService(self.session)
+        if not auth_service.user_can_write_case(generated_by, case_id):
+            raise PermissionError("Read-only users cannot generate reports")
 
         template = self.get_template(template_id)
 

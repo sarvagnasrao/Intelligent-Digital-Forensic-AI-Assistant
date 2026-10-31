@@ -1,17 +1,7 @@
-"""Settings Page - Application settings.
+"""Five category panes with flat, content-sized sections and one save bar.
 
-The page is split into five panes behind a left-hand nav so each one fits on a
-single screen. Two ideas shape the layout:
-
-* Only settings that belong together share a pane, and only the controls that
-  apply to the current choice are shown. The AI pane, for example, shows either
-  local models or cloud credentials - never both.
-* Local processes are managed in place. The Services pane can start, stop and
-  restart the worker, Qdrant and Ollama, but only processes IDFA itself started
-  (tracked by PID file) are ever stopped.
-
-Anything that touches the network or the file system runs on a worker thread so
-the window never freezes while a service boots.
+Chat connections, background analysis and search indexing are separate workflows.
+Provider editors keep drafts until Save; process and storage actions are immediate.
 """
 from __future__ import annotations
 
@@ -32,11 +22,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QInputDialog,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -45,7 +35,6 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QToolButton,
-    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -53,10 +42,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import (
-    cloud_api_key,
-    connection_api_key,
     AIConnectionConfig,
     AIModelConfig,
+    cloud_api_key,
+    connection_api_key,
     database_path,
     describe_layout_paths,
     free_space_bytes,
@@ -74,17 +63,13 @@ from app.ui.theme.manager import ThemeManager
 from app.ui.theme.tokens import Spacing, Typography
 from app.util import services
 
-# Settings read as a form, not a dashboard: a narrow column keeps every label
-# and field close together and stops two-field rows from drifting apart on a
-# wide monitor. 720px is also narrow enough for the 1200px minimum window.
-CONTENT_MAX_WIDTH = 920
+# Settings read as a form, not a dashboard: cap the column on wide monitors.
+CONTENT_MAX_WIDTH = 880
 
-# Two fields share a row, so each gets an equal slice of the card: with 24px
-# card padding and a 24px gutter that slice is ~324px, and this cap keeps the
-# control flush with the column instead of leaving a ragged gap on its right.
+# Provider dialogs retain paired fields; main panes use label/control rows.
 CONTROL_MAX_WIDTH = 420
 PATH_LABEL_WIDTH = 96
-NAV_WIDTH = 196
+NAV_WIDTH = 176
 
 MODE_LOCAL = "ollama"
 MODE_CLOUD = "openai"
@@ -143,6 +128,21 @@ class _TaskWorker(QThread):
         except Exception as exc:  # noqa: BLE001 - surfaced to the investigator
             ok, message = False, str(exc)
         self.finished_with_result.emit(ok, message)
+
+
+class _FeedbackLabel(QLabel):
+    """Reserve space for feedback only while there is something to report."""
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self.setVisible(bool(text))
+
+    def setText(self, text):  # noqa: N802 - Qt override
+        super().setText(text)
+        self.setVisible(bool(text))
+
+    def clear(self):
+        self.setText("")
 
 
 class _StatusWorker(QThread):
@@ -283,7 +283,8 @@ class SettingsPage(ResponsivePage):
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(self._build_nav())
+        self._nav_panel = self._build_nav()
+        outer.addWidget(self._nav_panel)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -330,6 +331,8 @@ class SettingsPage(ResponsivePage):
         for index, (_key, label) in enumerate(NAV_ITEMS):
             button = QPushButton(label.replace("&", "&&"))
             button.setCheckable(True)
+            button.setProperty("compact", True)
+            button.setFixedHeight(38)
             button.setProperty("navItem", True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda _checked=False, i=index: self._switch_pane(i))
@@ -363,6 +366,25 @@ class SettingsPage(ResponsivePage):
         layout = QVBoxLayout(column)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Spacing.MD)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        title = QLabel(NAV_ITEMS[len(self._panes)][1])
+        title.setProperty("pageTitle", True)
+        title.setFont(QFont(
+            Typography.FONT_FAMILY, Typography.HEADING_LG[0], Typography.HEADING_LG[1]
+        ))
+        layout.addWidget(title)
+        descriptions = (
+            "Make IDFA comfortable to use and choose how pages refresh.",
+            "Choose chat connections separately from background analysis and semantic search.",
+            "Manage local processes and the forensic worker connection.",
+            "Manage the folder that holds your investigation data.",
+            "Configure session and authentication preferences.",
+        )
+        description = QLabel(descriptions[len(self._panes)])
+        description.setWordWrap(True)
+        description.setProperty("sectionHint", True)
+        layout.addWidget(description)
 
         self._stack.addWidget(scroll)
         self._panes.append((scroll, column))
@@ -384,7 +406,7 @@ class SettingsPage(ResponsivePage):
         _card, grid = self._add_card(
             layout,
             "Appearance",
-            "Theme and interface language. Both apply as soon as they are saved.",
+            "Theme and language are previewed immediately. Save Settings to keep your choices.",
         )
 
         self.theme_combo = QComboBox()
@@ -436,32 +458,22 @@ class SettingsPage(ResponsivePage):
         self.analysis_provider.currentIndexChanged.connect(
             lambda _index: setattr(self, "ai_mode", self.analysis_provider.currentData())
         )
-        self.analysis_provider.hide()
-
         self._build_connections_card(layout)
-
-        background_toggle = QToolButton()
-        background_toggle.setText("Background analysis and embedding settings")
-        background_toggle.setCheckable(True)
-        background_toggle.setArrowType(Qt.ArrowType.RightArrow)
-        background_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        layout.addWidget(background_toggle)
         background = QWidget()
         background_layout = QVBoxLayout(background)
         background_layout.setContentsMargins(0, 0, 0, 0)
+        background_layout.setSpacing(Spacing.LG)
         layout.addWidget(background)
-        background.hide()
-        background_toggle.toggled.connect(background.setVisible)
-        background_toggle.toggled.connect(lambda expanded: background_toggle.setArrowType(
-            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow))
 
         # --- Offline -----------------------------------------------------
         self._offline_card, grid = self._add_card(
             background_layout,
-            "Offline models",
-            "Served by Ollama on this machine. The offline bundle already "
-            "contains both models, so nothing is downloaded here.",
+            "Background analysis",
+            "Automatic entity analysis uses its own provider, independent of chat connections.",
         )
+        self._add_field(grid, 0, 0, "Analysis provider", self.analysis_provider)
+        self.analysis_provider.currentIndexChanged.connect(
+            lambda: self.set_ai_mode(self.analysis_provider.currentData()))
 
         self.ollama_model = QComboBox()
         self.ollama_model.setEditable(True)
@@ -469,11 +481,48 @@ class SettingsPage(ResponsivePage):
         self.ollama_model.setCurrentText("phi3:mini")
         self._add_field(grid, 0, 0, "Background chat model", self.ollama_model)
 
+        _section, grid = self._add_card(
+            background_layout, "Embeddings & semantic search",
+            "Indexing settings apply to new vectors. Re-index existing artifacts after "
+            "changing the model or passages.",
+        )
+        # The two frequently used options belong together; unlike the generic
+        # settings rows, these are compact caption-above-control cells.
+        grid.setProperty("settingsRows", False)
+        self.embedding_provider = QComboBox()
+        self.embedding_provider.addItem("Local (Ollama)", MODE_LOCAL)
+        self.embedding_provider.addItem("Cloud", MODE_CLOUD)
+        self.embedding_provider.setToolTip(
+            "Cloud embeddings send artifact text to the provider; case consent is required."
+        )
+        self._add_field(grid, 0, 0, "Embedding source", self.embedding_provider)
+        self.embedding_provider.currentIndexChanged.connect(self._update_background_visibility)
+
         self.embedding_model = QComboBox()
         self.embedding_model.setEditable(True)
         self.embedding_model.addItems(["all-minilm", "nomic-embed-text"])
         self.embedding_model.setCurrentText("all-minilm")
         self._add_field(grid, 0, 1, "Embedding model", self.embedding_model)
+
+        self._embedding_advanced_toggle = QToolButton()
+        self._embedding_advanced_toggle.setText("Advanced indexing settings")
+        self._embedding_advanced_toggle.setCheckable(True)
+        self._embedding_advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._embedding_advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        grid.addWidget(self._embedding_advanced_toggle, 1, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
+        self._embedding_advanced_content = QWidget()
+        advanced_grid = QGridLayout(self._embedding_advanced_content)
+        advanced_grid.setContentsMargins(0, 0, 0, 0)
+        advanced_grid.setHorizontalSpacing(Spacing.LG)
+        advanced_grid.setVerticalSpacing(Spacing.MD)
+        advanced_grid.setColumnStretch(0, 1)
+        advanced_grid.setColumnStretch(1, 1)
+        grid.addWidget(self._embedding_advanced_content, 2, 0, 1, 2)
+        self._embedding_advanced_content.hide()
+        self._embedding_advanced_toggle.toggled.connect(self._embedding_advanced_content.setVisible)
+        self._embedding_advanced_toggle.toggled.connect(
+            lambda expanded: self._embedding_advanced_toggle.setArrowType(
+                Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow))
 
         self.embedding_chunk_size = QSpinBox()
         self.embedding_chunk_size.setRange(100, 20_000)
@@ -483,7 +532,7 @@ class SettingsPage(ResponsivePage):
             "Characters per semantic passage. Larger passages carry more context; "
             "smaller passages can improve topical precision. Changing this requires re-indexing."
         )
-        self._add_field(grid, 1, 0, "Search chunk size", self.embedding_chunk_size)
+        self._add_field(advanced_grid, 0, 0, "Search chunk size", self.embedding_chunk_size)
 
         self.embedding_chunk_overlap = QSpinBox()
         self.embedding_chunk_overlap.setRange(0, 19_900)
@@ -492,7 +541,7 @@ class SettingsPage(ResponsivePage):
         self.embedding_chunk_overlap.setToolTip(
             "Repeated characters between passages. Must remain smaller than chunk size."
         )
-        self._add_field(grid, 1, 1, "Chunk overlap", self.embedding_chunk_overlap)
+        self._add_field(advanced_grid, 0, 1, "Chunk overlap", self.embedding_chunk_overlap)
 
         self.embedding_chunk_size.valueChanged.connect(
             lambda size: self.embedding_chunk_overlap.setMaximum(size - 1)
@@ -503,7 +552,7 @@ class SettingsPage(ResponsivePage):
         self.embedding_batch_size.setToolTip(
             "Passages sent per embedding request. Reduce this if the model runs out of memory."
         )
-        self._add_field(grid, 2, 0, "Embedding batch size", self.embedding_batch_size)
+        self._add_field(advanced_grid, 1, 0, "Embedding batch size", self.embedding_batch_size)
 
         hint = QLabel(
             "all-minilm produces the 384-dimension vectors the existing search "
@@ -512,11 +561,26 @@ class SettingsPage(ResponsivePage):
         )
         hint.setProperty("sectionHint", True)
         hint.setWordWrap(True)
-        grid.addWidget(hint, 3, 0, 1, 2)
+        advanced_grid.addWidget(hint, 2, 0, 1, 2)
 
         # --- Cloud -------------------------------------------------------
+        self._background_cloud_toggle = QToolButton()
+        self._background_cloud_toggle.setText("Background cloud credentials")
+        self._background_cloud_toggle.setCheckable(True)
+        self._background_cloud_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._background_cloud_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        background_layout.addWidget(self._background_cloud_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        self._background_cloud_content = QWidget()
+        cloud_layout = QVBoxLayout(self._background_cloud_content)
+        cloud_layout.setContentsMargins(0, 0, 0, 0)
+        background_layout.addWidget(self._background_cloud_content)
+        self._background_cloud_content.hide()
+        self._background_cloud_toggle.toggled.connect(self._background_cloud_content.setVisible)
+        self._background_cloud_toggle.toggled.connect(
+            lambda expanded: self._background_cloud_toggle.setArrowType(
+                Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow))
         self._cloud_card, grid = self._add_card(
-            background_layout,
+            cloud_layout,
             "Background cloud provider",
             "Used only for background analysis and cloud embeddings. The key is encrypted for this "
             "Windows account before it is written to disk.",
@@ -559,7 +623,7 @@ class SettingsPage(ResponsivePage):
         self.test_btn = QPushButton("Test connection")
         self.test_btn.setProperty("secondary", True)
         self.test_btn.clicked.connect(self._test_connection)
-        self.test_status = QLabel("")
+        self.test_status = _FeedbackLabel()
         self.test_status.setProperty("testResult", "idle")
         self.test_status.setWordWrap(True)
 
@@ -570,11 +634,11 @@ class SettingsPage(ResponsivePage):
         test_layout.setSpacing(Spacing.MD)
         test_layout.addWidget(self.test_btn)
         test_layout.addWidget(self.test_status, 1)
-        grid.addWidget(test_row, 3, 0, 1, 2)
+        grid.addWidget(test_row, grid.rowCount(), 0, 1, 2)
         test_hint = QLabel("Testing does not save settings. Select Save to keep them.")
         test_hint.setProperty("sectionHint", True)
         test_hint.setWordWrap(True)
-        grid.addWidget(test_hint, 4, 0, 1, 2)
+        grid.addWidget(test_hint, grid.rowCount(), 0, 1, 2)
 
         # --- Advanced ----------------------------------------------------
         self._build_advanced_card(background_layout)
@@ -582,39 +646,65 @@ class SettingsPage(ResponsivePage):
 
     def _build_connections_card(self, layout):
         _card, grid = self._add_card(
-            layout, "AI Analysis connections",
-            "Manage chat connections and enable individual models. Cloud models need a usable API key "
+            layout, "Chat connections",
+            "Manage chat connections and enable individual models. Cloud models need an API key "
             "to appear in AI Analysis. Changes are kept only after Save Settings. "
             "These choices do not change background analysis or embeddings.",
         )
-        tabs = QTabWidget()
+        grid.setProperty("settingsRows", False)
         providers = QWidget()
         provider_layout = QVBoxLayout(providers)
+        provider_layout.setContentsMargins(0, 0, 0, 0)
+        provider_layout.setSpacing(Spacing.SM)
         models = QWidget()
         models_layout = QVBoxLayout(models)
-        tabs.addTab(providers, "Providers")
-        tabs.addTab(models, "Models")
-        grid.addWidget(tabs, 0, 0, 1, 2)
+        models_layout.setContentsMargins(0, 0, 0, 0)
+        models_layout.setSpacing(Spacing.SM)
+        grid.addWidget(providers, 0, 0, 1, 2)
         self.connection_combo = QListWidget()
-        self.connection_combo.setMaximumHeight(120)
+        self.connection_combo.setObjectName("SettingsConnections")
+        self.connection_combo.setFrameShape(QFrame.Shape.NoFrame)
+        self.connection_combo.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.connection_combo.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.connection_combo.setSpacing(3)
         self.connection_combo.currentRowChanged.connect(self._select_connection)
+        self.connection_combo.model().rowsInserted.connect(self._fit_connection_list)
+        self.connection_combo.model().rowsRemoved.connect(self._fit_connection_list)
+        self.connection_combo.model().modelReset.connect(self._fit_connection_list)
         provider_layout.addWidget(self.connection_combo)
         actions = QWidget()
+        actions.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         row = QHBoxLayout(actions)
         row.setContentsMargins(0, 0, 0, 0)
         add = QPushButton("Connect provider")
         add.clicked.connect(self._connect_provider)
-        manage = QPushButton("Manage")
+        manage = QPushButton("Edit provider…")
+        self.manage_connection_btn = manage
         manage.clicked.connect(self._manage_connection)
-        self.remove_connection_btn = QPushButton("Remove connection")
+        self.remove_connection_btn = QPushButton("Remove")
+        self.remove_connection_btn.setToolTip(
+            "Remove the selected provider. The built-in local connection cannot be removed.")
         self.remove_connection_btn.clicked.connect(self._remove_connection)
-        row.addWidget(add)
-        row.addWidget(manage)
-        row.addWidget(self.remove_connection_btn)
+        for button in (add, manage, self.remove_connection_btn):
+            button.setProperty("ghost", True)
+            button.setProperty("compact", True)
+            row.addWidget(button)
+        row.addStretch(1)
         provider_layout.addWidget(actions)
+        _models_section, model_grid = self._add_card(
+            layout, "Chat models",
+            "Enable models for AI Analysis. Select a model to target its provider actions.")
+        model_grid.addWidget(models, 0, 0, 1, 2)
         self.connection_dialog = QDialog(self)
         self.connection_dialog.setWindowTitle("Manage provider")
+        self.connection_dialog.setMinimumWidth(520)
         dialog_layout = QVBoxLayout(self.connection_dialog)
+        dialog_layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
+        dialog_layout.setSpacing(Spacing.MD)
+        dialog_hint = QLabel("Changes are a draft. Select Save Settings on the main page to keep them.")
+        dialog_hint.setProperty("sectionHint", True)
+        dialog_hint.setWordWrap(True)
+        dialog_layout.addWidget(dialog_hint)
         editor = QGridLayout()
         dialog_layout.addLayout(editor)
         self.connection_name = QLineEdit()
@@ -644,10 +734,16 @@ class SettingsPage(ResponsivePage):
         self.connection_models.hide()
         self.connection_models.setParent(self)
         self.model_tree = QTreeWidget()
+        self.model_tree.setFrameShape(QFrame.Shape.NoFrame)
+        self.model_tree.setObjectName("SettingsChatModels")
         self.model_tree.setHeaderHidden(True)
         self.model_tree.itemChanged.connect(self._model_tree_changed)
         self.model_tree.itemClicked.connect(self._model_tree_selected)
         models_layout.addWidget(self.model_tree)
+        self.model_action_target = QLabel()
+        self.model_action_target.setProperty("sectionHint", True)
+        self.model_action_target.setWordWrap(True)
+        models_layout.addWidget(self.model_action_target)
         model_actions = QWidget()
         row = QHBoxLayout(model_actions)
         row.setContentsMargins(0, 0, 0, 0)
@@ -664,7 +760,7 @@ class SettingsPage(ResponsivePage):
         models_layout.addWidget(model_actions)
         self.connection_test_btn = QPushButton("Test connection")
         self.connection_test_btn.clicked.connect(self._test_chat_connection)
-        self.connection_test_status = QLabel("")
+        self.connection_test_status = _FeedbackLabel()
         self.connection_test_status.setWordWrap(True)
         dialog_layout.addWidget(self.connection_test_btn)
         dialog_layout.addWidget(self.connection_test_status)
@@ -673,7 +769,7 @@ class SettingsPage(ResponsivePage):
         done = QPushButton("Done")
         done.clicked.connect(self.connection_dialog.accept)
         dialog_layout.addWidget(done)
-        self.model_discovery_status = QLabel("")
+        self.model_discovery_status = _FeedbackLabel()
         self.model_discovery_status.setWordWrap(True)
         models_layout.addWidget(self.model_discovery_status)
         self.background_cloud_warning = QLabel(
@@ -684,7 +780,22 @@ class SettingsPage(ResponsivePage):
         self.background_cloud_warning.setProperty("sectionHint", True)
         self.background_cloud_warning.hide()
         grid.addWidget(self.background_cloud_warning, 1, 0, 1, 2)
-        tabs.currentChanged.connect(lambda _: self._rebuild_model_tree())
+
+    def _fit_connection_list(self, *_args):
+        """Size the list to its contents, with scrolling only for longer lists."""
+        height = max(38, self.connection_combo.sizeHintForRow(0) + 2)
+        rows = min(5, max(1, self.connection_combo.count()))
+        self.connection_combo.setFixedHeight(rows * height + 4)
+
+    def _refresh_connection_summaries(self):
+        for index, connection in enumerate(self._connections):
+            enabled = sum(model.enabled for model in connection.models)
+            state = "Enabled" if connection.enabled else "Disabled"
+            text = (f"{connection.name}  ·  {state}\n"
+                    f"{connection.base_url}  ·  {enabled}/{len(connection.models)} models enabled")
+            self.connection_combo.item(index).setText(text)
+            self.connection_combo.item(index).setToolTip(text)
+        self._fit_connection_list()
 
     def _connect_provider(self):
         self._add_connection()
@@ -729,6 +840,11 @@ class SettingsPage(ResponsivePage):
             group.setHidden(bool(needle) and group.childCount() == 0)
             group.setExpanded(True)
         self.model_tree.blockSignals(False)
+        self._refresh_connection_summaries()
+        visible_rows = sum(1 + self.model_tree.topLevelItem(i).childCount()
+                           for i in range(self.model_tree.topLevelItemCount())
+                           if not self.model_tree.topLevelItem(i).isHidden())
+        self.model_tree.setFixedHeight(min(7, max(1, visible_rows)) * 30 + 4)
 
     def _model_tree_changed(self, item, _column):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -743,6 +859,7 @@ class SettingsPage(ResponsivePage):
                 entry = self.connection_models.item(i)
                 if entry.text() == model_id:
                     entry.setCheckState(item.checkState(0))
+        self._refresh_connection_summaries()
 
     def _model_tree_selected(self, item, _column):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -859,6 +976,11 @@ class SettingsPage(ResponsivePage):
         self._connection_index = index
         self._loading_connection = True
         valid = 0 <= index < len(self._connections)
+        self.manage_connection_btn.setEnabled(valid)
+        self.model_action_target.setText(
+            f"Model actions apply to: {self._connections[index].name}" if valid
+            else "Connect a provider to add or discover models.")
+        self.load_models_btn.setEnabled(valid and self._discovery_worker is None)
         for widget in (self.connection_name, self.connection_provider, self.connection_endpoint,
                        self.connection_key, self.connection_models, self.connection_model_filter,
                        self.connection_enabled):
@@ -894,9 +1016,8 @@ class SettingsPage(ResponsivePage):
 
     def _update_connection_label(self, text):
         if not getattr(self, "_loading_connection", False) and 0 <= self._connection_index < self.connection_combo.count():
-            self.connection_combo.item(self._connection_index).setText(
-                text.strip() or "New connection"
-            )
+            self._connections[self._connection_index].name = text.strip() or "New connection"
+            self._refresh_connection_summaries()
 
     def _append_model(self, model_id, enabled=True):
         item = QListWidgetItem(model_id)
@@ -920,6 +1041,7 @@ class SettingsPage(ResponsivePage):
                                  provider=MODE_LOCAL, base_url="http://127.0.0.1:11434"))
         self.connection_combo.addItem("New connection")
         self.connection_combo.setCurrentRow(len(self._connections) - 1)
+        self._rebuild_model_tree()
 
     def _remove_connection(self):
         index = self._connection_index
@@ -929,6 +1051,7 @@ class SettingsPage(ResponsivePage):
         self._connections.pop(index)
         self.connection_combo.takeItem(index)
         self._select_connection(self.connection_combo.currentRow())
+        self._rebuild_model_tree()
 
     def _add_connection_model(self):
         if self._connection_index < 0:
@@ -948,11 +1071,12 @@ class SettingsPage(ResponsivePage):
 
     def _build_advanced_card(self, layout: QVBoxLayout) -> None:
         card = QFrame()
-        card.setProperty("card", True)
+        card.setObjectName("SettingsAdvanced")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         card.setFrameShape(QFrame.Shape.NoFrame)
 
         body = QVBoxLayout(card)
-        body.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        body.setContentsMargins(0, Spacing.SM, 0, Spacing.SM)
         body.setSpacing(Spacing.SM)
 
         self._advanced_toggle = QToolButton()
@@ -982,6 +1106,7 @@ class SettingsPage(ResponsivePage):
         inner.addWidget(note)
 
         grid = QGridLayout()
+        grid.setProperty("settingsRows", True)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(Spacing.LG)
         grid.setVerticalSpacing(Spacing.MD)
@@ -1021,20 +1146,35 @@ class SettingsPage(ResponsivePage):
         )
         self._add_field(grid, 2, 0, "Context window", self.ai_context_tokens)
 
-        self.embedding_provider = QComboBox()
-        self.embedding_provider.addItem("Local (Ollama)", "ollama")
-        self.embedding_provider.addItem("Cloud", "openai")
-        self.embedding_provider.setToolTip(
-            "Cloud embeddings send artifact text to the provider and usually "
-            "need the case re-indexed. Local keeps search working offline."
-        )
-        self._add_field(grid, 2, 1, "Embedding source", self.embedding_provider)
-
     def set_ai_mode(self, mode: str) -> None:
         """Set the background provider (legacy callers use this method)."""
         self.ai_mode = MODE_CLOUD if mode == MODE_CLOUD else MODE_LOCAL
         self.analysis_provider.setCurrentIndex(self.analysis_provider.findData(self.ai_mode))
         self.background_cloud_warning.setVisible(self.ai_mode == MODE_CLOUD)
+        self._update_background_visibility()
+
+    def _update_background_visibility(self, *_args):
+        if not hasattr(self, "_cloud_card"):
+            return
+        analysis_cloud = self.analysis_provider.currentData() == MODE_CLOUD
+        embedding_cloud = self.embedding_provider.currentData() == MODE_CLOUD
+        cloud = analysis_cloud or embedding_cloud
+        if cloud:
+            uses = " and ".join(
+                name for enabled, name in (
+                    (analysis_cloud, "Background analysis"),
+                    (embedding_cloud, "embeddings"),
+                ) if enabled
+            )
+            self.background_cloud_warning.setText(
+                f"{uses} use a cloud provider; "
+                "case consent is required before evidence is sent."
+            )
+        previous = getattr(self, "_background_cloud_required", False)
+        if cloud != previous:
+            self._background_cloud_toggle.setChecked(cloud)
+        self._background_cloud_required = cloud
+        self.background_cloud_warning.setVisible(cloud)
 
     def _toggle_advanced(self, expanded: bool) -> None:
         self._advanced_content.setVisible(expanded)
@@ -1120,16 +1260,7 @@ class SettingsPage(ResponsivePage):
             "as started outside IDFA and left running.",
         )
 
-        for column, text in enumerate(("", "Service", "Endpoint", "Status")):
-            label = QLabel(text)
-            label.setProperty("fieldLabel", True)
-            grid.addWidget(label, 0, column)
-
-        grid.setColumnStretch(0, 0)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-
-        for row, key in enumerate(("worker", "qdrant", "ollama"), start=1):
+        for row, key in enumerate(("worker", "qdrant", "ollama")):
             dot = QLabel("●")
             dot.setProperty("serviceDot", "unknown")
 
@@ -1139,6 +1270,8 @@ class SettingsPage(ResponsivePage):
             endpoint = QLabel("")
             endpoint.setProperty("pathValue", True)
             endpoint.setFont(QFont("Consolas", Typography.MONO_SM[0]))
+            endpoint.setWordWrap(True)
+            endpoint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
             state = QLabel("Checking…")
             state.setProperty("sectionHint", True)
@@ -1165,22 +1298,29 @@ class SettingsPage(ResponsivePage):
                 lambda _checked=False, k=key: self._run_service(k, "restart")
             )
 
-            grid.addWidget(dot, row, 0)
-            grid.addWidget(name, row, 1)
-            grid.addWidget(endpoint, row, 2)
-            grid.addWidget(state, row, 3)
+            service = QWidget()
+            service.setObjectName("SettingsFieldCell")
+            service_layout = QGridLayout(service)
+            service_layout.setContentsMargins(0, 0, 0, 0)
+            service_layout.setSpacing(Spacing.XS)
+            heading = QHBoxLayout()
+            heading.setSpacing(Spacing.SM)
+            heading.addWidget(dot)
+            heading.addWidget(name)
+            heading.addStretch(1)
+            service_layout.addLayout(heading, 0, 0)
+            service_layout.addWidget(endpoint, 1, 0)
+            service_layout.addWidget(state, 2, 0)
+            service_layout.setColumnStretch(0, 1)
 
-            buttons = QWidget()
-            buttons.setObjectName("SettingsFieldCell")
-            button_layout = QHBoxLayout(buttons)
+            button_layout = QHBoxLayout()
             button_layout.setContentsMargins(0, 0, 0, 0)
             button_layout.setSpacing(Spacing.XS)
             button_layout.addWidget(start_btn)
             button_layout.addWidget(stop_btn)
             button_layout.addWidget(restart_btn)
-            grid.addWidget(
-                buttons, row, 4, Qt.AlignmentFlag.AlignRight
-            )
+            service_layout.addLayout(button_layout, 0, 1, 3, 1)
+            grid.addWidget(service, row, 0, 1, 2)
 
             self._service_rows[key] = {
                 "dot": dot,
@@ -1216,13 +1356,12 @@ class SettingsPage(ResponsivePage):
         logs.setProperty("ghost", True)
         logs.clicked.connect(self._open_logs)
         actions_layout.addWidget(logs)
-        actions_layout.addStretch(1)
-        grid.addWidget(actions, 4, 0, 1, 5)
+        grid.addWidget(actions, 4, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
 
-        self.services_message = QLabel("")
+        self.services_message = _FeedbackLabel()
         self.services_message.setProperty("sectionHint", True)
         self.services_message.setWordWrap(True)
-        grid.addWidget(self.services_message, 5, 0, 1, 5)
+        grid.addWidget(self.services_message, 5, 0, 1, 2)
 
         self._services_timer = QTimer(self)
         self._services_timer.setInterval(4000)
@@ -1318,7 +1457,10 @@ class SettingsPage(ResponsivePage):
                 continue
             row["endpoint"].setText(status.endpoint)
             row["endpoint"].setToolTip(status.endpoint)
-            row["dot"].setProperty("serviceDot", status.state)
+            # The theme uses the same error colour for stopped and failed
+            # services; keep the actual state in the detail and tooltip.
+            dot_state = "stopped" if status.state == services.ERROR else status.state
+            row["dot"].setProperty("serviceDot", dot_state)
             row["dot"].style().unpolish(row["dot"])
             row["dot"].style().polish(row["dot"])
 
@@ -1383,8 +1525,8 @@ class SettingsPage(ResponsivePage):
         actions_layout.addWidget(self.backup_db_btn)
         actions_layout.addStretch(1)
 
-        grid.addWidget(actions, 1, 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
-        grid.addWidget(self._build_paths_panel(), 2, 0, 1, 2)
+        grid.addWidget(actions, grid.rowCount(), 0, 1, 2, Qt.AlignmentFlag.AlignLeft)
+        grid.addWidget(self._build_paths_panel(), grid.rowCount(), 0, 1, 2)
 
         layout.addStretch(1)
 
@@ -1446,7 +1588,7 @@ class SettingsPage(ResponsivePage):
         _card, grid = self._add_card(
             layout,
             "Security",
-            "Session lifetime and password hashing strength for this installation.",
+            "Session settings for this installation. Bcrypt rounds is saved but is not currently applied to password hashing.",
         )
 
         self.session_timeout = QSpinBox()
@@ -1458,6 +1600,7 @@ class SettingsPage(ResponsivePage):
         self.bcrypt_rounds = QSpinBox()
         self.bcrypt_rounds.setRange(4, 31)
         self.bcrypt_rounds.setValue(12)
+        self.bcrypt_rounds.setToolTip("This value is saved but is not currently used for password hashing.")
         self._add_field(grid, 0, 1, "Bcrypt rounds", self.bcrypt_rounds)
 
         layout.addStretch(1)
@@ -1467,6 +1610,9 @@ class SettingsPage(ResponsivePage):
         footer = QFrame()
         footer.setObjectName("SettingsFooter")
         footer.setFrameShape(QFrame.Shape.NoFrame)
+        # The content width follows the viewport; it must not in turn become
+        # the minimum width of the viewport when the window is narrowed.
+        footer.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         footer_centring = QHBoxLayout(footer)
         footer_centring.setContentsMargins(Spacing.LG, Spacing.SM, Spacing.LG, Spacing.SM)
@@ -1485,7 +1631,7 @@ class SettingsPage(ResponsivePage):
         self._footer_layout.setSpacing(Spacing.SM)
 
         hint = QLabel(
-            "Changes apply after saving. AI, worker and folder changes need a restart."
+            "Save to keep edits. Appearance previews immediately; service and folder actions run immediately. Some changes may require a restart."
         )
         hint.setProperty("muted", True)
         hint.setToolTip(f"Saved to {get_config_path()}")
@@ -1493,14 +1639,27 @@ class SettingsPage(ResponsivePage):
         # pushing the buttons past the right edge of the column.
         hint.setWordWrap(True)
         hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._footer_hint = hint
         self._footer_layout.addWidget(hint, 1)
+
+        self._footer_help = QPushButton("Save info")
+        self._footer_help.setProperty("ghost", True)
+        self._footer_help.setAccessibleName("Show save and restart settings guidance")
+        self._footer_help.setToolTip(hint.text())
+        self._footer_help.clicked.connect(
+            lambda: QMessageBox.information(self, "Settings guidance", hint.text())
+        )
+        self._footer_layout.addWidget(self._footer_help)
 
         self.reset_btn = QPushButton("Reset to Defaults")
         self.reset_btn.setProperty("ghost", True)
+        self.reset_btn.setAccessibleName("Reset to Defaults")
         self.reset_btn.clicked.connect(self._on_reset)
         self._footer_layout.addWidget(self.reset_btn)
 
         self.save_btn = QPushButton("Save Settings")
+        self.save_btn.setAccessibleName("Save Settings")
+        self.save_btn.setToolTip(hint.text())
         self.save_btn.clicked.connect(self._on_save)
         self._footer_layout.addWidget(self.save_btn)
 
@@ -1509,6 +1668,13 @@ class SettingsPage(ResponsivePage):
     # -------------------------------------------------------------- geometry
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if hasattr(self, "_nav_panel"):
+            narrow = event.size().width() < 800
+            self._nav_panel.setFixedWidth(150 if narrow else NAV_WIDTH)
+            self._footer_hint.setVisible(not narrow)
+            self._footer_help.setVisible(narrow)
+            self.reset_btn.setText("Reset" if narrow else "Reset to Defaults")
+            self.save_btn.setText("Save" if narrow else "Save Settings")
         self._fit_column()
 
     def showEvent(self, event):
@@ -1545,7 +1711,7 @@ class SettingsPage(ResponsivePage):
         current = self._stack.currentWidget() if hasattr(self, "_stack") else None
         for scroll, column in self._panes:
             viewport = scroll.viewport().width() or self.width()
-            width = max(320, min(viewport - 2 * Spacing.LG, CONTENT_MAX_WIDTH))
+            width = max(1, min(viewport - 2 * Spacing.LG, CONTENT_MAX_WIDTH))
             column.setFixedWidth(width)
             if scroll is current and hasattr(self, "_footer_content"):
                 # The scrollbar sits inside the scroll area but outside the
@@ -1553,21 +1719,20 @@ class SettingsPage(ResponsivePage):
                 # right edges flush.
                 scrollbar = scroll.verticalScrollBar()
                 reserve = scrollbar.sizeHint().width() if scrollbar.isVisible() else 0
-                self._footer_content.setFixedWidth(max(320, width - reserve))
+                self._footer_content.setFixedWidth(max(1, width - reserve))
 
     # --------------------------------------------------------------- helpers
     def _add_card(
         self, parent_layout: QVBoxLayout, title: str, description: str = ""
     ) -> tuple[QFrame, QGridLayout]:
-        """Add a titled card and return it with the grid that holds its fields."""
+        """Add a flat, content-sized section (the name is kept for callers)."""
         card = QFrame()
-        card.setProperty("card", True)
-        card.setObjectName("SettingsCard")
+        card.setObjectName("SettingsSection")
         card.setFrameShape(QFrame.Shape.NoFrame)
-        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
 
         body = QVBoxLayout(card)
-        body.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        body.setContentsMargins(0, Spacing.SM, 0, Spacing.MD)
         body.setSpacing(Spacing.XS)
 
         heading = QLabel(title)
@@ -1584,6 +1749,7 @@ class SettingsPage(ResponsivePage):
             body.addWidget(hint)
 
         grid = QGridLayout()
+        grid.setProperty("settingsRows", True)
         grid.setContentsMargins(0, Spacing.MD, 0, 0)
         grid.setHorizontalSpacing(Spacing.LG)
         grid.setVerticalSpacing(Spacing.MD)
@@ -1613,6 +1779,22 @@ class SettingsPage(ResponsivePage):
         ``width=None`` for a path or URL that spans the card. ``align_bottom``
         centres a checkbox in the height of the input beside it.
         """
+        if grid.property("settingsRows"):
+            # Existing builders specify paired cells; sections now use one
+            # readable label/control row per option. Dialogs keep paired fields.
+            row = grid.rowCount()
+            label = QLabel(caption)
+            label.setProperty("fieldLabel", True)
+            label.setBuddy(widget)
+            label.setWordWrap(True)
+            label.setMinimumWidth(150)
+            label.setMaximumWidth(210)
+            grid.addWidget(label, row, 0)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            grid.addWidget(widget, row, 1)
+            grid.setColumnStretch(0, 2)
+            grid.setColumnStretch(1, 3)
+            return
         cell = QVBoxLayout()
         cell.setContentsMargins(0, 0, 0, 0)
         cell.setSpacing(Spacing.XS)
@@ -1752,6 +1934,8 @@ class SettingsPage(ResponsivePage):
         self.connection_combo.blockSignals(False)
         self.connection_combo.setCurrentRow(0 if self._connections else -1)
         self._select_connection(self.connection_combo.currentRow())
+        self._fit_connection_list()
+        self._rebuild_model_tree()
         self.embedding_model.setCurrentText(config.embeddings.model_id)
         self.embedding_chunk_size.setValue(config.embeddings.chunk_size)
         self.embedding_chunk_overlap.setMaximum(

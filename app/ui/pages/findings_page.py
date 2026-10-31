@@ -123,21 +123,19 @@ class FindingDetailPane(QFrame):
         layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
         layout.setSpacing(Spacing.SM)
 
-        # Title row with origin badge
-        title_row = QHBoxLayout()
+        # Keep badges below the title so long titles retain the full pane width.
         self.title = QLabel("Select finding to view details")
         self.title.setTextFormat(Qt.TextFormat.PlainText)
         self.title.setWordWrap(True)
         self.title.setFont(QFont(Typography.FONT_FAMILY, Typography.HEADING_SM[0], Typography.HEADING_SM[1]))
-        title_row.addWidget(self.title)
-        title_row.addStretch()
-        self.origin_badge = OriginBadge("investigator")
-        title_row.addWidget(self.origin_badge)
-        layout.addLayout(title_row)
-
-        # Status badge
+        layout.addWidget(self.title)
+        badge_row = QHBoxLayout()
         self.status_badge = StatusBadge("Draft", "draft")
-        layout.addWidget(self.status_badge, alignment=Qt.AlignmentFlag.AlignLeft)
+        badge_row.addWidget(self.status_badge)
+        self.origin_badge = OriginBadge("investigator")
+        badge_row.addWidget(self.origin_badge)
+        badge_row.addStretch()
+        layout.addLayout(badge_row)
 
         # Description
         desc_label = QLabel("Description:")
@@ -188,6 +186,7 @@ class FindingDetailPane(QFrame):
         self.artifacts_list = QLabel("—")
         self.artifacts_list.setTextFormat(Qt.TextFormat.PlainText)
         self.artifacts_list.setWordWrap(True)
+        self.artifacts_list.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.artifacts_list.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
         layout.addWidget(self.artifacts_list)
 
@@ -233,6 +232,9 @@ class FindingDetailPane(QFrame):
         self.set_finding(None)
 
     def set_finding(self, finding: Finding | None, artifacts: list[Artifact] = None):
+        # A placeholder is not itself a draft or investigator-authored finding.
+        self.status_badge.setVisible(finding is not None)
+        self.origin_badge.setVisible(finding is not None)
         for button in (self.verify_btn, self.reject_btn, self.review_btn,
                        self.edit_btn, self.link_btn, self.unlink_btn):
             button.setEnabled(finding is not None)
@@ -353,6 +355,8 @@ class IdentityHypothesisDialog(QDialog):
         self.alternatives.setMaximumHeight(80)
         form.addRow("Alternatives:", self.alternatives)
         self.artifact = QComboBox()
+        self.artifact.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.artifact.setMinimumContentsLength(10)
         for item in artifacts:
             self.artifact.addItem(_source_label(item), item.id)
         form.addRow("Source artifact:", self.artifact)
@@ -373,7 +377,14 @@ class IdentityHypothesisDialog(QDialog):
         self.source_list = QLabel("No sources added")
         self.source_list.setTextFormat(Qt.TextFormat.PlainText)
         self.source_list.setWordWrap(True)
-        layout.addWidget(self.source_list)
+        self.source_list.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.source_list.setMinimumWidth(0)
+        source_scroll = QScrollArea()
+        source_scroll.setWidgetResizable(True)
+        source_scroll.setMinimumHeight(60)
+        source_scroll.setMaximumHeight(120)
+        source_scroll.setWidget(self.source_list)
+        layout.addWidget(source_scroll)
         remove = QPushButton("Remove last source")
         remove.clicked.connect(self.remove_source)
         layout.addWidget(remove)
@@ -462,7 +473,7 @@ class FindingsPage(ResponsivePage):
         self.identity_btn.clicked.connect(self._on_new_identity)
         header_row.addWidget(self.identity_btn)
 
-        self.ai_suggest_btn = QPushButton("AI Suggested")
+        self.ai_suggest_btn = QPushButton("Show AI suggestions")
         self.ai_suggest_btn.setProperty("secondary", True)
         self.ai_suggest_btn.clicked.connect(self._on_ai_suggested)
         header_row.addWidget(self.ai_suggest_btn)
@@ -710,10 +721,7 @@ class FindingsPage(ResponsivePage):
             elif status == FindingStatus.REJECTED:
                 self.finding_service.reject_finding(finding.id, user, notes.strip() or None)
             else:
-                finding.status = status
-                finding.verified_at = None
-                finding.verified_by = None
-                finding.verification_notes = None
+                self.finding_service.update_finding(finding.id, status=status, updated_by=user)
             self._audit(user, finding, "review", {"status": status.value, "notes": notes.strip()})
             session.commit()
             self._refresh_selection(ref)
@@ -778,7 +786,7 @@ class FindingsPage(ResponsivePage):
                 raise ValueError("That artifact was not found in active evidence for this case.")
             if any(item.id == artifact.id for item in self.finding_service.get_finding_artifacts(finding.id)):
                 raise ValueError("This artifact is already linked to the finding.")
-            self.finding_service.link_artifact(finding.id, artifact.id)
+            self.finding_service.link_artifact(finding.id, artifact.id, actor=user)
             self._invalidate_review(finding)
             self._audit(user, finding, "link_artifact", {"artifact_id": artifact.artifact_id})
             ref = finding.finding_id
@@ -805,7 +813,7 @@ class FindingsPage(ResponsivePage):
         artifact = artifacts[labels.index(choice)]
         session = self.finding_service.session
         try:
-            self.finding_service.unlink_artifact(finding.id, artifact.id)
+            self.finding_service.unlink_artifact(finding.id, artifact.id, actor=user)
             self._invalidate_review(finding)
             self._audit(user, finding, "unlink_artifact", {"artifact_id": artifact.artifact_id})
             ref = finding.finding_id

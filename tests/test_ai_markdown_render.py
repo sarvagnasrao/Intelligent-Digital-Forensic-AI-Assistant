@@ -13,6 +13,41 @@ from PySide6.QtWidgets import QLabel
 from app.ui.markdown import MarkdownView, looks_like_markdown
 from app.ui.pages.ai_analysis_page import ChatMessageWidget
 
+
+def test_pending_response_animates_and_can_stop(qt_app):
+    from app.ui.pages.ai_analysis_page import PendingResponseWidget
+
+    widget = PendingResponseWidget(conversation=False)
+    before = widget.label.text()
+    widget._advance()
+    assert widget.label.text() != before
+    assert widget._timer.isActive()
+    widget.stop()
+    assert not widget._timer.isActive()
+    widget.deleteLater()
+
+
+def test_question_history_preserves_draft_and_stays_case_scoped(qt_app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from app.ui.pages.ai_analysis_page import HistoryLineEdit
+
+    edit = HistoryLineEdit()
+    edit.set_history(["first question", "second question"])
+    edit.setText("unfinished draft")
+    QTest.keyClick(edit, Qt.Key.Key_Up)
+    assert edit.text() == "second question"
+    QTest.keyClick(edit, Qt.Key.Key_Up)
+    assert edit.text() == "first question"
+    QTest.keyClick(edit, Qt.Key.Key_Down)
+    assert edit.text() == "second question"
+    QTest.keyClick(edit, Qt.Key.Key_Down)
+    assert edit.text() == "unfinished draft"
+    edit.set_history(["different case"])
+    QTest.keyClick(edit, Qt.Key.Key_Up)
+    assert edit.text() == "different case"
+    edit.deleteLater()
+
 MARKDOWN_ANSWERS = [
     "# Forensic Analysis Report\n\n**Case Reference:** ART-2026-001",
     "## 1. Executive Summary\n\nThe artifacts came from Windows XP.",

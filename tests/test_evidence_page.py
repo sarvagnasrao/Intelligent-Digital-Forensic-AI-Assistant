@@ -98,6 +98,37 @@ def evidence_row(page, evidence_id: str) -> int:
     raise AssertionError(f"{evidence_id} is not in the table")
 
 
+def test_click_multiple_and_select_all_shown(page, service, case_user, qt_app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    case, user, evidence = case_user
+    for name in ("second.dd", "third.dd"):
+        source = Path(evidence.source_path).parent / name
+        source.write_bytes(b"test")
+        service.register_evidence(case.id, name, str(source), registered_by=user, copy_to_store=True)
+    service.session.commit()
+    page.refresh()
+    page.resize(1400, 800)
+    page.show()
+    qt_app.processEvents()
+
+    for row in (0, 1):
+        rect = page.table_view.visualRect(page.table_model.index(row, 0))
+        QTest.mouseClick(page.table_view.viewport(), Qt.MouseButton.LeftButton, pos=rect.center())
+    assert len(page._selected_evidence()) == 2
+    QTest.mouseClick(page.table_view.viewport(), Qt.MouseButton.LeftButton,
+                     pos=page.table_view.visualRect(page.table_model.index(0, 0)).center())
+    assert len(page._selected_evidence()) == 1
+
+    page.search_edit.setText("second")
+    page.select_all_btn.click()
+    assert len(page._selected_evidence()) == 1
+    assert page._selected_evidence()[0][1].name == "second.dd"
+    page.clear_selection_btn.click()
+    assert not page._selected_evidence()
+
+
 def test_the_table_lists_the_registered_item_with_its_file_state(page, case_user):
     _case, _user, evidence = case_user
 
@@ -126,6 +157,65 @@ def test_a_missing_stored_copy_is_flagged_in_the_table(page, service, case_user)
     row = evidence_row(page, evidence.evidence_id)
     assert page.table_model.item(row, 4).text() == "Missing"
     assert "missing" in page.summary_label.text()
+
+
+def test_verification_refreshes_evidence_and_examination_pages(page, service, case_user, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from sqlalchemy.orm import Session
+    from app.auth.models import User
+    from app.evidence.service import EvidenceService
+    from app.ui.base import CaseContext
+    from app.ui.pages.examination_page import ExaminationPage
+
+    case, user, evidence = case_user
+    case_id, user_id, evidence_id, evidence_ref = case.id, user.id, evidence.id, evidence.evidence_id
+    assert page.table_model.item(0, 5).text() == "Calculated"
+    with Session(service.session.get_bind()) as worker_session:
+        outcome = EvidenceService(worker_session).verify_integrity(
+            evidence_id, worker_session.get(User, user_id)
+        )
+        worker_session.commit()
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    page._verification_complete([(evidence_ref, all(outcome.values()), "PASS")])
+    assert page.table_model.item(0, 5).text() == "Verified ✓"
+    exam_page = ExaminationPage()
+    exam_page.case_context = CaseContext(case_id, "C-1", "Case", "open", "medium", "T")
+    exam_page.evidence_service = service
+    exam_page._populate_evidence_combo()
+    assert exam_page.evidence_model.item(0, 2).text() == "Verified"
+    exam_page.deleteLater()
+
+
+def test_multi_verification_commits_each_success_before_next_failure(page, service, case_user, monkeypatch):
+    from sqlalchemy.orm import Session
+    from app.db import session as session_module
+    from app.evidence.models import EvidenceStatus, HashAlgorithm
+    from app.evidence.service import EvidenceService
+    from app.ui.pages.evidence_page import _VerifyThread
+
+    case, user, evidence = case_user
+    other_source = Path(evidence.source_path).parent / "other.dd"
+    other_source.write_bytes(b"other")
+    other = service.register_evidence(case.id, "other", str(other_source), registered_by=user)
+    service.session.commit()
+    first_id, other_id, user_id = evidence.id, other.id, user.id
+    engine = service.session.get_bind()
+    monkeypatch.setattr(session_module, "get_session_factory", lambda: lambda: Session(engine))
+
+    def verify(self, evidence_id, verified_by, progress_callback=None):
+        if evidence_id == other_id:
+            raise ValueError("Cannot read this item")
+        self.session.get(type(evidence), evidence_id).status = EvidenceStatus.INTEGRITY_VERIFIED
+        return {HashAlgorithm.SHA256: True}
+
+    monkeypatch.setattr(EvidenceService, "verify_integrity", verify)
+    worker = _VerifyThread([first_id, other_id], user_id)
+    results = []
+    worker.done.connect(results.extend)
+    worker.run()
+    service.session.expire_all()
+    assert service.session.get(type(evidence), first_id).status == EvidenceStatus.INTEGRITY_VERIFIED
+    assert [row[1] for row in results] == [True, False]
 
 
 def test_removed_items_are_hidden_until_the_filter_is_ticked(page, service, case_user):

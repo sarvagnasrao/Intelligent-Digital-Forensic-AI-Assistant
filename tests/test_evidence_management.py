@@ -68,6 +68,97 @@ def test_registering_copies_the_file_into_the_case_store(registered):
     assert EvidenceService.STORED_PRESENT == "present"
 
 
+def test_ewf_segments_are_one_hashed_item(service, session, registered, tmp_path):
+    import hashlib
+    from app.evidence.models import HashAlgorithm
+
+    case, user, _, _ = registered
+    first, second = tmp_path / "image.E01", tmp_path / "image.E02"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    item = service.register_evidence(case.id, "image", str(second), registered_by=user)
+    assert item.source_path == str(first)
+    assert Path(item.stored_path).with_suffix(".E02").read_bytes() == b"second"
+    assert service._calculate_hashes(item.stored_path, [HashAlgorithm.SHA256])[HashAlgorithm.SHA256] == hashlib.sha256(b"firstsecond").hexdigest()
+
+
+def test_hash_failure_removes_only_new_copy_and_never_overwrites(service, registered, tmp_path, monkeypatch):
+    case, user, _, source = registered
+    new_source = tmp_path / "new.txt"
+    new_source.write_bytes(b"new")
+    monkeypatch.setattr(service, "_calculate_hashes", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("hash failed")))
+    with pytest.raises(OSError, match="hash failed"):
+        service.register_evidence(case.id, "new", str(new_source), registered_by=user)
+    destination = Path(service.config.worker.evidence_root_windows) / str(case.id) / "E002.txt"
+    assert not destination.exists()
+    destination.write_bytes(b"existing")
+    with pytest.raises(FileExistsError):
+        service.register_evidence(case.id, "new", str(new_source), registered_by=user)
+    assert destination.read_bytes() == b"existing"
+    assert source.exists() and new_source.read_bytes() == b"new"
+
+
+def test_reference_algorithm_not_in_configuration_is_checked(service, registered, tmp_path):
+    from app.evidence.models import HashAlgorithm
+
+    case, user, _, _ = registered
+    source = tmp_path / "reference.txt"
+    source.write_bytes(b"synthetic")
+    service.config.forensics.hash_algorithms = ["sha256"]
+    item = service.register_evidence(case.id, "reference", str(source), registered_by=user,
+                                     reference_hashes={HashAlgorithm.MD5: "0" * 32})
+    hashes = [h for h in item.hashes if h.algorithm == HashAlgorithm.MD5]
+    assert len(hashes) == 2
+    assert next(h for h in hashes if h.is_reference).match_result is False
+    assert item.status.value == "integrity_failed"
+
+
+def test_invalid_reference_is_rejected_before_copy(service, registered, tmp_path):
+    from app.evidence.models import HashAlgorithm
+
+    case, user, _, _ = registered
+    source = tmp_path / "invalid.txt"
+    source.write_bytes(b"synthetic")
+    with pytest.raises(ValueError, match="Invalid MD5"):
+        service.register_evidence(case.id, "invalid", str(source), registered_by=user,
+                                  reference_hashes={HashAlgorithm.MD5: "not a hash"})
+    assert not (Path(service.config.worker.evidence_root_windows) / str(case.id) / "E002.txt").exists()
+
+
+def test_record_creation_failure_cleans_only_new_copy(service, registered, tmp_path, monkeypatch):
+    import app.evidence.service as module
+
+    case, user, existing, _ = registered
+    source = tmp_path / "new.txt"
+    source.write_bytes(b"synthetic")
+    def fail(**kwargs):
+        raise RuntimeError("hash record failed")
+    monkeypatch.setattr(module, "EvidenceHash", fail)
+    with pytest.raises(RuntimeError, match="hash record failed"):
+        service.register_evidence(case.id, "new", str(source), registered_by=user)
+    assert source.read_bytes() == b"synthetic"
+    assert Path(existing.stored_path).exists()
+    assert not (Path(service.config.worker.evidence_root_windows) / str(case.id) / "E002.txt").exists()
+
+
+def test_copy_failure_cleans_partial_segments(service, registered, tmp_path):
+    case, user, _, _ = registered
+    first, second = tmp_path / "split.E01", tmp_path / "split.E02"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    def fail_on_second(message, current, total):
+        if "segment 2/2" in message:
+            raise OSError("copy interrupted")
+
+    with pytest.raises(OSError, match="copy interrupted"):
+        service.register_evidence(case.id, "split", str(first), registered_by=user, progress_callback=fail_on_second)
+    dest = Path(service.config.worker.evidence_root_windows) / str(case.id)
+    assert not (dest / "E002.E01").exists()
+    assert not (dest / "E002.E02").exists()
+    assert first.read_bytes() == b"one" and second.read_bytes() == b"two"
+
+
 def test_file_state_reports_a_missing_stored_copy(service, session, registered):
     case, _user, evidence, _source = registered
     Path(evidence.stored_path).unlink()
@@ -135,6 +226,63 @@ def test_deleting_a_reference_only_item_keeps_the_source(service, session, regis
 
     assert result["files"] == 0
     assert reference.is_file()
+
+
+def test_deleting_missing_evidence_with_many_artifacts(service, session, registered):
+    import sqlite3
+    from app.artifacts.models import Artifact, ArtifactType
+
+    case, user, evidence, source = registered
+    evidence_id = evidence.id
+    Path(evidence.stored_path).unlink()
+    session.add_all([
+        Artifact(artifact_id=f"ART-{i}", case_id=case.id, evidence_id=evidence_id,
+                 artifact_type=ArtifactType.FILE, name=f"item-{i}")
+        for i in range(850)
+    ])
+    session.commit()
+    raw = session.connection().connection.driver_connection
+    previous_limit = raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 900)
+    try:
+        result = service.delete_evidence(evidence_id, user)
+        session.commit()
+    finally:
+        raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+    assert result["files"] == 0
+    assert result["artifacts"] == 850
+    assert source.exists()
+    assert service.get_evidence_by_id(evidence_id) is None
+    assert session.query(Artifact).filter_by(evidence_id=evidence_id).count() == 0
+
+
+def test_delete_worker_reserves_write_before_reading_evidence(session, registered, monkeypatch, qt_app):
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+    from app.db import session as session_module
+    from app.evidence.service import EvidenceService
+    from app.ui.deletion_worker import DeletionWorker
+
+    _case, user, evidence, _source = registered
+    user_id, evidence_id = user.id, evidence.id
+    engine = session.get_bind()
+    session.commit()
+    monkeypatch.setattr(session_module, "get_session_factory", lambda: lambda: Session(engine))
+
+    def simulate_cleanup(self, record_id, performed_by, reason):
+        with engine.connect() as competing:
+            competing.exec_driver_sql("PRAGMA busy_timeout=1")
+            with pytest.raises(OperationalError, match="locked"):
+                competing.exec_driver_sql("BEGIN IMMEDIATE")
+        return {"files": 0, "bytes": 0, "jobs": 0, "artifacts": 0}
+
+    monkeypatch.setattr(EvidenceService, "delete_evidence", simulate_cleanup)
+    worker = DeletionWorker("evidence", evidence_id, user_id)
+    results, errors = [], []
+    worker.succeeded.connect(results.append)
+    worker.failed.connect(errors.append)
+    worker.run()
+    assert results and not errors
 
 
 def test_deleting_cascades_completed_examinations_and_artifacts(

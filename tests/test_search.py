@@ -114,6 +114,29 @@ def run(coroutine):
     return asyncio.run(coroutine)
 
 
+def test_ai_resolves_explicit_artifact_id_in_current_case(session, service, qt_app):
+    from app.ui.pages.ai_analysis_page import AskWorker
+
+    artifact = add_artifact(session, artifact_id="ART-0001-10664", name="photo.jpg",
+                            path="/photo.jpg", content="[Image - 9 KB]")
+    artifact.artifact_type = ArtifactType.IMAGE
+    session.commit()
+    add_artifact(session, artifact_id="ART-0001-12854", name="other.txt", path="/other.txt")
+
+    items = AskWorker(1, "Explain art-0001-10664", 1)._retrieve(session)
+
+    assert [item["citation"]["artifact_id"] for item in items] == ["ART-0001-10664"]
+    assert "visual contents have not been inspected" in items[0]["context"]["content_warning"]
+
+
+def test_ai_does_not_substitute_other_artifacts_for_missing_id(session, service, qt_app):
+    from app.ui.pages.ai_analysis_page import AskWorker
+
+    add_artifact(session, artifact_id="ART-0001-12854", name="other.txt", path="/other.txt")
+    with pytest.raises(ValueError, match="ART-0001-10664"):
+        AskWorker(1, "Explain ART-0001-10664", 1)._retrieve(session)
+
+
 def test_a_filename_is_searchable(session, service):
     add_artifact(
         session, artifact_id="ART-1", name="budget-final.xlsx",
@@ -268,6 +291,8 @@ def test_semantic_hits_collapse_to_one_row_per_file(session, service, monkeypatc
         session, artifact_id="ART-1", name="contract.pdf", path="/contract.pdf",
         content="a long agreement",
     )
+    artifact.index_status = IndexStatus.INDEXED
+    session.commit()
 
     class FakeClient:
         async def post(self, url, json=None, **kwargs):  # noqa: A002
@@ -305,12 +330,18 @@ def test_semantic_hits_collapse_to_one_row_per_file(session, service, monkeypatc
     assert results[0]["chunk_index"] == 7
     assert "thirty days" in results[0]["snippet"]
 
+    artifact.index_status = IndexStatus.INDEX_FAILED
+    session.commit()
+    assert run(service.semantic_search(1, "termination")) == []
+
 
 def test_hybrid_does_not_repeat_an_artifact(session, service, monkeypatch):
-    add_artifact(
+    artifact = add_artifact(
         session, artifact_id="ART-1", name="budget.txt", path="/budget.txt",
         content="the budget is approved",
     )
+    artifact.index_status = IndexStatus.INDEXED
+    session.commit()
 
     class FakeClient:
         async def post(self, url, json=None, **kwargs):  # noqa: A002

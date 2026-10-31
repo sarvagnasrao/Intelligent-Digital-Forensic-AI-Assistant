@@ -41,6 +41,8 @@ class FakeQdrant:
         self.get_urls: list[str] = []
         self.put_urls: list[str] = []
         self.upserts: list[dict] = []
+        self.points = {}
+        self.cleanup_status = 200
 
     async def get(self, url, **kwargs):
         self.get_urls.append(url)
@@ -48,11 +50,26 @@ class FakeQdrant:
 
     async def put(self, url, json=None, **kwargs):  # noqa: A002 - httpx signature
         self.put_urls.append(url)
-        if url.endswith("/points"):
+        if "/points?" in url:
             self.upserts.append(json or {})
+            if self.upsert_status == 200:
+                self.points.update({point["id"]: point for point in json["points"]})
             return FakeResponse(self.upsert_status)
         # Collection creation.
         return FakeResponse(200)
+
+    async def post(self, url, json=None, **kwargs):
+        if self.cleanup_status == 200:
+            conditions = json["filter"]
+            case_id = conditions["must"][0]["match"]["value"]
+            artifact_id = conditions["must"][1]["match"]["value"]
+            keep = set(conditions["must_not"][0]["has_id"])
+            self.points = {
+                key: point for key, point in self.points.items()
+                if key in keep or point["payload"]["case_id"] != case_id
+                or point["payload"]["artifact_id"] != artifact_id
+            }
+        return FakeResponse(self.cleanup_status)
 
     async def aclose(self):
         return None
@@ -207,6 +224,44 @@ def test_point_ids_are_deterministic(session, service, monkeypatch):
     assert [point["id"] for point in second] == expected
 
 
+def test_rebuild_removes_obsolete_chunks(session, service, monkeypatch):
+    artifacts = add_artifacts(session, 1, contents=["x" * 3000])
+    stub_embedder(monkeypatch, good_vectors)
+    assert run_index(service)["indexed"] == 1
+    assert len(service._client.points) == 3
+    service.config.embeddings.chunk_size = 4000
+    result = asyncio.run(service.index_artifacts(CASE_ID, rebuild=True))
+    assert result["indexed"] == 1
+    assert len(service._client.points) == 1
+    assert artifacts[0].index_status is IndexStatus.INDEXED
+
+
+def test_cleanup_failure_is_not_reported_as_indexed(session, service, monkeypatch):
+    artifacts = add_artifacts(session, 1)
+    service._client.cleanup_status = 500
+    stub_embedder(monkeypatch, good_vectors)
+    result = run_index(service)
+    assert result["indexed"] == 0
+    assert "cleanup failed" in result["errors"][0]
+    assert artifacts[0].index_status is IndexStatus.INDEX_FAILED
+
+
+def test_interruption_during_rebuild_persists_fail_closed_status(session, service, monkeypatch):
+    artifacts = add_artifacts(session, 1)
+    stub_embedder(monkeypatch, good_vectors)
+    assert run_index(service)["indexed"] == 1
+
+    async def interrupted_put(url, json=None, **kwargs):
+        raise KeyboardInterrupt("simulated process interruption")
+
+    monkeypatch.setattr(service._client, "put", interrupted_put)
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(service.index_artifacts(CASE_ID, rebuild=True))
+    session.rollback()
+    session.expire_all()
+    assert session.get(Artifact, artifacts[0].id).index_status is IndexStatus.INDEX_FAILED
+
+
 def test_payload_carries_searchable_fields(session, service, monkeypatch):
     add_artifacts(session, 1, contents=["the quick brown fox " * 100])
     stub_embedder(monkeypatch, good_vectors)
@@ -351,7 +406,7 @@ def test_collection_is_created_when_missing(session, service, monkeypatch):
 
     run_index(service)
 
-    collection_urls = [url for url in service._client.put_urls if not url.endswith("/points")]
+    collection_urls = [url for url in service._client.put_urls if "/points?" not in url]
     assert collection_urls == [f"http://127.0.0.1:6333/collections/idfa_case_{CASE_ID}"]
     assert service._client.get_urls[0].endswith(f"/collections/idfa_case_{CASE_ID}")
 
@@ -362,5 +417,5 @@ def test_existing_collection_is_not_recreated(session, service, monkeypatch):
 
     run_index(service)
 
-    collection_urls = [url for url in service._client.put_urls if not url.endswith("/points")]
+    collection_urls = [url for url in service._client.put_urls if "/points?" not in url]
     assert collection_urls == []

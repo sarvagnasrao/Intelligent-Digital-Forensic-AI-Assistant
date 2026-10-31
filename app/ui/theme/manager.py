@@ -229,6 +229,9 @@ class ThemeManager:
 
     @staticmethod
     def _build_font() -> QFont:
-        font = QFont(Typography.FONT_FAMILY)
+        # Keep the application's configured point size rather than resetting it
+        # to Qt's default whenever the theme is reapplied.
+        font = QFont(QApplication.font())
+        font.setFamily(Typography.FONT_FAMILY)
         font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
         return font

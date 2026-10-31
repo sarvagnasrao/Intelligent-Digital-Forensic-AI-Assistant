@@ -28,3 +28,13 @@ config.yaml
 
 # Runtime output
 *.log
+
+# Local session exports, temporary test homes and case databases
+/project
+/greeting.json
+/idfa_pytest_*/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3

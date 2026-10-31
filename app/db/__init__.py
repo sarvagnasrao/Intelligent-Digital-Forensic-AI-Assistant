@@ -10,6 +10,7 @@ def load_all_models() -> None:
     """Import all models to register with Base.metadata."""
     # Import order matters - auth first (User, Case), then others
     from app.auth.models import Case, User, UserRole  # noqa: F401
+    from app.devices.models import DeviceEvidenceLink, PhysicalDevice  # noqa: F401
     from app.evidence.models import CustodyEvent, Evidence, EvidenceHash, EvidenceStatus, EvidenceType, HashAlgorithm  # noqa: F401
     from app.examination.models import ExaminationJob, ExaminationOperation, ExaminationResult, JobStatus  # noqa: F401
     from app.artifacts.models import (  # noqa: F401

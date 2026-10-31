@@ -9,6 +9,37 @@ import worker.main as worker_main
 VECTOR_SIZE = 384
 
 
+def test_filesystem_walker_delivers_bounded_batches_and_propagates_failure(monkeypatch):
+    from types import SimpleNamespace
+
+    meta = SimpleNamespace(flags=1, type=3, addr=1, size=0, mtime=0, atime=0, ctime=0, crtime=0)
+    entries = [
+        SimpleNamespace(info=SimpleNamespace(name=SimpleNamespace(name=f"file{i}".encode()), meta=meta))
+        for i in range(5)
+    ]
+    monkeypatch.setattr(worker_main, "_fs_info", SimpleNamespace(open_dir=lambda **_: entries))
+    monkeypatch.setattr(worker_main, "pytsk3", SimpleNamespace(
+        TSK_FS_META_FLAG_ALLOC=1, TSK_FS_META_TYPE_REG=1, TSK_FS_META_TYPE_DIR=2,
+    ))
+    batches = []
+    result = worker_main.walk_and_extract_artifacts(
+        "unused", partition_offset=42, batch_size=2,
+        batch_callback=lambda offset, rows: batches.append((offset, rows)),
+    )
+    assert result == []
+    assert [len(rows) for _, rows in batches] == [2, 2, 1]
+    assert all(offset == 42 for offset, _ in batches)
+    assert [row["name"] for _, rows in batches for row in rows] == [
+        f"file{i}" for i in range(5)
+    ]
+
+    def fail(_offset, _rows):
+        raise OSError("receiver unavailable")
+
+    with pytest.raises(RuntimeError, match="batch delivery failed"):
+        worker_main.walk_and_extract_artifacts("unused", batch_size=2, batch_callback=fail)
+
+
 def test_extraction_does_not_fake_pdf_or_image_content():
     assert worker_main.extract_text_content(b"%PDF-1.7", "application/pdf", ".pdf", deep=True) is None
     assert worker_main.extract_text_content(b"not an image", "image/jpeg", ".jpg", deep=True) is None
@@ -208,7 +239,8 @@ def test_file_extraction_probes_partitions_like_file_traversal(
 
     assert body["success"] is True
     assert mounted_offsets == [0, 1_048_576]
-    assert body["results"][0]["data"]["partition_offset"] == 1_048_576
+    artifact_result = next(result for result in body["results"] if result["type"] == "artifacts")
+    assert artifact_result["data"]["partition_offset"] == 1_048_576
 
 
 def test_progress_defaults_for_an_unknown_job(client):
@@ -308,6 +340,31 @@ def test_text_extraction_keeps_real_text_whatever_the_depth():
         "meeting notes: transfer approved"
     )
     assert worker_main.extract_text_content(body, "text/plain", ".txt", deep=True)
+
+
+def test_plain_file_evidence_hashes_all_bytes_without_buffering_binary(tmp_path):
+    import hashlib
+
+    payload = tmp_path / "large.bin"
+    contents = b"binary-payload" * 100_000
+    payload.write_bytes(contents)
+
+    artifact = worker_main.describe_file_evidence(str(payload))
+
+    assert artifact["content_hash"] == hashlib.sha256(contents).hexdigest()
+    assert artifact["content_text"] is None
+    assert artifact["content_truncated"] is False
+
+
+def test_plain_file_evidence_keeps_complete_supported_text(tmp_path):
+    payload = tmp_path / "notes.txt"
+    text = "forensic note — " * 20_000
+    payload.write_text(text, encoding="utf-8")
+
+    artifact = worker_main.describe_file_evidence(str(payload))
+
+    assert artifact["content_text"] == text
+    assert artifact["content_truncated"] is False
 
 
 def test_unsupported_binary_is_not_faked_as_hex():

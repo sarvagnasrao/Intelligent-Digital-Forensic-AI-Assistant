@@ -22,7 +22,6 @@ from PySide6.QtGui import (
     QStandardItemModel,
     QTextCharFormat,
     QTextCursor,
-    QTextDocument,
 )
 from PySide6.QtPdf import QPdfDocument, QPdfSearchModel
 from PySide6.QtPdfWidgets import QPdfView
@@ -33,25 +32,26 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
     QDialog,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabBar,
     QTableView,
-    QTextBrowser,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from app.artifacts.models import Artifact, ArtifactType
+from app.config import get_config
 from app.ui import qt_threads
 from app.ui.base import CaseContext, ResponsivePage
 from app.ui.layouts import configure_detail_pane, configure_detail_splitter
@@ -62,6 +62,29 @@ from app.util.time import format_local_date
 def _enum_value(value) -> str:
     """Normalize SQLAlchemy enums and raw SQLite/FTS values for display."""
     return str(getattr(value, "value", value))
+
+
+def _has_extracted_text(artifact: Artifact) -> bool:
+    """Use stored content, not file type, snippet, or indexing state.
+
+    Older deep scans stored these descriptions instead of extracted text.
+    Match only the complete known stand-in, never a substring of real text.
+    """
+    content = (artifact.content_text or "").strip()
+    if not content:
+        return False
+    return re.fullmatch(
+        r"\[(?:Image|Office Document|SQLite Database) - \d+ bytes\]",
+        content,
+    ) is None
+
+
+def _evidence_label(artifact: Artifact) -> str:
+    """Show the case-visible identifier, never the internal database key."""
+    evidence = getattr(artifact, "evidence", None)
+    evidence_id = getattr(evidence, "evidence_id", None) or "Unknown ID"
+    name = getattr(evidence, "name", None) or "Unknown evidence"
+    return f"{evidence_id} — {name}"
 
 if TYPE_CHECKING:
     from app.artifacts.service import SearchService
@@ -85,8 +108,7 @@ class ArtifactTableModel(QStandardItemModel):
         for item in results:
             art = item["artifact"]
             size_str = self._format_size(art.source_size or 0)
-            evidence = getattr(art, "evidence", None)
-            evidence_name = getattr(evidence, "name", "") or "Unknown evidence"
+            evidence_name = _evidence_label(art)
             index_status = _enum_value(getattr(art, "index_status", "unknown"))
             source = item.get("source", "") or ", ".join(item.get("sources", []))
             matched = ", ".join(item.get("matched_fields") or []) or source
@@ -109,7 +131,7 @@ class ArtifactTableModel(QStandardItemModel):
             )
             for cell in row:
                 cell.setEditable(False)
-                cell.setToolTip(tooltip)
+                cell.setToolTip(f"{cell.text()}\n\n{tooltip}" if cell.text() else tooltip)
             self.appendRow(row)
 
     @staticmethod
@@ -137,7 +159,7 @@ class ArtifactDocumentDialog(QDialog):
     def __init__(self, artifact: Artifact, query: str = "", parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"{artifact.name} — IDFA Document Viewer")
-        self.setMinimumSize(850, 600)
+        self.setMinimumSize(500, 400)
         self._artifact = artifact
         self._query = query.strip()
         self._pdf_document: QPdfDocument | None = None
@@ -145,10 +167,14 @@ class ArtifactDocumentDialog(QDialog):
         self._text_match_index = -1
 
         layout = QVBoxLayout(self)
-        toolbar = QHBoxLayout()
         title = QLabel(f"{artifact.name}  ·  {_enum_value(artifact.artifact_type)}")
         title.setStyleSheet("font-weight: 600;")
-        toolbar.addWidget(title, 1)
+        title.setWordWrap(True)
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        title.setToolTip(title.text())
+        layout.addWidget(title)
+        toolbar = QHBoxLayout()
+        toolbar.addStretch(1)
         self.previous_match_button = QPushButton("↑")
         self.previous_match_button.setToolTip("Previous occurrence")
         self.previous_match_button.setFixedWidth(38)
@@ -165,7 +191,7 @@ class ArtifactDocumentDialog(QDialog):
         self.match_count_label.setMinimumWidth(55)
         self.match_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         toolbar.addWidget(self.match_count_label)
-        self.maximize_button = QPushButton("❐  Restore")
+        self.maximize_button = QPushButton("□  Maximize")
         self.maximize_button.setToolTip("Maximize or restore this document viewer")
         self.maximize_button.clicked.connect(self._toggle_maximized)
         toolbar.addWidget(self.maximize_button)
@@ -203,6 +229,19 @@ class ArtifactDocumentDialog(QDialog):
             None,
         )
         if extension == ".pdf":
+            # An evidence image is not the selected file, even if it happens to
+            # have a PDF extension. source_offset stores the filesystem inode.
+            if (self._artifact.source_offset is not None or not evidence_path
+                    or Path(evidence_path).suffix.lower() != ".pdf"):
+                self.text_view.setPlainText(
+                    "The original PDF is not available as a standalone evidence file. "
+                    "Showing the selected artifact's extracted text instead.\n\n"
+                    + (self._artifact.content_text or "No extracted text is available for this document.")
+                )
+                self.viewer_stack.addWidget(self.text_view)
+                if self._query:
+                    self._highlight_query(self._query)
+                return
             # PDF loading is asynchronous: add the native page viewer before
             # checking status, otherwise fast status checks incorrectly fall
             # through to the indexed placeholder text.
@@ -316,6 +355,18 @@ class ArtifactDocumentDialog(QDialog):
             self.match_count_label.setText("0 / 0")
 
 
+class _WrappedMetadata(QLabel):
+    """Reserve the full wrapped height so provenance remains scrollable."""
+
+    def setText(self, text):
+        super().setText(text)
+        self.setMinimumHeight(max(0, self.heightForWidth(self.width())))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setMinimumHeight(max(0, self.heightForWidth(event.size().width())))
+
+
 class ArtifactDetailPane(QFrame):
     delete_requested = Signal()
 
@@ -357,12 +408,25 @@ class ArtifactDetailPane(QFrame):
         content_header.addWidget(self.expand_button)
         layout.addLayout(content_header)
 
-        self.metadata_label = QLabel("")
+        self.metadata_label = _WrappedMetadata("")
         self.metadata_label.setWordWrap(True)
         self.metadata_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(self.metadata_label)
+
+        hash_row = QHBoxLayout()
+        self.hash_label = QLabel("SHA-256:")
+        hash_row.addWidget(self.hash_label)
+        self.hash_value = QLineEdit()
+        self.hash_value.setReadOnly(True)
+        self.hash_value.setMinimumWidth(0)
+        self.hash_value.setToolTip("Select or scroll horizontally to inspect the complete value.")
+        hash_row.addWidget(self.hash_value, 1)
+        self.copy_hash_button = QPushButton("Copy hash")
+        self.copy_hash_button.clicked.connect(lambda: QApplication.clipboard().setText(self.hash_value.text()))
+        hash_row.addWidget(self.copy_hash_button)
+        layout.addLayout(hash_row)
 
         action_row = QHBoxLayout()
         self.copy_id_button = QPushButton("Copy artifact ID")
@@ -414,6 +478,7 @@ class ArtifactDetailPane(QFrame):
             self.content_label, self.expand_button, self.metadata_label,
             self.copy_id_button, self.copy_path_button, self.delete_button,
             self.content_text, self.match_status, self.snippet_label,
+            self.hash_label, self.hash_value, self.copy_hash_button,
         ):
             widget.setVisible(artifact is not None)
         if not artifact:
@@ -422,14 +487,14 @@ class ArtifactDetailPane(QFrame):
             self.match_status.clear()
             self.snippet_label.clear()
             self.metadata_label.clear()
+            self.hash_value.clear()
             self.copy_id_button.setEnabled(False)
             self.copy_path_button.setEnabled(False)
             self.delete_button.setEnabled(False)
             return
 
         self.title.setText(f"{_enum_value(artifact.artifact_type)}: {artifact.name}")
-        evidence = getattr(artifact, "evidence", None)
-        evidence_name = getattr(evidence, "name", None) or "Unknown evidence"
+        evidence_name = _evidence_label(artifact)
         try:
             extraction = json.loads(artifact.metadata_json or "{}")
         except (TypeError, json.JSONDecodeError):
@@ -437,6 +502,7 @@ class ArtifactDetailPane(QFrame):
         extraction_status = extraction.get("extraction_status", "legacy_unknown")
         extraction_labels = {
             "extracted": "Text extracted",
+            "partial": "Partial extraction",
             "metadata_only_deleted": "Deleted entry — metadata only",
             "unsupported_or_no_text": "No extracted text (unsupported or unreadable format)",
             "error": "Extraction error",
@@ -448,7 +514,8 @@ class ArtifactDetailPane(QFrame):
         if extraction.get("content_truncated"):
             extraction_text += " — partial content"
         if extraction.get("read_error"):
-            extraction_text += f"\nRead error: {extraction['read_error']}"
+            label = "Extraction warning" if extraction_status == "partial" else "Read error"
+            extraction_text += f"\n{label}: {extraction['read_error']}"
         self.metadata_label.setText(
             f"Artifact ID: {artifact.artifact_id}\n"
             f"Evidence: {evidence_name}\n"
@@ -456,9 +523,11 @@ class ArtifactDetailPane(QFrame):
             f"Size: {ArtifactTableModel._format_size(artifact.source_size or 0)}  ·  "
             f"Index: {_enum_value(artifact.index_status).replace('_', ' ').title()}\n"
             f"Extraction: {extraction_text}\n"
-            f"SHA-256: {artifact.content_hash or 'Not available'}\n"
             f"Created: {format_local_date(artifact.created_time) if artifact.created_time else 'Unknown'}"
         )
+        self.hash_value.setText(artifact.content_hash or "Not available")
+        self.hash_value.home(False)
+        self.copy_hash_button.setEnabled(bool(artifact.content_hash))
         self.copy_id_button.setEnabled(True)
         self.copy_path_button.setEnabled(bool(artifact.source_path))
         self.delete_button.setEnabled(True)
@@ -564,7 +633,7 @@ class SearchWorker(QObject):
     def __init__(self, search_service: "SearchService", case_id: int, query: str, 
                  mode: str, artifact_type: ArtifactType | None,
                  date_from: date | None = None, date_to: date | None = None,
-                 regex: bool = False):
+                 regex: bool = False, evidence_id: int | None = None):
         super().__init__()
         self.search_service = search_service
         self.case_id = case_id
@@ -574,8 +643,10 @@ class SearchWorker(QObject):
         self.date_from = date_from
         self.date_to = date_to
         self.regex = regex
+        self.evidence_id = evidence_id
 
     def run(self):
+        loop = None
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -585,7 +656,7 @@ class SearchWorker(QObject):
                     self.search_service.keyword_search(
                         self.case_id, self.query, self.artifact_type,
                         date_from=self.date_from, date_to=self.date_to,
-                        regex=self.regex,
+                        regex=self.regex, evidence_id=self.evidence_id,
                     )
                 )
             elif self.mode == "Semantic":
@@ -593,6 +664,7 @@ class SearchWorker(QObject):
                     self.search_service.semantic_search(
                         self.case_id, self.query, self.artifact_type,
                         date_from=self.date_from, date_to=self.date_to,
+                        evidence_id=self.evidence_id,
                     )
                 )
             else:  # Hybrid
@@ -600,13 +672,17 @@ class SearchWorker(QObject):
                     self.search_service.hybrid_search(
                         self.case_id, self.query, self.artifact_type,
                         date_from=self.date_from, date_to=self.date_to,
-                        regex=self.regex,
+                        regex=self.regex, evidence_id=self.evidence_id,
                     )
                 )
             
             self.finished.emit(results)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if loop is not None:
+                loop.close()
+                asyncio.set_event_loop(None)
 
 
 class OpenArtifactWorker(QObject):
@@ -686,10 +762,11 @@ class IndexWorker(QObject):
     error = Signal(str)
     progress = Signal(str, int, int, int, int)
 
-    def __init__(self, search_service: "SearchService", case_id: int):
+    def __init__(self, search_service: "SearchService", case_id: int, rebuild: bool = False):
         super().__init__()
         self.search_service = search_service
         self.case_id = case_id
+        self.rebuild = rebuild
 
     def run(self):
         try:
@@ -697,7 +774,7 @@ class IndexWorker(QObject):
             asyncio.set_event_loop(loop)
             result = loop.run_until_complete(
                 self.search_service.index_artifacts(
-                    self.case_id, progress_callback=self.progress.emit
+                    self.case_id, progress_callback=self.progress.emit, rebuild=self.rebuild
                 )
             )
             self.finished.emit(result)
@@ -724,6 +801,8 @@ class ArtifactsSearchPage(ResponsivePage):
         self.case_context: CaseContext | None = None
         self.search_service: "SearchService | None" = None
         self._last_search_query = ""
+        self._search_generation = 0
+        self._search_active = False
         self._open_threads: list[QThread] = []
         
 
@@ -731,6 +810,14 @@ class ArtifactsSearchPage(ResponsivePage):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.LG)
+
+        title = QLabel("Artifacts & Search")
+        title.setStyleSheet("font-size: 20px; font-weight: 600;")
+        layout.addWidget(title)
+        subtitle = QLabel("Search files and extracted content from this case.")
+        subtitle.setProperty("muted", True)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
 
         # Search controls are split into two compact rows so the page remains
         # comfortable at the minimum desktop window width.
@@ -754,35 +841,67 @@ class ArtifactsSearchPage(ResponsivePage):
             "OR / NOT / NEAR for FTS5 syntax, or tick Regex."
         )
         self.query_edit.returnPressed.connect(self._on_search)
+        self.query_edit.setClearButtonEnabled(True)
         search_bar.addWidget(self.query_edit, 1)
 
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self._on_search)
+        search_bar.addWidget(self.search_btn)
+        layout.addLayout(search_bar)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(Spacing.SM)
         self.regex_check = QCheckBox("Regex")
         self.regex_check.setToolTip(
             "Treat the query as a regular expression over names, paths and "
             "content. Slower on large cases."
         )
-        search_bar.addWidget(self.regex_check)
+        filter_row.addWidget(self.regex_check)
 
         # Type filter
         self.type_filter = QComboBox()
         self.type_filter.addItem("All Types")
         for t in ArtifactType:
             self.type_filter.addItem(t.value)
-        search_bar.addWidget(self.type_filter)
+        filter_row.addWidget(self.type_filter)
 
-        search_bar.addStretch()
-        layout.addLayout(search_bar)
+        filter_row.addWidget(QLabel("Content:"))
+        self.content_filter = QComboBox()
+        self.content_filter.addItem("All", "all")
+        self.content_filter.addItem("With extracted text", "with_text")
+        self.content_filter.addItem("Without extracted text", "without_text")
+        self.content_filter.setToolTip(
+            "Filter by stored extracted text, independently of artifact type or indexing status. "
+            "Empty, whitespace-only and known legacy placeholder text count as no text. "
+            "Applied when you Search; clear the query to filter the case inventory. "
+            "Search results are filtered after backend result limits, so other matching "
+            "artifacts may not be shown. Semantic search only retrieves indexed text."
+        )
+        filter_row.addWidget(self.content_filter)
 
         # Default to an explicit no-date-limit state rather than displaying a
         # misleading sentinel such as 2000-01-01.
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(Spacing.SM)
-        filter_row.addWidget(QLabel("Date:"))
+        filter_row.addWidget(QLabel("Evidence:"))
+        self.evidence_filter = QComboBox()
+        self.evidence_filter.addItem("All evidence", None)
+        self.evidence_filter.setToolTip(
+            "Limit results to one active evidence item. Older semantic indexes may require rebuilding."
+        )
+        filter_row.addWidget(self.evidence_filter)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+
+        date_row = QHBoxLayout()
+        date_row.setSpacing(Spacing.SM)
+        date_label = QLabel("Created:")
+        date_label.setToolTip("Filter by the artifact's creation date; artifacts without a creation date are excluded.")
+        date_row.addWidget(date_label)
         self.date_preset = QComboBox()
+        self.date_preset.setToolTip(date_label.toolTip())
         for label, key in self.DATE_PRESETS:
             self.date_preset.addItem(label, key)
         self.date_preset.setMinimumWidth(145)
-        filter_row.addWidget(self.date_preset)
+        date_row.addWidget(self.date_preset)
 
         self.custom_range = QWidget()
         custom_row = QHBoxLayout(self.custom_range)
@@ -792,8 +911,10 @@ class ArtifactsSearchPage(ResponsivePage):
         for picker in (self.date_from, self.date_to):
             picker.setDisplayFormat("yyyy-MM-dd")
             picker.setCalendarPopup(True)
-            picker.setMinimumDate(QDate(2000, 1, 1))
-            picker.setMaximumDate(QDate.currentDate())
+            # Evidence timestamps can predate 2000 or be in the future when
+            # a device clock was incorrect. Do not silently exclude them.
+            picker.setMinimumDate(QDate(1752, 9, 14))
+            picker.setMaximumDate(QDate(9999, 12, 31))
         today = QDate.currentDate()
         self.date_from.setDate(today.addDays(-29))
         self.date_to.setDate(today)
@@ -803,19 +924,46 @@ class ArtifactsSearchPage(ResponsivePage):
         custom_row.addWidget(self.date_to)
         custom_row.addStretch(1)
         self.custom_range.hide()
-        layout.addWidget(self.custom_range)
-
-        self.search_btn = QPushButton("Search")
-        self.search_btn.clicked.connect(self._on_search)
-        filter_row.addStretch()
+        date_row.addStretch()
         self.show_all_btn = QPushButton("Show all")
         self.show_all_btn.setProperty("secondary", True)
         self.show_all_btn.setToolTip(
             "Clear the query and filters and list every active case artifact"
         )
         self.show_all_btn.clicked.connect(self._show_all_artifacts)
-        filter_row.addWidget(self.show_all_btn)
-        filter_row.addWidget(self.search_btn)
+        date_row.addWidget(self.show_all_btn)
+        layout.addLayout(date_row)
+        layout.addWidget(self.custom_range)
+
+        index_row = QHBoxLayout()
+        index_row.setSpacing(Spacing.SM)
+
+        self.index_options_toggle = QToolButton()
+        self.index_options_toggle.setText("Semantic indexing")
+        self.index_options_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.index_options_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.index_options_toggle.setCheckable(True)
+        self.index_options_toggle.setToolTip(
+            "Show indexing and rebuild actions for semantic search"
+        )
+        index_row.addWidget(self.index_options_toggle)
+        self.result_summary = QLabel("")
+        self.result_summary.setProperty("muted", True)
+        index_row.addStretch()
+        index_row.addWidget(self.result_summary)
+        layout.addLayout(index_row)
+
+        self.index_options = QWidget()
+        index_actions = QHBoxLayout(self.index_options)
+        index_actions.setContentsMargins(0, 0, 0, 0)
+        index_actions.setSpacing(Spacing.SM)
+        self.index_options.hide()
+        self.index_options_toggle.toggled.connect(self.index_options.setVisible)
+        self.index_options_toggle.toggled.connect(
+            lambda expanded: self.index_options_toggle.setArrowType(
+                Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+            )
+        )
 
         # Index button
         self.index_btn = QPushButton("Index for Semantic Search")
@@ -825,13 +973,14 @@ class ArtifactsSearchPage(ResponsivePage):
             "Qdrant. Artifacts already indexed are skipped."
         )
         self.index_btn.clicked.connect(self._on_index)
-        filter_row.addWidget(self.index_btn)
-
-        self.result_summary = QLabel("")
-        self.result_summary.setProperty("muted", True)
-        filter_row.addWidget(self.result_summary)
-
-        layout.addLayout(filter_row)
+        index_actions.addWidget(self.index_btn)
+        self.rebuild_index_btn = QPushButton("Rebuild semantic index")
+        self.rebuild_index_btn.setProperty("secondary", True)
+        self.rebuild_index_btn.setToolTip("Re-embed all active case artifacts using current settings.")
+        self.rebuild_index_btn.clicked.connect(lambda: self._on_index(rebuild=True))
+        index_actions.addWidget(self.rebuild_index_btn)
+        index_actions.addStretch()
+        layout.addWidget(self.index_options)
         self.date_preset.currentIndexChanged.connect(self._on_date_preset_changed)
         self.mode_tabs.currentChanged.connect(
             lambda index: self.regex_check.setEnabled(index != 1)
@@ -857,6 +1006,7 @@ class ArtifactsSearchPage(ResponsivePage):
 
         # Results splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.results_splitter = splitter
 
         # Results table
         self.table_view = QTableView()
@@ -872,22 +1022,59 @@ class ArtifactsSearchPage(ResponsivePage):
         self.table_view.setToolTip(
             "Double-click a PDF or document result to extract a temporary copy and open it externally."
         )
-        splitter.addWidget(self.table_view)
+        results_container = QWidget()
+        results_layout = QVBoxLayout(results_container)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_heading = QLabel("Results")
+        results_heading.setStyleSheet("font-weight: 600;")
+        results_layout.addWidget(results_heading)
+        self.empty_results = QLabel("No artifacts to display. Add evidence and run an examination to extract artifacts.")
+        self.empty_results.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_results.setWordWrap(True)
+        self.empty_results.setProperty("muted", True)
+        results_layout.addWidget(self.empty_results, 1)
+        self.empty_results.hide()
+        results_layout.addWidget(self.table_view, 1)
+        splitter.addWidget(results_container)
 
         # Detail pane
         self.detail_pane = ArtifactDetailPane()
+        self.detail_pane.setMaximumWidth(16777215)
         self.detail_pane.delete_requested.connect(self._on_delete_artifact)
-        splitter.addWidget(self.detail_pane)
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.detail_scroll.setWidget(self.detail_pane)
+        splitter.addWidget(self.detail_scroll)
 
-        configure_detail_splitter(splitter, preferred_detail_width=380)
+        configure_detail_splitter(splitter, preferred_detail_width=300)
         layout.addWidget(splitter, 1)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "results_splitter"):
+            orientation = (Qt.Orientation.Vertical if event.size().width() < 850
+                           else Qt.Orientation.Horizontal)
+            if self.results_splitter.orientation() != orientation:
+                self.results_splitter.setOrientation(orientation)
+
+    def _set_empty_results(self, message: str | None) -> None:
+        self.empty_results.setText(message or "")
+        self.empty_results.setVisible(bool(message))
+        self.table_view.setVisible(not message)
+        # An empty inspector duplicates the empty-state message and consumes
+        # valuable space on a laptop. Restore it when results are available.
+        self.detail_scroll.setVisible(not message)
+
     def set_case_context(self, context: CaseContext):
+        self._invalidate_search()
         self.case_context = context
+        self._refresh_evidence_filter()
         if self.search_service:
             self._load_case_artifacts()
 
     def on_page_shown(self):
+        self._refresh_evidence_filter()
         if self.search_service and self.case_context and not self._last_search_query:
             self._load_case_artifacts()
 
@@ -937,8 +1124,19 @@ class ArtifactsSearchPage(ResponsivePage):
             filtered.append(item)
         return filtered
 
+    def _filter_results_by_content(self, results: list[dict]) -> list[dict]:
+        mode = self.content_filter.currentData()
+        if mode == "all":
+            return results
+        return [
+            item for item in results
+            if _has_extracted_text(item["artifact"]) == (mode == "with_text")
+        ]
+
     def set_search_service(self, service: "SearchService"):
+        self._invalidate_search()
         self.search_service = service
+        self._refresh_evidence_filter()
         # Enable semantic/hybrid tabs if service is available
         self.mode_tabs.setTabEnabled(1, True)
         self.mode_tabs.setTabEnabled(2, True)
@@ -946,6 +1144,17 @@ class ArtifactsSearchPage(ResponsivePage):
         self.mode_tabs.setTabToolTip(2, "")
         if self.case_context:
             self._load_case_artifacts()
+
+    def _refresh_evidence_filter(self):
+        previous = self.evidence_filter.currentData()
+        self.evidence_filter.clear()
+        self.evidence_filter.addItem("All evidence", None)
+        if self.search_service and self.case_context:
+            for evidence in self.search_service.list_case_evidence(self.case_context.case_id):
+                self.evidence_filter.addItem(f"{evidence.evidence_id} — {evidence.name}", evidence.id)
+        index = self.evidence_filter.findData(previous)
+        if index >= 0:
+            self.evidence_filter.setCurrentIndex(index)
 
     def _load_case_artifacts(self):
         """Display the case inventory when no search query is active."""
@@ -958,23 +1167,37 @@ class ArtifactsSearchPage(ResponsivePage):
         date_from, date_to = self._date_range()
         try:
             results = self.search_service.list_case_artifacts(
-                self.case_context.case_id, artifact_type, date_from, date_to
+                self.case_context.case_id, artifact_type, date_from, date_to,
+                evidence_id=self.evidence_filter.currentData(),
             )
         except Exception as exc:
             self.result_summary.setText("Could not load artifacts")
             QMessageBox.critical(self, "Artifact List Error", str(exc))
             return
+        results = self._filter_results_by_content(results)
         self.table_model.populate(results)
+        filtered = (self.type_filter.currentIndex() > 0 or
+                    self.content_filter.currentIndex() > 0 or
+                    self.evidence_filter.currentIndex() > 0 or
+                    self.date_preset.currentIndex() > 0)
+        self._set_empty_results(None if results else (
+            "No artifacts match these filters. Try changing or clearing them." if filtered else
+            "No artifacts yet. Add evidence and run an examination to extract artifacts."
+        ))
         self.table_view.clearSelection()
         if results:
             self.table_view.selectRow(0)
         else:
             self.detail_pane.set_artifact(None)
-        self.result_summary.setText(f"{len(results):,} artifact(s) in this case")
+        scope = "matching filters" if filtered else "in this case"
+        self.result_summary.setText(f"{len(results):,} artifact(s) {scope}")
 
     def _show_all_artifacts(self):
+        self._invalidate_search()
         self.query_edit.clear()
         self.type_filter.setCurrentIndex(0)
+        self.content_filter.setCurrentIndex(0)
+        self.evidence_filter.setCurrentIndex(0)
         self.date_preset.setCurrentIndex(0)
         self.regex_check.setChecked(False)
         self._last_search_query = ""
@@ -987,9 +1210,15 @@ class ArtifactsSearchPage(ResponsivePage):
 
         query = self.query_edit.text().strip()
         if not query:
+            self._invalidate_search()
             self._last_search_query = ""
             self._load_case_artifacts()
             return
+        if self._search_active:
+            return
+        self._search_active = True
+        self._search_generation += 1
+        generation = self._search_generation
         self._last_search_query = query
 
         mode_idx = self.mode_tabs.currentIndex()
@@ -1018,21 +1247,46 @@ class ArtifactsSearchPage(ResponsivePage):
             date_from,
             date_to,
             regex=self.regex_check.isChecked() and mode != "Semantic",
+            evidence_id=self.evidence_filter.currentData(),
         )
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
-        self._worker.finished.connect(self._on_search_finished)
-        self._worker.error.connect(self._on_search_error)
+        self._worker.finished.connect(lambda results: self._deliver_search_results(generation, results))
+        self._worker.error.connect(lambda error: self._deliver_search_error(generation, error))
         self._worker.finished.connect(self._worker_thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.error.connect(self._worker_thread.quit)
+        self._worker.error.connect(self._worker.deleteLater)
+        self._worker_thread.finished.connect(self._search_thread_finished)
         self._worker_thread.finished.connect(self._worker_thread.deleteLater)
         self._worker_thread.start()
 
-    def _on_search_finished(self, results: list[dict]):
+    def _invalidate_search(self):
+        self._search_generation += 1
+        self._last_search_query = ""
+        self.progress_bar.hide()
+
+    def _deliver_search_results(self, generation: int, results: list[dict]):
+        if generation == self._search_generation:
+            self._on_search_finished(results)
+
+    def _deliver_search_error(self, generation: int, error: str):
+        if generation == self._search_generation:
+            self._on_search_error(error)
+
+    def _search_thread_finished(self):
+        self._search_active = False
         self.progress_bar.hide()
         self.search_btn.setEnabled(True)
+
+    def _on_search_finished(self, results: list[dict]):
+        self.progress_bar.hide()
         results = self._filter_results_by_date(results)
+        returned_count = len(results)
+        results = self._filter_results_by_content(results)
         self.table_model.populate(results)
+        self._set_empty_results(None if results else
+                                "No results found. Try another query or clear your filters.")
         self.table_view.clearSelection()
         if results:
             self.table_view.selectRow(0)
@@ -1040,13 +1294,17 @@ class ArtifactsSearchPage(ResponsivePage):
         else:
             self.detail_pane.set_artifact(None)
             self.result_summary.setText("No results — check the syntax or try another mode")
+        if self.content_filter.currentData() != "all":
+            self.result_summary.setText(
+                f"{len(results)} of {returned_count} returned result(s) · "
+                "content filter applied after search limits"
+            )
 
     def _on_search_error(self, error: str):
         self.progress_bar.hide()
-        self.search_btn.setEnabled(True)
         QMessageBox.critical(self, "Search Error", error)
 
-    def _on_index(self):
+    def _on_index(self, rebuild=False):
         if not self.search_service or not self.case_context:
             return
         
@@ -1056,12 +1314,13 @@ class ArtifactsSearchPage(ResponsivePage):
         self.index_progress_bar.setFormat("Preparing…")
         self.index_progress_bar.show()
         self.index_btn.setEnabled(False)
+        self.rebuild_index_btn.setEnabled(False)
         self.index_btn.setText("Indexing…")
         
         # Run indexing in background
         self._index_thread = QThread()
         qt_threads.track(self._index_thread)
-        self._index_worker = IndexWorker(self.search_service, self.case_context.case_id)
+        self._index_worker = IndexWorker(self.search_service, self.case_context.case_id, rebuild)
         self._index_worker.moveToThread(self._index_thread)
         self._index_thread.started.connect(self._index_worker.run)
         self._index_worker.progress.connect(self._on_index_progress)
@@ -1076,6 +1335,7 @@ class ArtifactsSearchPage(ResponsivePage):
 
     def _on_index_finished(self, result: dict):
         self.index_btn.setEnabled(True)
+        self.rebuild_index_btn.setEnabled(True)
         self.index_btn.setText("Index for Semantic Search")
         if "error" in result:
             self.index_status_label.setText(f"Semantic indexing failed: {result['error']}")
@@ -1114,6 +1374,7 @@ class ArtifactsSearchPage(ResponsivePage):
         self.index_status_label.setText(f"Semantic indexing failed: {error}")
         self.index_progress_bar.hide()
         self.index_btn.setEnabled(True)
+        self.rebuild_index_btn.setEnabled(True)
         self.index_btn.setText("Index for Semantic Search")
         QMessageBox.critical(self, "Index Error", error)
 

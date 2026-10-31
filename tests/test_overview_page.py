@@ -48,3 +48,21 @@ def test_overview_renders_measurable_workflow_and_next_action(qt_app):
     assert "7 retained artifact(s)" in page.history_note.text()
     assert "2 completed report(s)" in page.history_note.text()
     page.deleteLater()
+
+
+def test_overview_reflows_cards_and_opens_recommended_page(qt_app):
+    from app.ui.pages.overview_page import OverviewPage
+
+    page = OverviewPage()
+    page.show()
+    page.resize(450, 700)
+    qt_app.processEvents()
+    assert page.cards_layout.getItemPosition(page.cards_layout.indexOf(page.stat_cards["artifacts"]))[:2] == (2, 0)
+    assert page.workflow_grid.getItemPosition(page.workflow_grid.indexOf(page.workflow_cards["analysis"]))[:2] == (3, 0)
+    requested = []
+    page.next_action_requested.connect(requested.append)
+    page.update_recommendation({"key": "examination", "title": "Review", "detail": "Check the job."})
+    page.recommendation_button.click()
+    assert requested == ["examination"]
+    page.close()
+    page.deleteLater()

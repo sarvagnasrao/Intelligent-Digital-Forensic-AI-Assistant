@@ -14,8 +14,10 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from itertools import combinations
+from typing import Any, cast
 
 from sqlalchemy import delete, select
+from sqlalchemy.engine import CursorResult, Row
 from sqlalchemy.orm import Session
 
 from app.analysis.models import (
@@ -52,6 +54,23 @@ GENERIC_VALUES = {
     "c:\\users", "/etc", "/usr", "/var", "/tmp", "/home",
 }
 
+# Role mailboxes are often copied into unrelated documents. This deliberately
+# small exact-match list avoids guessing from domains or substrings (e.g.
+# help.person@example.org). Such an address can still corroborate another link.
+GENERIC_EMAIL_LOCAL_PARTS = {"help", "helpdesk", "help-desk", "support"}
+
+
+def _generic_role_mailbox(key: tuple[str, str]) -> bool:
+    if key[0] != EntityType.EMAIL.value:
+        return False
+    local, separator, domain = key[1].partition("@")
+    return bool(separator and domain and local in GENERIC_EMAIL_LOCAL_PARTS)
+
+
+def _label_key(label: str) -> tuple[str, str]:
+    kind, value = label.split("\u0000", 1)
+    return kind, value
+
 
 @dataclass
 class RelationshipSettings:
@@ -84,11 +103,23 @@ class RelationshipStats:
 
 
 def _key(entity: Entity) -> tuple[str, str]:
-    normalized = (entity.normalized_value or entity.value or "").strip().lower()
+    normalized = _relationship_value(
+        entity.entity_type.value, entity.normalized_value or entity.value or ""
+    )
     return (entity.entity_type.value, normalized)
 
 
-def _pair_key(kind: RelationshipKind, left: tuple[str, str], right: tuple[str, str]):
+def _relationship_value(entity_type: str, value: str) -> str:
+    """Preserve case-sensitive crypto identifiers; normalize other graph keys."""
+    value = value.strip()
+    if entity_type == EntityType.CRYPTO_ADDRESS.value and not value.startswith("0x"):
+        return value
+    return value.lower()
+
+
+def _pair_key(
+    kind: RelationshipKind, left: tuple[str, str], right: tuple[str, str]
+) -> tuple[str, str, str, str, str]:
     """Order the two sides so an edge is the same edge whichever way it is seen."""
     left, right = sorted((left, right))
     return (kind.value, left[0], left[1], right[0], right[1])
@@ -121,8 +152,8 @@ class RelationshipBuilder:
         existing = {
             _pair_key(
                 row.kind,
-                (row.left_type, row.left_value.lower()),
-                (row.right_type, row.right_value.lower()),
+                (row.left_type, _relationship_value(row.left_type, row.left_value)),
+                (row.right_type, _relationship_value(row.right_type, row.right_value)),
             ): row
             for row in self.session.execute(
                 select(EntityRelationship).where(
@@ -163,6 +194,16 @@ class RelationshipBuilder:
             if key in wanted:
                 continue
             if row.status != RelationshipStatus.PENDING:
+                # Preserve the decision and its original provenance for audit,
+                # but do not present an unsupported historical edge as a lead.
+                try:
+                    details = json.loads(row.details_json or "{}")
+                except (TypeError, ValueError):
+                    details = {}
+                if not isinstance(details, dict):
+                    details = {}
+                details["unsupported_after_rebuild"] = True
+                row.details_json = json.dumps(details)
                 stats.kept_reviewed += 1
                 continue
             self.session.delete(row)
@@ -191,7 +232,6 @@ class RelationshipBuilder:
         # entity key -> set of artifact ids, and artifact -> its entity keys.
         per_entity: dict[tuple[str, str], set[int]] = {}
         per_artifact: dict[int, list[tuple[str, str]]] = {}
-        meta: dict[tuple[str, str], Entity] = {}
 
         for entity in rows:
             key = _key(entity)
@@ -203,7 +243,6 @@ class RelationshipBuilder:
             bucket = per_artifact.setdefault(entity.artifact_id, [])
             if key not in bucket:
                 bucket.append(key)
-            meta.setdefault(key, entity)
 
         stats.artifact_links = sum(len(value) for value in per_artifact.values())
         artifact_total = max(1, len(per_artifact))
@@ -217,7 +256,7 @@ class RelationshipBuilder:
         hubs = {key for key, ids in per_entity.items() if len(ids) > hub_limit}
         stats.skipped_hubs = len(hubs)
 
-        pair_artifacts: dict[tuple, set[int]] = {}
+        pair_artifacts: dict[tuple[str, str, str, str, str], set[int]] = {}
         for artifact_id, keys in per_artifact.items():
             usable = [
                 key for key in keys[: self.settings.max_entities_per_artifact]
@@ -228,22 +267,39 @@ class RelationshipBuilder:
                     _pair_key(RelationshipKind.SHARED_ENTITY, left, right), set()
                 ).add(artifact_id)
 
+        # A sample must be drawn from a supporting artifact's current text,
+        # never an arbitrary cached snippet for the same value in another file.
+        texts = dict(self.session.execute(
+            select(Artifact.id, Artifact.content_text).where(
+                Artifact.case_id == self.case_id,
+                Artifact.id.in_(per_artifact),
+            )
+        ).all()) if per_artifact else {}
+        samples: dict[tuple[int, tuple[str, str]], str] = {}
+        for entity in rows:
+            text = texts.get(entity.artifact_id) or ""
+            start, end = entity.start_offset, entity.end_offset
+            key = (entity.artifact_id, _key(entity))
+            if (key not in samples and isinstance(start, int) and isinstance(end, int)
+                    and 0 <= start < end <= len(text) and text[start:end] == entity.value):
+                samples[key] = text[max(0, start - 100):min(len(text), end + 100)]
+
         pairs: dict[tuple, dict] = {}
-        for key, artifact_ids in pair_artifacts.items():
-            _, left_type, left_value, right_type, right_value = key
+        for pair_key, artifact_ids in pair_artifacts.items():
+            _, left_type, left_value, right_type, right_value = pair_key
             left = (left_type, left_value)
             right = (right_type, right_value)
             shared = len(artifact_ids)
             left_count = len(per_entity.get(left, ()))
             right_count = len(per_entity.get(right, ()))
-            if shared < self.settings.min_shared:
-                continue
             # One shared artifact is only enough when *both* sides are strong
             # identifiers: "this address and this phone number appeared in the
             # same file" is a finding, "this address and this path" is not.
             left_strong = EntityType(left_type) in STRONG_TYPES
             right_strong = EntityType(right_type) in STRONG_TYPES
-            if shared == 1 and not (left_strong and right_strong):
+            if shared < self.settings.min_shared and not (
+                shared == 1 and left_strong and right_strong
+            ):
                 continue
 
             # Overlap coefficient: how much of the rarer side is explained by
@@ -258,7 +314,9 @@ class RelationshipBuilder:
                 continue
 
             listed = sorted(artifact_ids)[: self.settings.max_shared_artifacts_listed]
-            pairs[key] = {
+            sample = next((samples[(ident, left)] for ident in sorted(artifact_ids)
+                           if (ident, left) in samples), "")
+            pairs[pair_key] = {
                 "kind": RelationshipKind.SHARED_ENTITY,
                 "left": left,
                 "right": right,
@@ -270,12 +328,11 @@ class RelationshipBuilder:
                     "left_artifacts": left_count,
                     "right_artifacts": right_count,
                     "coverage": score,
-                    "sample": (meta.get(left).context_snippet or "")[:200]
-                    if meta.get(left) else "",
+                    "sample": sample[:200],
                 },
             }
 
-        artifact_pairs = self._collect_artifact_links(per_entity, per_artifact, hubs)
+        artifact_pairs = self._collect_artifact_links(per_entity, per_artifact, hubs, rows)
         return pairs, artifact_pairs
 
     def _collect_artifact_links(
@@ -283,6 +340,7 @@ class RelationshipBuilder:
         per_entity: dict[tuple[str, str], set[int]],
         per_artifact: dict[int, list[tuple[str, str]]],
         hubs: set[tuple[str, str]],
+        entities: list[Entity],
     ) -> dict[tuple, dict]:
         """Artifact ↔ artifact edges for artifacts that mention the same value.
 
@@ -308,8 +366,28 @@ class RelationshipBuilder:
                 shared.setdefault((left_id, right_id), set()).add(labelled)
 
         index = self._artifact_index()
+        # Excerpts must come from the current artifact text, not a cached model
+        # snippet. Invalid or stale offsets are omitted rather than guessed.
+        candidate_ids = {ident for pair in shared for ident in pair}
+        texts = dict(self.session.execute(
+            select(Artifact.id, Artifact.content_text).where(
+                Artifact.case_id == self.case_id, Artifact.id.in_(candidate_ids)
+            )
+        ).all()) if candidate_ids else {}
+        excerpts: dict[tuple[int, tuple[str, str]], str] = {}
+        for entity in entities:
+            text = texts.get(entity.artifact_id) or ""
+            start, end = entity.start_offset, entity.end_offset
+            key = (entity.artifact_id, _key(entity))
+            if (key not in excerpts and isinstance(start, int) and isinstance(end, int)
+                    and 0 <= start < end <= len(text) and text[start:end] == entity.value):
+                excerpts[key] = text[max(0, start - 100):min(len(text), end + 100)]
         pairs: dict[tuple, dict] = {}
         for (left_id, right_id), labels in shared.items():
+            # A shared help desk alone is weak evidence of a meaningful link;
+            # keep it in details when an independent identifier also matches.
+            if all(_generic_role_mailbox(_label_key(label)) for label in labels):
+                continue
             left_row = index.get(left_id)
             right_row = index.get(right_id)
             if left_row is None or right_row is None:
@@ -328,8 +406,8 @@ class RelationshipBuilder:
                 ("artifact", str(left_row.artifact_id).lower()): left_row,
                 ("artifact", str(right_row.artifact_id).lower()): right_row,
             }
-            key = _pair_key(RelationshipKind.RELATED_ARTIFACTS, left, right)
-            pairs[key] = {
+            pair_key = _pair_key(RelationshipKind.RELATED_ARTIFACTS, left, right)
+            pairs[pair_key] = {
                 "kind": RelationshipKind.RELATED_ARTIFACTS,
                 "left": left,
                 "right": right,
@@ -346,14 +424,23 @@ class RelationshipBuilder:
                     "left_path": row_for[left].source_path,
                     "right_path": row_for[right].source_path,
                     "shared": [
-                        {"type": label.split("\u0000")[0], "value": label.split("\u0000")[1]}
+                        {
+                            "type": label.split("\u0000", 1)[0],
+                            "value": label.split("\u0000", 1)[1],
+                            "case_artifact_count": len(per_entity[_label_key(label)]),
+                            "excerpts": [
+                                {"artifact_id": ident, "text": excerpts[(ident, _label_key(label))]}
+                                for ident in (row_for[left].id, row_for[right].id)
+                                if (ident, _label_key(label)) in excerpts
+                            ],
+                        }
                         for label in sorted(labels)
                     ][:25],
                 },
             }
         return pairs
 
-    def _artifact_index(self) -> dict[int, object]:
+    def _artifact_index(self) -> dict[int, Row[int, str, str, str | None, int]]:
         rows = self.session.execute(
             select(Artifact.id, Artifact.artifact_id, Artifact.name,
                    Artifact.source_path, Artifact.evidence_id)
@@ -406,7 +493,14 @@ class RelationshipBuilder:
                 ])
                 key = _pair_key(RelationshipKind.DUPLICATE_CONTENT, left, right)
                 cap = self.settings.max_shared_artifacts_listed
-                artifact_ids = [item.id for item in group][:cap]
+                # Each edge must include both endpoints even when the group is
+                # larger than the provenance display limit.
+                artifact_ids = [representative.id, duplicate.id]
+                artifact_ids.extend(
+                    item.id for item in group
+                    if item.id not in (representative.id, duplicate.id)
+                )
+                artifact_ids = artifact_ids[:max(2, cap)]
                 pairs[key] = {
                     "kind": RelationshipKind.DUPLICATE_CONTENT,
                     "left": left,
@@ -437,4 +531,4 @@ class RelationshipBuilder:
                 EntityRelationship.status == RelationshipStatus.PENDING,
             )
         )
-        return int(result.rowcount or 0)
+        return int(cast(CursorResult[Any], result).rowcount or 0)

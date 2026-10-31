@@ -35,8 +35,11 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from sqlalchemy import select
+from sqlalchemy.orm import object_session
 
 from app.config import get_config
+from app.devices.models import DeviceEvidenceLink, PhysicalDevice
 from app.reports.templates import (
     ReportTemplate,
     build_context,
@@ -709,11 +712,9 @@ class ReportGenerator:
         story.append(Spacer(1, 0.4 * cm))
         story.append(Paragraph(
             _rich(
-                f"This report was prepared for {template.prepared_for} and contains "
-                f"confidential digital forensic material. Distribution is restricted to the "
-                f"court, the parties and their authorised representatives. The signed original "
-                f"is retained by {template.organization}. No part of this report may be "
-                f"reproduced without the examiner's written consent."
+                "Investigator and legal review is required under the applicable jurisdiction's "
+                "rules. Admissibility and weight are determined by the court and are not "
+                "guaranteed by this report. Missing information must be supplied or identified."
             ),
             ParagraphStyle(
                 name="CoverNotice", parent=self.styles["Normal"], fontSize=9,
@@ -779,8 +780,8 @@ class ReportGenerator:
         tools = [
             ["Item", "Detail"],
             ["Application", f"IDFA {self.config.app.version} (local-first digital forensic analysis)"],
-            ["Evidence processing", "pytsk3 / The Sleuth Kit, read-only file-system access"],
-            ["Integrity hashing", "SHA-256"],
+            ["Evidence processing", "IDFA supports pytsk3 / The Sleuth Kit; actual use and version require verification"],
+            ["Integrity hashing", "See recorded hash values and verification results"],
             ["Keyword index", "SQLite FTS5 full-text index"],
             ["Semantic index", "Qdrant vector index (optional, local)"],
             [
@@ -792,13 +793,13 @@ class ReportGenerator:
                     else f"Local Ollama model '{self.config.ollama.model}' - triage only, unverified"
                 ),
             ],
-            ["Time standard", "UTC"],
+            ["Time standard", "Review displayed timestamps and source time zones"],
             [
                 "Network exposure",
                 (
-                    "Selected evidence and prompts were sent to the configured cloud AI provider"
+                    "Cloud AI is currently configured; actual use requires verification"
                     if self.config.ollama.provider == "openai"
-                    else "No external AI provider; processing is local to the examiner's system"
+                    else "Local AI is currently configured; actual use requires verification"
                 ),
             ],
         ]
@@ -815,10 +816,8 @@ class ReportGenerator:
 
         story.append(Paragraph(
             _rich(
-                "Each item below was registered against this case and its integrity was "
-                "recorded by cryptographic hash. Appendix A lists the reference hashes; any "
-                "party may recalculate them to confirm that the examined data is unchanged. "
-                "Registration and access history is reproduced in Appendix B."
+                "The following inventory reflects available case records. Hashes and "
+                "verification results are shown where recorded; missing entries require review."
             ),
             self.styles["SmallNote"],
         ))
@@ -854,6 +853,8 @@ class ReportGenerator:
                         f"{self._algorithm_label(hash_row.algorithm.value)} hash",
                         f"{hash_row.hash_value}{status}",
                     ])
+            else:
+                ev_data.append(["Hashes", "No hash recorded"])
 
             table = self._property_table(ev_data)
             story.append(table)
@@ -924,14 +925,14 @@ class ReportGenerator:
             "Artifact details (first 100 shown)" if len(artifacts) > 100 else "Artifact details",
             self.styles["SubSectionHeading"],
         ))
-        headers = ["ID", "Type", "Name", "Source path", "Size", "Created", "Indexed"]
+        headers = ["ID", "Type", "Name", "Evidence / source path", "Size", "Created", "Indexed"]
         rows: list = [[Paragraph(_rich(header), self.styles["TableHeader"]) for header in headers]]
         for artifact in artifacts[:100]:
             values = [
                 artifact.artifact_id,
                 artifact.artifact_type.value,
-                artifact.name[:70],
-                (artifact.source_path or "N/A")[:90],
+                artifact.name,
+                f"{self._artifact_evidence_label(artifact)}\n{artifact.source_path or 'N/A'}",
                 self._format_size(artifact.source_size or 0),
                 format_local_date(artifact.created_time) if artifact.created_time else "-",
                 "Yes" if artifact.index_status.value == "indexed" else "No",
@@ -952,6 +953,33 @@ class ReportGenerator:
                 self.styles["SmallNote"],
             ))
         return story
+
+    @staticmethod
+    def _artifact_evidence_label(artifact: "Artifact") -> str:
+        """Describe the linked evidence, never treating its database key as its public ID."""
+        evidence = artifact.evidence
+        if evidence is None or evidence.case_id != artifact.case_id:
+            return "Evidence unavailable"
+        label = f"{evidence.evidence_id} - {evidence.name}"
+        if evidence.removed_at is not None:
+            label += " (removed from case)"
+        session = object_session(evidence)
+        if session is None:
+            return label + " | Device associations unavailable"
+        devices = session.execute(
+            select(PhysicalDevice.id, PhysicalDevice.label)
+            .join(DeviceEvidenceLink, DeviceEvidenceLink.device_id == PhysicalDevice.id)
+            .where(DeviceEvidenceLink.evidence_id == evidence.id,
+                   PhysicalDevice.case_id == artifact.case_id)
+            .order_by(PhysicalDevice.id)
+        ).all()
+        if devices:
+            label += " | Investigator-associated device(s): " + ", ".join(
+                f"record ID {device_id} - {name}" for device_id, name in devices
+            )
+        else:
+            label += " | No associated physical device"
+        return label
 
     def _build_findings_section(self, findings: list["Finding"]) -> list:
         story = self._heading("Findings and Opinions")
@@ -1030,13 +1058,22 @@ class ReportGenerator:
             for link in finding.artifact_links:
                 artifact = link.artifact
                 note = f" - {link.notes}" if link.notes else ""
+                if artifact is None or artifact.case_id != getattr(finding, "case_id", artifact.case_id):
+                    story.append(Paragraph(
+                        _rich(f"- Artifact unavailable (relevance: {link.relevance}){note}"),
+                        self.styles["BodyText2"],
+                    ))
+                    continue
                 story.append(Paragraph(
                     _rich(
                         f"- {artifact.artifact_id}: {artifact.name} "
-                        f"(relevance: {link.relevance}){note}"
+                        f"(evidence: {self._artifact_evidence_label(artifact)}; "
+                        f"relevance: {link.relevance}){note}"
                     ),
                     self.styles["BodyText2"],
                 ))
+        else:
+            story.append(Paragraph("No supporting artifact links recorded.", self.styles["SmallNote"]))
         story.append(Spacer(1, 0.35 * cm))
         return story
 
@@ -1075,8 +1112,7 @@ class ReportGenerator:
         signature_flowables.append(Spacer(1, 0.4 * cm))
         signature_flowables.append(Paragraph(
             _rich(
-                "Signed in the presence of the issuing organisation. The signed original is "
-                f"retained by {template.organization} and is the authoritative version."
+                "Signature and review must be completed by the appropriate persons."
             ),
             self.styles["SmallNote"],
         ))
@@ -1087,10 +1123,8 @@ class ReportGenerator:
         story = self._heading("Appendix A - Evidence Integrity (SHA-256)")
         story.append(Paragraph(
             _rich(
-                "Cryptographic hashes allow any party to verify independently that evidence "
-                "has not changed since acquisition. Recalculate the hash of the stored copy "
-                "and compare it with the reference value below; a match demonstrates that "
-                "the examined data is unchanged."
+                "Reference hashes and recorded verification results are shown below. "
+                "A recorded reference alone does not establish that verification occurred."
             ),
             self.styles["SmallNote"],
         ))
@@ -1102,12 +1136,12 @@ class ReportGenerator:
             Paragraph("Verification", self.styles["TableHeader"]),
         ]]
         for ev in evidence_list:
-            references = [h for h in (ev.hashes or []) if h.is_reference] or list(ev.hashes or [])
+            references = [h for h in (ev.hashes or []) if h.is_reference]
             if not references:
                 rows.append([
                     Paragraph(_rich(f"{ev.evidence_id} - {ev.name}"), self.styles["TableCell"]),
                     Paragraph("-", self.styles["TableCell"]),
-                    Paragraph("No hash recorded at registration", self.styles["TableCell"]),
+                    Paragraph("No reference hash recorded", self.styles["TableCell"]),
                     Paragraph("Not verified", self.styles["TableCell"]),
                 ])
                 continue
@@ -1151,9 +1185,9 @@ class ReportGenerator:
 
         story.append(Paragraph(
             _rich(
-                "The following application-level log records evidence registration, "
-                "examination and report activity. It is reproduced in reverse chronological "
-                "order and supports the chain of custody described in this report."
+                "The following application-level audit log is not a complete physical chain "
+                "of custody. Obtain and review external custody and transfer records. "
+                "Events are shown in reverse chronological order."
             ),
             self.styles["SmallNote"],
         ))

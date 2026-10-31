@@ -19,15 +19,16 @@ Accuracy notes, because each of these used to make a correct query miss:
 """
 from __future__ import annotations
 
-import re
-import uuid
 import json
 import logging
-from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING
+import re
+import uuid
+from collections.abc import Sequence
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, joinedload
 
@@ -37,15 +38,15 @@ from app.config import get_config
 if TYPE_CHECKING:
     pass
 
-# A chunk is small enough to be about one topic and large enough to answer a
-# question. Overlap keeps a sentence from being cut in half at a boundary.
+# Defaults for standalone callers. SearchService uses editable EmbeddingConfig
+# values when creating semantic index passages.
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 SNIPPET_WIDTH = 240
 REGEX_SCAN_LIMIT = 5000
 
 
-def purge_artifact_rows(session: Session, artifacts: list[Artifact]) -> int:
+def purge_artifact_rows(session: Session, artifacts: Sequence[Artifact]) -> int:
     """Delete artifact records and their dependent analysis/index rows.
 
     Source evidence files are never touched. Relationship graph rows that cite
@@ -144,19 +145,23 @@ def purge_artifact_rows(session: Session, artifacts: list[Artifact]) -> int:
         if linked.intersection(artifact_id_set):
             session.delete(relationship)
 
-    entity_ids = select(Entity.id).where(Entity.artifact_id.in_(artifact_ids))
-    session.execute(delete(TimelineEvent).where(
-        (TimelineEvent.artifact_id.in_(artifact_ids))
-        | (TimelineEvent.entity_id.in_(entity_ids))
-    ))
-    session.execute(delete(FindingArtifactLink).where(
-        FindingArtifactLink.artifact_id.in_(artifact_ids)
-    ))
-    session.execute(delete(ArtifactChunk).where(
-        ArtifactChunk.artifact_id.in_(artifact_ids)
-    ))
-    session.execute(delete(Entity).where(Entity.artifact_id.in_(artifact_ids)))
-    session.execute(delete(Artifact).where(Artifact.id.in_(artifact_ids)))
+    for start in range(0, len(artifact_ids), 400):
+        batch = artifact_ids[start:start + 400]
+        entity_ids = select(Entity.id).where(Entity.artifact_id.in_(batch))
+        session.execute(delete(TimelineEvent).where(
+            (TimelineEvent.artifact_id.in_(batch))
+            | (TimelineEvent.entity_id.in_(entity_ids))
+        ), execution_options={"synchronize_session": False})
+        session.execute(delete(FindingArtifactLink).where(
+            FindingArtifactLink.artifact_id.in_(batch)
+        ), execution_options={"synchronize_session": False})
+        session.execute(delete(ArtifactChunk).where(
+            ArtifactChunk.artifact_id.in_(batch)
+        ), execution_options={"synchronize_session": False})
+        session.execute(delete(Entity).where(Entity.artifact_id.in_(batch)),
+                        execution_options={"synchronize_session": False})
+        session.execute(delete(Artifact).where(Artifact.id.in_(batch)),
+                        execution_options={"synchronize_session": False})
     session.flush()
     return len(artifact_ids)
 
@@ -242,6 +247,7 @@ def chunk_text(
         return []
     if size <= 0:
         size = CHUNK_SIZE
+    overlap = max(0, overlap)
     if overlap >= size:
         overlap = max(0, size // 4)
 
@@ -283,12 +289,23 @@ class SearchService:
         if self._client:
             await self._client.aclose()
 
+    def list_case_evidence(self, case_id: int) -> list:
+        """Active evidence choices for the current case."""
+        from app.evidence.models import Evidence
+
+        return list(self.session.execute(
+            select(Evidence).where(
+                Evidence.case_id == case_id, Evidence.removed_at.is_(None)
+            ).order_by(Evidence.evidence_id)
+        ).scalars().all())
+
     def list_case_artifacts(
         self,
         case_id: int,
         artifact_type: ArtifactType | None = None,
         date_from: date | None = None,
         date_to: date | None = None,
+        evidence_id: int | None = None,
     ) -> list[dict]:
         """List artifacts belonging to evidence that is still in the case."""
         from app.evidence.models import Evidence
@@ -297,17 +314,23 @@ class SearchService:
             select(Artifact)
             .options(joinedload(Artifact.evidence))
             .join(Evidence, Artifact.evidence_id == Evidence.id)
-            .where(Artifact.case_id == case_id, Evidence.removed_at.is_(None))
+            .where(
+                Artifact.case_id == case_id,
+                Evidence.case_id == case_id,
+                Evidence.removed_at.is_(None),
+            )
         )
+        if evidence_id is not None:
+            stmt = stmt.where(Artifact.evidence_id == evidence_id)
         if artifact_type:
             stmt = stmt.where(Artifact.artifact_type == artifact_type)
         if date_from:
             stmt = stmt.where(Artifact.created_time >= datetime.combine(
-                date_from, datetime.min.time(), tzinfo=timezone.utc
+                date_from, datetime.min.time(), tzinfo=UTC
             ))
         if date_to:
-            stmt = stmt.where(Artifact.created_time < datetime.combine(
-                date_to, datetime.max.time(), tzinfo=timezone.utc
+            stmt = stmt.where(Artifact.created_time <= datetime.combine(
+                date_to, datetime.max.time(), tzinfo=UTC
             ))
         stmt = stmt.order_by(Artifact.name.collate("NOCASE"), Artifact.id)
         return [
@@ -380,12 +403,13 @@ class SearchService:
         date_from: date | None = None,
         date_to: date | None = None,
         regex: bool = False,
+        evidence_id: int | None = None,
     ) -> list[dict]:
         """Search with SQLite FTS5, or with a regular expression."""
         if regex:
             return await self.regex_search(
                 case_id, query, artifact_type, limit=limit, offset=offset,
-                date_from=date_from, date_to=date_to,
+                date_from=date_from, date_to=date_to, evidence_id=evidence_id,
             )
 
         fts_query = build_fts_query(query)
@@ -401,7 +425,7 @@ class SearchService:
             AND a.case_id = :case_id
             AND EXISTS (
                 SELECT 1 FROM evidence e
-                WHERE e.id = a.evidence_id AND e.removed_at IS NULL
+                WHERE e.id = a.evidence_id AND e.case_id = :case_id AND e.removed_at IS NULL
             )
         """
         params: dict = {
@@ -411,6 +435,9 @@ class SearchService:
             "offset": max(0, int(offset)),
         }
 
+        if evidence_id is not None:
+            sql += " AND a.evidence_id = :evidence_id"
+            params["evidence_id"] = evidence_id
         if artifact_type:
             sql += " AND a.artifact_type = :artifact_type"
             params["artifact_type"] = (
@@ -496,6 +523,7 @@ class SearchService:
         date_from: date | None = None,
         date_to: date | None = None,
         scan_limit: int = REGEX_SCAN_LIMIT,
+        evidence_id: int | None = None,
     ) -> list[dict]:
         """Case-insensitive regular expression over name, path and content.
 
@@ -514,17 +542,23 @@ class SearchService:
             select(Artifact)
             .options(joinedload(Artifact.evidence))
             .join(Evidence, Artifact.evidence_id == Evidence.id)
-            .where(Artifact.case_id == case_id, Evidence.removed_at.is_(None))
+            .where(
+                Artifact.case_id == case_id,
+                Evidence.case_id == case_id,
+                Evidence.removed_at.is_(None),
+            )
         )
+        if evidence_id is not None:
+            stmt = stmt.where(Artifact.evidence_id == evidence_id)
         if artifact_type:
             stmt = stmt.where(Artifact.artifact_type == artifact_type)
         if date_from:
             stmt = stmt.where(Artifact.created_time >= datetime.combine(
-                date_from, datetime.min.time(), tzinfo=timezone.utc
+                date_from, datetime.min.time(), tzinfo=UTC
             ))
         if date_to:
-            stmt = stmt.where(Artifact.created_time < datetime.combine(
-                date_to, datetime.max.time(), tzinfo=timezone.utc
+            stmt = stmt.where(Artifact.created_time <= datetime.combine(
+                date_to, datetime.max.time(), tzinfo=UTC
             ))
         stmt = stmt.order_by(Artifact.id).limit(max(1, int(scan_limit)))
         rows = list(self.session.execute(stmt).scalars().all())
@@ -573,6 +607,7 @@ class SearchService:
         limit: int = 20,
         date_from: date | None = None,
         date_to: date | None = None,
+        evidence_id: int | None = None,
     ) -> list[dict]:
         """Search Qdrant chunk vectors and collapse hits to one row per file."""
         try:
@@ -583,7 +618,7 @@ class SearchService:
             collection_name = f"{self.config.qdrant.collection_prefix}{case_id}"
             # Ask for more chunk hits than files wanted: several hits can
             # belong to the same artifact.
-            search_payload = {
+            search_payload: dict[str, Any] = {
                 "vector": query_vector,
                 "limit": max(10, int(limit) * 5),
                 "with_payload": True,
@@ -600,6 +635,10 @@ class SearchService:
                         "value": artifact_type.value
                         if hasattr(artifact_type, "value") else str(artifact_type)
                     },
+                })
+            if evidence_id is not None:
+                search_payload["filter"]["must"].append({
+                    "key": "evidence_id", "match": {"value": evidence_id},
                 })
 
             response = await self.client.post(
@@ -636,10 +675,14 @@ class SearchService:
                 .join(Evidence, Artifact.evidence_id == Evidence.id)
                 .where(
                     Artifact.case_id == case_id,
+                    Evidence.case_id == case_id,
                     Artifact.artifact_id.in_(list(best.keys())),
                     Evidence.removed_at.is_(None),
+                    Artifact.index_status == IndexStatus.INDEXED,
                 )
             )
+            if evidence_id is not None:
+                stmt = stmt.where(Artifact.evidence_id == evidence_id)
             by_id = {
                 artifact.artifact_id: artifact
                 for artifact in self.session.execute(stmt).scalars().all()
@@ -689,17 +732,18 @@ class SearchService:
         date_from: date | None = None,
         date_to: date | None = None,
         regex: bool = False,
+        evidence_id: int | None = None,
     ) -> list[dict]:
         """Combine keyword and semantic search with Reciprocal Rank Fusion."""
         import asyncio
 
         keyword_task = self.keyword_search(
             case_id, query, artifact_type, keyword_limit, regex=regex,
-            date_from=date_from, date_to=date_to,
+            date_from=date_from, date_to=date_to, evidence_id=evidence_id,
         )
         semantic_task = self.semantic_search(
             case_id, query, artifact_type, semantic_limit,
-            date_from=date_from, date_to=date_to,
+            date_from=date_from, date_to=date_to, evidence_id=evidence_id,
         )
         keyword_results, semantic_results = await asyncio.gather(
             keyword_task, semantic_task
@@ -753,6 +797,7 @@ class SearchService:
         case_id: int,
         artifact_ids: list[int] | None = None,
         progress_callback=None,
+        rebuild: bool = False,
     ) -> dict:
         """Index artifact text into Qdrant as passage-level vectors."""
 
@@ -788,22 +833,24 @@ class SearchService:
                 Evidence, Artifact.evidence_id == Evidence.id
             ).where(
                 Artifact.case_id == case_id,
+                Evidence.case_id == case_id,
                 Evidence.removed_at.is_(None),
-                Artifact.index_status.in_(
-                    (IndexStatus.NOT_INDEXED, IndexStatus.INDEX_FAILED)
-                ),
                 Artifact.content_text.is_not(None),
                 Artifact.content_text != "",
             )
-            if artifact_ids:
+            if not rebuild:
+                stmt = stmt.where(Artifact.index_status.in_(
+                    (IndexStatus.NOT_INDEXED, IndexStatus.INDEX_FAILED)
+                ))
+            if artifact_ids is not None:
                 stmt = stmt.where(Artifact.id.in_(artifact_ids))
 
-            artifacts = list(self.session.execute(stmt).scalars().all())
-            if not artifacts:
+            count_stmt = select(func.count()).select_from(stmt.order_by(None).subquery())
+            total_artifacts = self.session.scalar(count_stmt) or 0
+            if not total_artifacts:
                 report_progress("No artifacts need indexing", 0, 0)
                 return {"indexed": 0, "message": "No artifacts to index"}
 
-            total_artifacts = len(artifacts)
             report_progress("Preparing semantic index", 0, total_artifacts)
             collection_name = f"{self.config.qdrant.collection_prefix}{case_id}"
             await self._ensure_collection(collection_name)
@@ -813,10 +860,31 @@ class SearchService:
             failures: list[str] = []
 
             batch_size = max(1, self.config.embeddings.batch_size)
-            for start in range(0, len(artifacts), batch_size):
-                batch = artifacts[start:start + batch_size]
+            chunk_size = self.config.embeddings.chunk_size
+            chunk_overlap = self.config.embeddings.chunk_overlap
+            start = 0
+            last_artifact_id = 0
+            while start < total_artifacts:
+                batch = list(
+                    self.session.execute(
+                        stmt.where(Artifact.id > last_artifact_id)
+                        .order_by(Artifact.id)
+                        .limit(batch_size)
+                    ).scalars().all()
+                )
+                if not batch:
+                    break
+                batch_end = start + len(batch)
+                last_artifact_id = batch[-1].id
+                # Persist the fail-closed state before touching Qdrant. A crash
+                # after an upsert or during cleanup must never expose mixed or
+                # obsolete passages as trustworthy semantic search results.
+                for artifact in batch:
+                    artifact.index_status = IndexStatus.INDEX_FAILED
+                    artifact.vector_id = None
+                self.session.commit()
                 report_progress(
-                    f"Preparing batch {start + 1}–{start + len(batch)}",
+                    f"Preparing batch {start + 1}–{batch_end}",
                     start,
                     total_artifacts,
                     indexed,
@@ -833,7 +901,11 @@ class SearchService:
                         )
                     )
                     for index, (char_start, char_end, piece) in enumerate(
-                        chunk_text(artifact.content_text or "")
+                        chunk_text(
+                            artifact.content_text or "",
+                            size=chunk_size,
+                            overlap=chunk_overlap,
+                        )
                     ):
                         chunk = ArtifactChunk(
                             artifact_id=artifact.id,
@@ -853,6 +925,7 @@ class SearchService:
                     failures.append(
                         f"batch of {len(batch)} starting at {start}: no text to embed"
                     )
+                    start = batch_end
                     continue
 
                 vectors: list[list[float]] = []
@@ -860,9 +933,9 @@ class SearchService:
                 for group_start in range(0, len(plan), batch_size):
                     group = plan[group_start:group_start + batch_size]
                     report_progress(
-                        f"Embedding passages for batch {start + 1}–{start + len(batch)}",
+                        f"Embedding passages for batch {start + 1}–{batch_end}",
                         min(
-                            start + len(batch),
+                            batch_end,
                             start + int(
                                 len(batch) * (group_start + len(group)) / max(1, len(plan))
                             ),
@@ -895,9 +968,10 @@ class SearchService:
                     for artifact in batch:
                         artifact.index_status = IndexStatus.INDEX_FAILED
                         artifact.vector_id = None
+                    start = batch_end
                     continue
 
-                points = []
+                points: list[dict[str, Any]] = []
                 accepted: list[Artifact] = []
                 rejected: list[str] = []
                 for (artifact, chunk), vector in zip(plan, vectors, strict=True):
@@ -930,6 +1004,9 @@ class SearchService:
                         accepted.append(artifact)
 
                 if rejected:
+                    rejected_set = set(rejected)
+                    points = [p for p in points if p["payload"]["artifact_id"] not in rejected_set]
+                    accepted = [a for a in accepted if a.artifact_id not in rejected_set]
                     for artifact in batch:
                         if artifact.artifact_id in rejected:
                             artifact.index_status = IndexStatus.INDEX_FAILED
@@ -939,11 +1016,12 @@ class SearchService:
                     )
 
                 if not points:
+                    start = batch_end
                     continue
 
                 try:
                     upsert_response = await self.client.put(
-                        f"{self.config.qdrant.url}/collections/{collection_name}/points",
+                        f"{self.config.qdrant.url}/collections/{collection_name}/points?wait=true",
                         json={"points": points},
                         timeout=120.0,
                     )
@@ -953,12 +1031,36 @@ class SearchService:
                         artifact.index_status = IndexStatus.INDEX_FAILED
                         artifact.vector_id = None
                     failures.append(f"Qdrant upsert failed: {exc}")
+                    start = batch_end
                     continue
 
                 if status_code in (200, 201):
                     for artifact in accepted:
+                        current_ids = [
+                            point["id"] for point in points
+                            if point["payload"]["artifact_id"] == artifact.artifact_id
+                        ]
+                        try:
+                            cleanup = await self.client.post(
+                                f"{self.config.qdrant.url}/collections/{collection_name}/points/delete?wait=true",
+                                json={"filter": {"must": [
+                                    {"key": "case_id", "match": {"value": case_id}},
+                                    {"key": "artifact_id",
+                                     "match": {"value": artifact.artifact_id}},
+                                ], "must_not": [{"has_id": current_ids}]}},
+                                timeout=120.0,
+                            )
+                            if cleanup.status_code not in (200, 201):
+                                raise RuntimeError(f"HTTP {cleanup.status_code}")
+                        except Exception as exc:
+                            artifact.index_status = IndexStatus.INDEX_FAILED
+                            artifact.vector_id = None
+                            failures.append(
+                                f"Stale vector cleanup failed for {artifact.artifact_id}: {exc}"
+                            )
+                            continue
                         artifact.index_status = IndexStatus.INDEXED
-                        artifact.indexed_at = datetime.now(timezone.utc)
+                        artifact.indexed_at = datetime.now(UTC)
                         artifact.vector_id = next(
                             (
                                 point["id"] for point in points
@@ -966,7 +1068,7 @@ class SearchService:
                             ),
                             None,
                         )
-                    indexed += len(accepted)
+                        indexed += 1
                     chunk_count += len(points)
                 else:
                     for artifact in accepted:
@@ -978,12 +1080,14 @@ class SearchService:
                     )
 
                 report_progress(
-                    f"Stored vectors for batch {start + 1}–{start + len(batch)}",
-                    start + len(batch),
+                    f"Stored vectors for batch {start + 1}–{batch_end}",
+                    batch_end,
                     total_artifacts,
                     indexed,
                     len(failures),
                 )
+                self.session.commit()
+                start += len(batch)
 
             self.session.commit()
             report_progress(
@@ -995,13 +1099,14 @@ class SearchService:
             )
             return {
                 "indexed": indexed,
-                "total": len(artifacts),
+                "total": total_artifacts,
                 "chunks": chunk_count,
                 "failed": len(failures),
                 "errors": failures,
             }
 
         except Exception as e:
+            self.session.rollback()
             return {"indexed": 0, "error": str(e)}
 
     async def _ensure_collection(self, collection_name: str):

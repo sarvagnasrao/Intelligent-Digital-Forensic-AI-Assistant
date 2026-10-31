@@ -392,10 +392,12 @@ class GlobalAuditPage(ResponsivePage):
                 grid.addWidget(widget, 0, column)
             grid.setColumnStretch(self._filter_widgets.index(self.user_filter), 1)
         else:
-            row = [w for w in self._filter_widgets if w is not self.user_filter]
+            row = [w for w in self._filter_widgets
+                   if w not in (self.user_filter, self.reset_filters_btn)]
             for column, widget in enumerate(row):
                 grid.addWidget(widget, 0, column)
-            grid.addWidget(self.user_filter, 1, 0, 1, len(row))
+            grid.addWidget(self.user_filter, 1, 0, 1, len(row) - 1)
+            grid.addWidget(self.reset_filters_btn, 1, len(row) - 1)
 
         grid.activate()
 

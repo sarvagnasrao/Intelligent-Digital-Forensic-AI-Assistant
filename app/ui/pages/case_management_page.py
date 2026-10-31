@@ -1,12 +1,10 @@
 """Case Management Page - Global dashboard."""
 from __future__ import annotations
 
-import csv
-from datetime import datetime
-from io import StringIO
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal, Slot
+from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QAction, QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -15,6 +13,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -22,7 +21,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QTableView,
     QTextEdit,
@@ -32,12 +30,12 @@ from PySide6.QtWidgets import (
 
 from app.auth.models import User, UserRole
 from app.cases.service import CaseService
-from app.ui.base import ResponsivePage, StatCard, StatusBadge
+from app.ui.base import ResponsivePage, StatCard
 from app.ui.theme.tokens import Color, Spacing, Typography
 from app.util.time import format_local_date
 
 if TYPE_CHECKING:
-    from app.auth.models import Case
+    pass
 
 
 class NewCaseDialog(QDialog):
@@ -263,7 +261,7 @@ class CaseFilterProxyModel(QSortFilterProxyModel):
             for col in range(model.columnCount()):
                 idx = model.index(source_row, col, source_parent)
                 data = model.data(idx)
-                if data and self._search_filter.lower() in str(data).lower():
+                if data and search_lower in str(data).lower():
                     match = True
                     break
             if not match:
@@ -310,7 +308,7 @@ class CaseManagementPage(ResponsivePage):
         layout.addLayout(header_row)
 
         # Stat cards
-        self.cards_layout = QHBoxLayout()
+        self.cards_layout = QGridLayout()
         self.cards_layout.setSpacing(Spacing.MD)
         self.stat_cards = {
             "total": StatCard("Total Cases", "0", "📁", Color.INFO),
@@ -321,11 +319,11 @@ class CaseManagementPage(ResponsivePage):
         }
         for key, card in self.stat_cards.items():
             card.clicked.connect(lambda _, k=key: self._on_stat_card_clicked(k))
-            self.cards_layout.addWidget(card)
+            self.cards_layout.addWidget(card, 0, self.cards_layout.count())
         layout.addLayout(self.cards_layout)
 
         # Filters
-        filter_row = QHBoxLayout()
+        filter_row = QGridLayout()
         filter_row.setSpacing(Spacing.SM)
 
         self.search_edit = QLineEdit()
@@ -335,36 +333,35 @@ class CaseManagementPage(ResponsivePage):
         self.search_edit.setMinimumWidth(150)
         self.search_edit.setMaximumWidth(300)
         self.search_edit.setFixedHeight(36)
-        filter_row.addWidget(QLabel("Search:"))
-        filter_row.addWidget(self.search_edit, 1)
+        search_label = QLabel("Search:")
 
         self.status_filter = QComboBox()
         self.status_filter.addItems(["All", "open", "active", "on_hold", "closed"])
         self.status_filter.currentTextChanged.connect(self._apply_filters)
         self.status_filter.setFixedHeight(36)
-        filter_row.addWidget(QLabel("Status:"))
-        filter_row.addWidget(self.status_filter)
+        status_label = QLabel("Status:")
 
         self.priority_filter = QComboBox()
         self.priority_filter.addItems(["All", "low", "medium", "high", "critical"])
         self.priority_filter.currentTextChanged.connect(self._apply_filters)
         self.priority_filter.setFixedHeight(36)
-        filter_row.addWidget(QLabel("Priority:"))
-        filter_row.addWidget(self.priority_filter)
+        priority_label = QLabel("Priority:")
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setProperty("secondary", True)
         self.refresh_btn.setFixedHeight(36)
         self.refresh_btn.clicked.connect(self.refresh)
-        filter_row.addWidget(self.refresh_btn)
 
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.setProperty("secondary", True)
         self.export_btn.setFixedHeight(36)
         self.export_btn.clicked.connect(self._export_cases_selected)
-        filter_row.addWidget(self.export_btn)
-
-        filter_row.addStretch()
+        self._filter_row = filter_row
+        self._filter_widgets = [search_label, self.search_edit, status_label,
+                                self.status_filter, priority_label, self.priority_filter,
+                                self.refresh_btn, self.export_btn]
+        self._compact_layout = None
+        self._arrange_toolbar(True)
         layout.addLayout(filter_row)
 
         # Case table
@@ -380,6 +377,8 @@ class CaseManagementPage(ResponsivePage):
         self.table_view.setSortingEnabled(True)
         # Column sizing: Case ID resize to content, Title stretch, others resize to content
         header = self.table_view.horizontalHeader()
+        # Keep the title legible when the narrow table needs horizontal scrolling.
+        header.setMinimumSectionSize(90)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Case ID
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)           # Title
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)  # Status
@@ -400,14 +399,26 @@ class CaseManagementPage(ResponsivePage):
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setStyleSheet(f"color: {Color.TEXT_MUTED.name()}; font-size: 14px; padding: 48px;")
         self.empty_label.hide()
-        layout.addWidget(self.empty_label)
+        layout.addWidget(self.empty_label, 1)
 
-        # Recent activity placeholder replaced with proper empty state
-        self.recent_activity_label = QLabel("No recent activity")
-        self.recent_activity_label.setObjectName("ActivityEmptyState")
-        self.recent_activity_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.recent_activity_label.setStyleSheet(f"color: {Color.TEXT_MUTED.name()}; font-size: 13px; padding: {Spacing.MD}px;")
-        layout.addWidget(self.recent_activity_label)
+    def _arrange_toolbar(self, compact: bool):
+        if compact == self._compact_layout:
+            return
+        self._compact_layout = compact
+        for index, card in enumerate(self.stat_cards.values()):
+            self.cards_layout.addWidget(card, index // 3 if compact else 0,
+                                        index % 3 if compact else index)
+        for widget in self._filter_widgets:
+            self._filter_row.removeWidget(widget)
+        for index, widget in enumerate(self._filter_widgets):
+            if compact and index >= 4:
+                self._filter_row.addWidget(widget, 1, index - 4)
+            else:
+                self._filter_row.addWidget(widget, 0, index)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._arrange_toolbar(event.size().width() < 900)
 
     def set_user(self, user: User):
         self.current_user = user
@@ -446,6 +457,10 @@ class CaseManagementPage(ResponsivePage):
         # Show/hide empty state
         row_count = self.proxy_model.rowCount()
         if row_count == 0:
+            if self.table_model.rowCount():
+                self.empty_label.setText("No cases match the current filters.")
+            else:
+                self.empty_label.setText("No cases yet. Click + New Case to create one.")
             self.table_view.hide()
             self.empty_label.show()
         else:
@@ -661,10 +676,11 @@ class CaseManagementPage(ResponsivePage):
             try:
                 with session_scope() as session:
                     case_service = CaseService(session)
-                    updated = case_service.update_case(
+                    case_service.update_case(
                         case.id,
                         title=data["title"],
                         description=data["description"],
+                        objective=data.get("objective"),
                         priority=data["priority"],
                         status=data["status"],
                         assignee_id=data["assignee_id"],
@@ -754,6 +770,8 @@ class CaseManagementPage(ResponsivePage):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        from app.db.session import session_scope
+
         try:
             with session_scope() as session:
                 case_service = CaseService(session)
@@ -775,6 +793,7 @@ class CaseManagementPage(ResponsivePage):
             import json
 
             from app.artifacts.models import Artifact
+            from app.db.session import session_scope
             from app.evidence.models import Evidence
             from app.examination.models import ExaminationJob
             from app.findings.models import Finding

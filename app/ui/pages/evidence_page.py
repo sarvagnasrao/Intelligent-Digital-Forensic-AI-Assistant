@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QScrollArea,
@@ -102,7 +104,7 @@ def _format_size(bytes_value: float) -> str:
 # --------------------------------------------------------------- worker threads
 class _RegisterEvidenceThread(QThread):
     progress = Signal(str, int)
-    registered = Signal(str)
+    registered = Signal(object)
     failed = Signal(str)
 
     def __init__(self, case_id: int, data: dict, user_id: int):
@@ -126,24 +128,40 @@ class _RegisterEvidenceThread(QThread):
                 percent = int(current * 100 / total) if total else 0
                 self.progress.emit(message, min(percent, 100))
 
-            reference_hashes = None
-            if self.data.get("reference_hash"):
-                reference_hashes = {
-                    HashAlgorithm(self.data["reference_algorithm"]):
-                        self.data["reference_hash"]
-                }
-            item = service.register_evidence(
-                case_id=self.case_id,
-                name=self.data["name"],
-                source_path=self.data["source_path"],
-                description=self.data["description"],
-                registered_by=user,
-                copy_to_store=self.data["copy_to_store"],
-                reference_hashes=reference_hashes,
-                progress_callback=report,
-            )
-            session.commit()
-            self.registered.emit(item.evidence_id)
+            paths = self.data.get("source_paths") or [self.data["source_path"]]
+            if len(paths) != 1:
+                raise ValueError("Bulk and folder intake is temporarily disabled pending forensic integrity fixes. Register one item at a time.")
+            results = []
+            for index, path in enumerate(paths, 1):
+                item = None
+                def report_item(message, current, total):
+                    report(f"{index}/{len(paths)} · {Path(path).name} · {message}", current, total)
+
+                try:
+                    reference_hashes = None
+                    if len(paths) == 1 and self.data.get("reference_hash"):
+                        reference_hashes = {
+                            HashAlgorithm(self.data["reference_algorithm"]): self.data["reference_hash"]
+                        }
+                    item = service.register_evidence(
+                        case_id=self.case_id,
+                        name=self.data["name"] if len(paths) == 1 else Path(path).name,
+                        source_path=path,
+                        description=self.data["description"],
+                        registered_by=user,
+                        copy_to_store=self.data["copy_to_store"],
+                        reference_hashes=reference_hashes,
+                        progress_callback=report_item,
+                    )
+                    session.commit()
+                    results.append((path, item.evidence_id, ""))
+                except Exception as exc:  # Each item has its own transaction.
+                    stored_path = getattr(item, "stored_path", None) if item is not None else None
+                    session.rollback()
+                    if stored_path:
+                        service._remove_unregistered_copy(stored_path)
+                    results.append((path, "", str(exc)))
+            self.registered.emit(results)
         except Exception as exc:
             session.rollback()
             self.failed.emit(str(exc))
@@ -301,6 +319,7 @@ class RegisterEvidenceDialog(QDialog):
         self.setWindowTitle("Register Evidence")
         self.setModal(True)
         self.resize(640, 520)
+        self.source_paths = []
 
         layout = QFormLayout(self)
         layout.setSpacing(Spacing.MD)
@@ -314,16 +333,22 @@ class RegisterEvidenceDialog(QDialog):
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("Select the source file or the .001 segment of an image")
         self.path_edit.setReadOnly(True)
-        browse_btn = QPushButton("Browse")
+        browse_btn = QPushButton("Browse files")
         browse_btn.clicked.connect(self._browse_file)
+        folder_btn = QPushButton("Browse folder")
+        folder_btn.clicked.connect(self._browse_folder)
+        folder_btn.setEnabled(False)
+        folder_btn.setToolTip("Folder intake is temporarily disabled pending forensic integrity fixes. Register one item at a time.")
         file_row.addWidget(self.path_edit)
         file_row.addWidget(browse_btn)
+        file_row.addWidget(folder_btn)
         layout.addRow("Source file:", file_row)
 
         file_hint = QLabel(
             "The format is detected automatically. For a segmented raw image, "
             "select .001 or any later segment; the complete set is registered as "
-            "one item."
+            "one item. Bulk and folder intake is temporarily disabled pending forensic "
+            "integrity fixes; register one item at a time."
         )
         file_hint.setWordWrap(True)
         file_hint.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
@@ -388,11 +413,58 @@ class RegisterEvidenceDialog(QDialog):
         )
         if not path:
             return
-        suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        if len(suffix) == 3 and suffix.isdigit() and int(suffix) > 0:
-            first_part = path[: -len(suffix)] + "001"
-            if Path(first_part).is_file():
-                path = first_part
+        self._set_paths([path])
+
+    def _browse_folder(self):
+        QMessageBox.warning(self, "Folder intake unavailable", "Bulk and folder intake is temporarily disabled pending forensic integrity fixes. Register one item at a time.")
+        return
+        folder = QFileDialog.getExistingDirectory(self, "Select Evidence Folder")
+        if folder:
+            paths = []
+            def safe_entry(path):
+                try:
+                    info = path.lstat()
+                    return not (stat.S_ISLNK(info.st_mode) or
+                                getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                except OSError:
+                    return False
+
+            if not safe_entry(Path(folder)):
+                self._set_paths([])
+                return
+            for root, dirs, files in os.walk(folder, followlinks=False):
+                dirs[:] = [name for name in dirs if safe_entry(Path(root) / name)]
+                paths.extend(str(p) for name in files if safe_entry(p := Path(root) / name) and p.is_file())
+            paths.sort()
+            self._set_paths(paths)
+
+    def _set_paths(self, paths):
+        if len(paths) > 1:
+            QMessageBox.warning(self, "Bulk intake unavailable", "Bulk and folder intake is temporarily disabled pending forensic integrity fixes. Register one item at a time.")
+            return
+        unique = {}
+        for value in paths:
+            path = Path(value)
+            suffix = path.suffix[1:]
+            if len(suffix) == 3 and suffix[0].lower() == "e" and suffix[1:].isdigit():
+                try:
+                    path = EvidenceService._split_image_parts(path)[0]
+                except (OSError, ValueError):
+                    pass  # Registration reports incomplete or ambiguous sets.
+                key = str(path.parent.resolve() / (path.stem + ".e01")).casefold()
+            elif len(suffix) == 3 and suffix.isdigit() and int(suffix) > 0:
+                first = path.with_suffix(".001")
+                key = str(first.resolve()).casefold()
+                path = first if first.is_file() else path
+            else:
+                key = str(path.resolve()).casefold()
+            unique.setdefault(key, str(path))
+        self.source_paths = list(unique.values())
+        if len(self.source_paths) != 1:
+            self.path_edit.setText(f"{len(self.source_paths)} files selected" if self.source_paths else "")
+            self.detected_type_label.setText("Each file is identified during registration.")
+            return
+        path = self.source_paths[0]
         detected_type, mime_type = EvidenceService.detect_file_type(path)
         friendly = "Forensic disk image" if detected_type == EvidenceType.IMAGE else "File"
         self.detected_type_label.setText(f"{friendly} — {mime_type}")
@@ -404,6 +476,12 @@ class RegisterEvidenceDialog(QDialog):
             self.name_edit.setText(image_name)
 
     def _accept_if_valid(self):
+        if len(self.source_paths) > 1:
+            QMessageBox.warning(self, "Bulk intake unavailable", "Bulk and folder intake is temporarily disabled pending forensic integrity fixes. Register one item at a time.")
+            return
+        if len(self.source_paths) > 1 and self.reference_hash.text().strip():
+            QMessageBox.warning(self, "Known hash", "Remove the known hash before registering multiple items; add it to each item separately afterwards.")
+            return
         algorithm = HashAlgorithm(self.hash_algorithm.currentData())
         value = self.reference_hash.text().strip()
         if value:
@@ -425,6 +503,7 @@ class RegisterEvidenceDialog(QDialog):
         return {
             "name": self.name_edit.text().strip(),
             "source_path": self.path_edit.text().strip(),
+            "source_paths": self.source_paths,
             "description": self.desc_edit.text().strip() or None,
             "copy_to_store": self.copy_check.currentIndex() == 0,
             "reference_algorithm": self.hash_algorithm.currentData(),
@@ -526,19 +605,28 @@ class DeleteEvidenceDialog(QDialog):
                 f"{derived}"
             )
         summary.setWordWrap(True)
+        # Preserve room for both paragraphs when a blocker adds another row.
+        # QLabel's minimum size otherwise permits the impact paragraph to be
+        # silently clipped by the vertical layout.
+        summary.setMinimumHeight(summary.fontMetrics().lineSpacing() * 6)
         layout.addWidget(summary)
 
         if files:
-            listing = QLabel("\n".join(str(part) for part in files))
+            listing = QPlainTextEdit()
+            listing.setPlainText("\n".join(str(part) for part in files))
+            listing.setReadOnly(True)
+            listing.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+            listing.setMinimumHeight(70)
+            listing.setMaximumHeight(110)
             listing.setFont(QFont("Consolas", Typography.MONO_SM[0]))
-            listing.setWordWrap(True)
-            listing.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             layout.addWidget(listing)
 
-        note = QLabel(f"The original file is kept: {evidence.source_path}")
-        note.setWordWrap(True)
-        note.setProperty("sectionHint", True)
-        layout.addWidget(note)
+        layout.addWidget(QLabel("The original file is kept:"))
+        source = QLineEdit(str(evidence.source_path))
+        source.setReadOnly(True)
+        source.setCursorPosition(0)
+        source.setToolTip(str(evidence.source_path))
+        layout.addWidget(source)
 
         self.confirm_edit = QLineEdit()
         self.confirm_edit.setPlaceholderText(evidence.evidence_id)
@@ -897,6 +985,7 @@ class EvidenceDetailPane(QFrame):
 
         form = QFormLayout()
         form.setSpacing(Spacing.XS)
+        form.setHorizontalSpacing(Spacing.MD)
         form.setContentsMargins(0, 0, 0, 0)
 
         self._add_row(form, "Category", evidence.evidence_type.value.replace("_", " ").title())
@@ -1122,34 +1211,30 @@ class EvidenceDetailPane(QFrame):
         self._body_layout.addWidget(box)
 
     def _add_actions(self, evidence: Evidence) -> None:
-        grid = QGridLayout()
-        grid.setContentsMargins(0, Spacing.XS, 0, 0)
-        grid.setSpacing(Spacing.XS)
-
-        def button(caption, action, destructive=False):
-            control = QPushButton(caption)
-            control.setProperty("compact", True)
-            control.setProperty("ghost", not destructive)
-            if destructive:
-                control.setProperty("destructive", True)
-            control.clicked.connect(
-                lambda _checked=False, a=action: self._emit(a)
-            )
-            return control
-
+        row = QHBoxLayout()
+        row.setContentsMargins(0, Spacing.XS, 0, 0)
+        row.setSpacing(Spacing.XS)
+        verify = QPushButton("Verify integrity")
+        verify.clicked.connect(lambda: self._emit("verify"))
+        row.addWidget(verify)
+        more = QPushButton("More actions")
+        menu = QMenu(more)
+        for caption, action in (
+            ("Export copy…", "export"),
+            ("Set reference hash…", "reference_hash"),
+            ("Edit details…", "edit"),
+        ):
+            menu.addAction(caption, lambda _checked=False, a=action: self._emit(a))
+        menu.addSeparator()
         removed = evidence.is_removed
-        grid.addWidget(button("Verify", "verify"), 0, 0)
-        grid.addWidget(button("Export copy…", "export"), 0, 1)
-        grid.addWidget(button("Reference hash…", "reference_hash"), 1, 0)
-        grid.addWidget(button("Edit details…", "edit"), 1, 1)
-        grid.addWidget(
-            button("Return to case" if removed else "Remove…",
-                   "return" if removed else "remove"), 2, 0
+        menu.addAction(
+            "Return to case" if removed else "Remove from case…",
+            lambda: self._emit("return" if removed else "remove"),
         )
-        grid.addWidget(
-            button("Delete permanently…", "delete", destructive=True), 2, 1
-        )
-        self._actions_layout.addLayout(grid)
+        menu.addAction("Delete permanently…", lambda: self._emit("delete"))
+        more.setMenu(menu)
+        row.addWidget(more)
+        self._actions_layout.addLayout(row)
 
     @staticmethod
     def _hint(text: str) -> QLabel:
@@ -1190,31 +1275,33 @@ class EvidencePage(ResponsivePage):
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.MD)
 
-        header_row = QHBoxLayout()
+        header_row = QGridLayout()
+        self._header_grid = header_row
         title = QLabel("Evidence")
         title.setProperty("pageTitle", True)
         title.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_LG[0], Typography.HEADING_LG[1])
         )
-        header_row.addWidget(title)
+        self._title = title
+        header_row.addWidget(title, 0, 0)
 
         self.summary_label = QLabel("")
         self.summary_label.setProperty("sectionHint", True)
-        header_row.addSpacing(Spacing.MD)
-        header_row.addWidget(self.summary_label)
-        header_row.addStretch()
+        self.summary_label.setWordWrap(True)
+        header_row.addWidget(self.summary_label, 0, 1)
 
         self.devices_btn = QPushButton("Physical devices")
         self.devices_btn.clicked.connect(self._on_devices)
-        header_row.addWidget(self.devices_btn)
+        header_row.addWidget(self.devices_btn, 0, 2)
 
         self.register_btn = QPushButton("Register Evidence")
         self.register_btn.clicked.connect(self._on_register)
-        header_row.addWidget(self.register_btn)
+        header_row.addWidget(self.register_btn, 0, 3)
         layout.addLayout(header_row)
 
         # Filters ---------------------------------------------------------
-        filter_row = QHBoxLayout()
+        filter_row = QGridLayout()
+        self._filter_grid = filter_row
         filter_row.setSpacing(Spacing.SM)
 
         self.search_edit = QLineEdit()
@@ -1222,28 +1309,32 @@ class EvidencePage(ResponsivePage):
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setMaximumWidth(320)
         self.search_edit.textChanged.connect(self._apply_filters)
-        filter_row.addWidget(self.search_edit)
+        filter_row.addWidget(self.search_edit, 0, 0)
 
         self.status_filter = QComboBox()
         for label, value in STATUS_FILTERS:
             self.status_filter.addItem(label, value)
         self.status_filter.currentIndexChanged.connect(self._apply_filters)
-        filter_row.addWidget(self.status_filter)
+        filter_row.addWidget(self.status_filter, 0, 1)
 
         self.show_archived_check = QCheckBox("Archived")
         self.show_archived_check.setChecked(True)
         self.show_archived_check.setToolTip("Show archived items in the list.")
         self.show_archived_check.toggled.connect(self._apply_filters)
-        filter_row.addWidget(self.show_archived_check)
+        filter_row.addWidget(self.show_archived_check, 0, 2)
 
         self.show_removed_check = QCheckBox("Removed")
         self.show_removed_check.setToolTip(
             "Show items that were removed from the case. They stay in the record."
         )
         self.show_removed_check.toggled.connect(self._apply_filters)
-        filter_row.addWidget(self.show_removed_check)
+        filter_row.addWidget(self.show_removed_check, 0, 3)
 
-        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        tools_row = QGridLayout()
+        self._tools_grid = tools_row
+        tools_row.setSpacing(Spacing.SM)
 
         self.select_all_btn = QPushButton("Select all shown")
         self.select_all_btn.setProperty("secondary", True)
@@ -1251,13 +1342,13 @@ class EvidencePage(ResponsivePage):
             "Select all evidence currently visible after the search and filters."
         )
         self.select_all_btn.clicked.connect(self._select_all_visible)
-        filter_row.addWidget(self.select_all_btn)
+        tools_row.addWidget(self.select_all_btn, 0, 0)
 
         self.clear_selection_btn = QPushButton("Clear selection")
         self.clear_selection_btn.setProperty("secondary", True)
         self.clear_selection_btn.setEnabled(False)
         self.clear_selection_btn.clicked.connect(self._clear_selection)
-        filter_row.addWidget(self.clear_selection_btn)
+        tools_row.addWidget(self.clear_selection_btn, 0, 1)
 
         self.check_files_btn = QPushButton("Check files")
         self.check_files_btn.setProperty("secondary", True)
@@ -1265,7 +1356,7 @@ class EvidencePage(ResponsivePage):
             "Confirm that every stored file is still where the record says it is."
         )
         self.check_files_btn.clicked.connect(self._on_check_files)
-        filter_row.addWidget(self.check_files_btn)
+        tools_row.addWidget(self.check_files_btn, 0, 2)
 
         self.manifest_btn = QPushButton("Export manifest")
         self.manifest_btn.setProperty("secondary", True)
@@ -1273,11 +1364,12 @@ class EvidencePage(ResponsivePage):
             "Write the case evidence list, with hashes and status, to CSV or JSON."
         )
         self.manifest_btn.clicked.connect(self._on_export_manifest)
-        filter_row.addWidget(self.manifest_btn)
-        layout.addLayout(filter_row)
+        tools_row.addWidget(self.manifest_btn, 0, 3)
+        layout.addLayout(tools_row)
 
         # Table + detail --------------------------------------------------
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter = splitter
 
         table_frame = QFrame()
         table_layout = QVBoxLayout(table_frame)
@@ -1317,8 +1409,40 @@ class EvidencePage(ResponsivePage):
         self.detail_pane.action_requested.connect(self._on_detail_action)
         splitter.addWidget(self.detail_pane)
 
-        configure_detail_splitter(splitter, preferred_detail_width=380)
+        # Keep more of the evidence table visible on laptop-sized windows;
+        # the investigator can still resize the inspector to see full details.
+        configure_detail_splitter(splitter, preferred_detail_width=300)
         layout.addWidget(splitter, 1)
+        self._compact = None
+        self._reflow(self.width())
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._reflow(event.size().width())
+
+    def _reflow(self, width: int) -> None:
+        compact = width < 760
+        if compact == self._compact:
+            return
+        self._compact = compact
+        groups = (
+            (self._header_grid, (self._title, self.summary_label,
+                                 self.devices_btn, self.register_btn)),
+            (self._filter_grid, (self.search_edit, self.status_filter,
+                                 self.show_archived_check, self.show_removed_check)),
+            (self._tools_grid, (self.select_all_btn, self.clear_selection_btn,
+                                self.check_files_btn, self.manifest_btn)),
+        )
+        for grid, widgets in groups:
+            for index, widget in enumerate(widgets):
+                grid.removeWidget(widget)
+                grid.addWidget(widget, index // 2 if compact else 0,
+                               index % 2 if compact else index)
+        self._splitter.setOrientation(
+            Qt.Orientation.Vertical if compact else Qt.Orientation.Horizontal
+        )
+        self.detail_pane.setMaximumWidth(16777215 if compact else 460)
+        self._splitter.setSizes([350, 300] if compact else [600, 300])
 
     # ------------------------------------------------------------- context
     def set_case_context(self, context: CaseContext):
@@ -1387,6 +1511,19 @@ class EvidencePage(ResponsivePage):
     def _apply_filters(self):
         visible = self._visible_evidence()
         self.table_model.populate(visible, self._file_states)
+        if not self._all_evidence:
+            self.empty_hint.setText(
+                "No evidence registered yet. Use Register Evidence to add an item."
+            )
+        elif (all(item.is_removed for item in self._all_evidence)
+              and not self.show_removed_check.isChecked()):
+            self.empty_hint.setText(
+                "All evidence is removed from the case. Select Removed to view or return items."
+            )
+        else:
+            self.empty_hint.setText(
+                "No evidence matches the current filters. Adjust the search or filters."
+            )
         self.empty_hint.setVisible(not visible)
         self.select_all_btn.setEnabled(bool(visible))
         self._on_selection_changed()
@@ -1601,7 +1738,7 @@ class EvidencePage(ResponsivePage):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         data = dialog.get_data()
-        if not data["name"] or not data["source_path"]:
+        if not data["source_paths"] or (len(data["source_paths"]) == 1 and not data["name"]):
             QMessageBox.warning(self, "Validation Error", "Name and source file are required")
             return
         user = self._require_writer()
@@ -1621,11 +1758,16 @@ class EvidencePage(ResponsivePage):
         self._track(self._register_thread)
         self._register_thread.start()
 
-    def _registration_complete(self, evidence_id: str):
+    def _registration_complete(self, results):
         self._close_progress()
         self.register_btn.setEnabled(True)
         self._expire()
-        QMessageBox.information(self, "Evidence Registered", f"Evidence registered: {evidence_id}")
+        lines = [f"{path}: {evidence_id if evidence_id else 'FAILED — ' + error}"
+                 for path, evidence_id, error in results]
+        if any(error for _, _, error in results):
+            QMessageBox.warning(self, "Registration Results", "\n".join(lines))
+        else:
+            QMessageBox.information(self, "Evidence Registered", "\n".join(lines))
 
     def _registration_failed(self, error: str):
         self._close_progress()

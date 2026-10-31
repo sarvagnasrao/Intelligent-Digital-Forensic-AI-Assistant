@@ -9,18 +9,20 @@ and places, with its answer checked against the source text.
 
 Two rules keep the output usable:
 
-* **One match per span.** A URL contains a hostname and often a path; an email
+* **Normally one match per span.** A URL contains a hostname and often a path; an email
   contains a domain. When two patterns match overlapping text the higher
   priority pattern wins, so the same characters are not reported twice as
-  unrelated things.
+  unrelated things. An email or IP address in a URL query is also retained as
+  an independent source-backed lead, because it can link to other records.
 * **One row per value per artifact.** The same address mentioned fifty times is
   one entity for that file, with the first span kept.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.artifacts.models import EntityType
 
@@ -35,11 +37,11 @@ EXTRACTOR_PRIORITY: tuple[str, ...] = (
     "hash",
     "ip",
     "mac",
+    "timestamp",
     "phone",
     "file_path",
     "username",
     "device_id",
-    "timestamp",
 )
 
 # Confidence for a pattern that cannot be wrong about its own syntax. Values
@@ -57,17 +59,31 @@ _URL_RE = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(
-    r"(?<![\w.+-])([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})(?![\w-])"
+    r"(?<![\w.+-])([A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\."
+    r"(?:xn--[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|[A-Za-z]{2,}))(?![\w-])",
+    re.IGNORECASE,
 )
 _BTC_RE = re.compile(r"\b(?:bc1[a-zA-HJ-NP-Z0-9]{25,62}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b")
 _ETH_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
 _HASH_RE = re.compile(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b")
 _IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w)(?!\.\d)")
-_IPV6_RE = re.compile(r"(?<![\w:])(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}(?![\w:])")
-_MAC_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
+_IPV6_RE = re.compile(
+    r"(?<![\w:])(?:[A-Fa-f0-9]{0,4}:){2,7}"
+    r"(?:[A-Fa-f0-9]{0,4}:)?(?:\d{1,3}\.){3}\d{1,3}(?![\w:])(?!\.[\w:.])"
+    r"|(?<![\w:])(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}(?![\w:])(?!\.[\w:.])"
+)
+_MAC_RE = re.compile(
+    r"(?<![\w.])(?:[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}"
+    r"|[0-9A-Fa-f]{4}(?:\.[0-9A-Fa-f]{4}){2})(?!\w|\.[\w.])"
+)
+_MAC_COMPACT_CONTEXT_RE = re.compile(
+    r"\b(?:mac(?:[_\s-]?address)?|bssid)\s*[=:]\s*[\"']?"
+    r"([0-9A-Fa-f]{12})(?![\w.:-])",
+    re.IGNORECASE,
+)
 _PHONE_CANDIDATE_RE = re.compile(
-    r"(?<![\w+])(?:\+\d{1,4}[\d\s().\-]{0,18}\d"
-    r"|\(?\d{2,5}\)?[\s.\-]\d[\d\s().\-]{0,16}\d)(?![\w])"
+    r"(?<![\w+])(?:\+\d{1,4}[\d \t().\-]{0,18}\d"
+    r"|\(?\d{2,5}\)?[ \t.\-]\d[\d \t().\-]{0,16}\d)(?![\w])"
 )
 _PHONE_SHAPE_DATE = re.compile(
     r"^\d{1,4}\s*[.\-/]\s*\d{1,2}\s*[.\-/]\s*\d{1,4}$"
@@ -96,7 +112,7 @@ _FILENAME_RE = re.compile(
 )
 _USERNAME_CONTEXT_RE = re.compile(
     r"(?:\buser(?:name)?|\blogin(?:name)?|\baccount|\bowner|\buid|\bsam)\b"
-    r"\s*[=:]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._\-]{2,31})",
+    r"\s*[=:]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._\-]{2,511})(?![A-Za-z0-9._\-])",
     re.IGNORECASE,
 )
 _USERNAME_PATH_RE = re.compile(
@@ -105,7 +121,7 @@ _USERNAME_PATH_RE = re.compile(
 _USERNAME_HANDLE_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9_]{3,30})\b")
 _DEVICE_ID_RE = re.compile(
     r"\b(?:device[_\s-]?(?:id|uuid|serial)|serial(?:number|no)?|imei|udid)"
-    r"\s*[=:]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._:\-]{5,63})",
+    r"\s*[=:]\s*[\"']?([A-Za-z0-9][A-Za-z0-9._:\-]{5,63})(?![A-Za-z0-9._:\-])",
     re.IGNORECASE,
 )
 _ISO_DATE_RE = re.compile(
@@ -113,7 +129,7 @@ _ISO_DATE_RE = re.compile(
     r"(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?(?![\d-])"
 )
 _SLASH_DATE_RE = re.compile(
-    r"(?<![\d/])(\d{2})/(\d{2})/(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?(?![\d/])"
+    r"(?<![\d/])(\d{1,2})/(\d{1,2})/(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?(?![\d/])"
 )
 
 # Domains that say nothing about a relationship. Kept short: the rarity filter
@@ -151,14 +167,21 @@ def _clip(value: str) -> str:
 def normalize_value(entity_type: EntityType, value: str) -> str:
     """A comparable form of a value, used for dedupe and relationship keys."""
     text = value.strip()
+    if entity_type is EntityType.MAC_ADDRESS:
+        digits = re.sub(r"[:-]|\.", "", text.lower())
+        if len(digits) == 12 and re.fullmatch(r"[0-9a-f]{12}", digits):
+            return ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+        return text.lower()[:MAX_ENTITY_VALUE]
+    if entity_type is EntityType.CRYPTO_ADDRESS:
+        # Bitcoin addresses are case-sensitive; lowercasing Base58 can merge
+        # distinct addresses. Ethereum hexadecimal addresses compare by value.
+        return (text.lower() if text.startswith("0x") else text)[:MAX_ENTITY_VALUE]
     if entity_type in (
         EntityType.EMAIL,
         EntityType.URL,
         EntityType.USERNAME,
         EntityType.FILE_PATH,
-        EntityType.CRYPTO_ADDRESS,
         EntityType.HASH,
-        EntityType.MAC_ADDRESS,
         EntityType.DEVICE_ID,
         EntityType.PERSON,
         EntityType.ORGANIZATION,
@@ -176,7 +199,10 @@ def normalize_value(entity_type: EntityType, value: str) -> str:
         digits = re.sub(r"\D", "", text)
         return ("+" + digits) if text.startswith("+") else digits
     if entity_type is EntityType.IP_ADDRESS:
-        return text.lower()
+        try:
+            return str(ipaddress.ip_address(text))
+        except ValueError:
+            return text.lower()
     if entity_type is EntityType.TIMESTAMP:
         return text.replace(" ", "T").lower()
     return text.lower()[:MAX_ENTITY_VALUE]
@@ -193,9 +219,7 @@ def _valid_ipv4(value: str) -> bool:
     if any(number > 255 for number in numbers):
         return False
     # 0.0.0.0 and 255.255.255.255 are usually placeholders or masks.
-    if numbers == [0, 0, 0, 0] or numbers == [255, 255, 255, 255]:
-        return False
-    return True
+    return not (numbers == [0, 0, 0, 0] or numbers == [255, 255, 255, 255])
 
 
 def _valid_phone(value: str) -> bool:
@@ -211,7 +235,7 @@ def _valid_phone(value: str) -> bool:
         return False
     # A bare run of digits is far more often an id, a size or a timestamp than
     # a telephone number; require the shape a human writes it in.
-    return bool(re.search(r"[+\-(). ]", value))
+    return bool(re.search(r"[+\-(). \t]", value))
 
 
 def _low_entropy_hash(value: str) -> bool:
@@ -273,11 +297,20 @@ def extract_entities(
         extractor: str,
         confidence: float = CONFIDENCE_EXACT,
         metadata: dict | None = None,
+        allow_overlap: bool = False,
     ) -> None:
-        value = _clip(raw_value)
+        # Colons are significant at either end of a compressed IPv6 address.
+        value = (
+            raw_value.strip()[:MAX_ENTITY_VALUE]
+            if entity_type is EntityType.IP_ADDRESS else _clip(raw_value)
+        )
         if not value or len(value) < 3:
             return
-        if not claimed.free(start, end):
+        # Clipping punctuation or a long value must also clip its source span.
+        # Otherwise the persisted offsets do not identify the stored value.
+        start += raw_value.index(value)
+        end = start + len(value)
+        if not allow_overlap and not claimed.free(start, end):
             return
         claimed.claim(start, end)
         found.append(
@@ -302,9 +335,19 @@ def extract_entities(
             continue
         add(EntityType.URL, value, match.start(), match.end(), "url")
 
+    def in_url_query(start: int, end: int) -> bool:
+        return any(
+            entity.entity_type is EntityType.URL
+            and entity.start <= start < end <= entity.end
+            and "?" in text[entity.start:start]
+            and "#" not in text[entity.start:start]
+            for entity in found
+        )
+
     # --- e-mail addresses ---------------------------------------------
     for match in _EMAIL_RE.finditer(text):
-        add(EntityType.EMAIL, match.group(1), match.start(1), match.end(1), "email")
+        add(EntityType.EMAIL, match.group(1), match.start(1), match.end(1), "email",
+            allow_overlap=in_url_query(match.start(1), match.end(1)))
 
     # --- wallet addresses ---------------------------------------------
     for match in _BTC_RE.finditer(text):
@@ -326,21 +369,25 @@ def extract_entities(
         add(EntityType.HASH, value, match.start(), match.end(), "hash")
 
     # --- addresses ----------------------------------------------------
+    for match in _IPV6_RE.finditer(text):
+        try:
+            address = ipaddress.IPv6Address(match.group(0))
+        except ValueError:
+            continue
+        # The unspecified address is a placeholder, not an investigative lead.
+        if not address.is_unspecified:
+            add(EntityType.IP_ADDRESS, match.group(0), match.start(), match.end(), "ip",
+                allow_overlap=in_url_query(match.start(), match.end()))
+
     for match in _IPV4_RE.finditer(text):
         if _valid_ipv4(match.group(0)):
-            add(EntityType.IP_ADDRESS, match.group(0), match.start(), match.end(), "ip")
-    for match in _IPV6_RE.finditer(text):
-        add(EntityType.IP_ADDRESS, match.group(0), match.start(), match.end(), "ip")
+            add(EntityType.IP_ADDRESS, match.group(0), match.start(), match.end(), "ip",
+                allow_overlap=in_url_query(match.start(), match.end()))
 
     for match in _MAC_RE.finditer(text):
         add(EntityType.MAC_ADDRESS, match.group(0), match.start(), match.end(), "mac")
-
-    # --- telephone numbers --------------------------------------------
-    for match in _PHONE_CANDIDATE_RE.finditer(text):
-        value = match.group(0)
-        if not _valid_phone(value):
-            continue
-        add(EntityType.PHONE, value, match.start(), match.end(), "phone")
+    for match in _MAC_COMPACT_CONTEXT_RE.finditer(text):
+        add(EntityType.MAC_ADDRESS, match.group(1), match.start(1), match.end(1), "mac")
 
     # --- timestamps ---------------------------------------------------
     for match in _ISO_DATE_RE.finditer(text):
@@ -348,11 +395,19 @@ def extract_entities(
         if not _valid_date(year, month, day):
             continue
         add(EntityType.TIMESTAMP, match.group(0), match.start(), match.end(), "timestamp")
+
     for match in _SLASH_DATE_RE.finditer(text):
         day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        if not _valid_date(year, month, day):
+        if not (_valid_date(year, month, day) or _valid_date(year, day, month)):
             continue
         add(EntityType.TIMESTAMP, match.group(0), match.start(), match.end(), "timestamp")
+
+    # Dates with times can resemble phone numbers; preserve the full timestamp.
+    for match in _PHONE_CANDIDATE_RE.finditer(text):
+        value = match.group(0)
+        if not _valid_phone(value):
+            continue
+        add(EntityType.PHONE, value, match.start(), match.end(), "phone")
 
     # --- file paths and names -----------------------------------------
     for match in _WINDOWS_PATH_RE.finditer(text):
@@ -407,14 +462,17 @@ def parse_timestamp(value: str) -> datetime | None:
         except ValueError:
             continue
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         return parsed
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y", "%m/%d/%Y"):
+    for fmt in (
+        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y",
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
+    ):
         try:
             parsed = datetime.strptime(value.strip(), fmt)
         except ValueError:
             continue
-        return parsed.replace(tzinfo=timezone.utc)
+        return parsed.replace(tzinfo=UTC)
     return None
 
 

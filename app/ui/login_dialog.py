@@ -66,7 +66,7 @@ class LoginDialog(QDialog):
 
         self.setWindowTitle("IDFA — Investigator Authentication")
         self.setModal(True)
-        self.setFixedWidth(410)
+        self.setMinimumWidth(410)
         self.setWindowFlags(
             Qt.WindowType.Dialog
             | Qt.WindowType.FramelessWindowHint
@@ -76,6 +76,9 @@ class LoginDialog(QDialog):
         )
 
         self._build_ui()
+        # Start keyboard navigation at the first credential field, not the
+        # custom title bar's minimize button.
+        self.username_edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
         # The dialog is built in English; this renders it in the configured
         # language, and in a language picked since the last sign-in.
@@ -84,7 +87,6 @@ class LoginDialog(QDialog):
         # Size to the laid-out content so the footer never collides with the
         # sign-in button when the system font is larger than assumed.
         self.adjustSize()
-        self.setFixedHeight(self.height())
 
     def _load_colors(self) -> None:
         """Resolve every colour this dialog uses from the active palette."""
@@ -131,7 +133,7 @@ class LoginDialog(QDialog):
     def _build_title_bar(self, parent_layout):
         self.title_bar = QFrame()
         self.title_bar.setObjectName("TitleBar")
-        self.title_bar.setFixedHeight(42)
+        self.title_bar.setMinimumHeight(42)
         self.title_bar.setStyleSheet(f"""
             QFrame#TitleBar {{
                 background-color: {self.TITLE_BG};
@@ -206,9 +208,10 @@ class LoginDialog(QDialog):
         button = QToolButton()
         button.setText(text)
         button.setToolTip(tooltip)
-        button.setFixedSize(36, 32)
+        button.setAccessibleName(tooltip)
+        button.setMinimumSize(36, 32)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         hover = self.CLOSE_HOVER if close else self.MONOGRAM_BG
         hover_text = self.CLOSE_HOVER_FG if close else self.TEXT
@@ -229,6 +232,9 @@ class LoginDialog(QDialog):
             }}
             QToolButton:pressed {{
                 background-color: {self.BORDER};
+            }}
+            QToolButton:focus {{
+                border: 1px solid {self.ACCENT};
             }}
         """)
         return button
@@ -302,16 +308,18 @@ class LoginDialog(QDialog):
         description.setWordWrap(True)
         description.setStyleSheet(f"""
             color: {self.SECONDARY};
-            font-size: 11px;
             background: transparent;
         """)
         root.addWidget(description)
         root.addSpacing(19)
 
-        root.addWidget(self._field_label("Username"))
+        username_label = self._field_label("Username")
+        root.addWidget(username_label)
         root.addSpacing(7)
 
         self.username_edit = QLineEdit()
+        username_label.setBuddy(self.username_edit)
+        self.username_edit.setAccessibleName(tr("Username"))
         self.username_edit.setObjectName("UsernameInput")
         self.username_edit.setPlaceholderText("Enter your username")
         self.username_edit.setClearButtonEnabled(True)
@@ -321,10 +329,13 @@ class LoginDialog(QDialog):
         root.addWidget(self.username_edit)
         root.addSpacing(15)
 
-        root.addWidget(self._field_label("Password"))
+        password_label = self._field_label("Password")
+        root.addWidget(password_label)
         root.addSpacing(7)
 
         self.password_edit = QLineEdit()
+        password_label.setBuddy(self.password_edit)
+        self.password_edit.setAccessibleName(tr("Password"))
         self.password_edit.setObjectName("PasswordInput")
         self.password_edit.setPlaceholderText("Enter your password")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -336,22 +347,23 @@ class LoginDialog(QDialog):
 
         self.show_password_btn = QToolButton(self.password_edit)
         self.show_password_btn.setText("Show")
+        self.show_password_btn.setAccessibleName(tr("Show password"))
         self.show_password_btn.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
-        self.show_password_btn.setFocusPolicy(
-            Qt.FocusPolicy.NoFocus
-        )
+        self.show_password_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.show_password_btn.setStyleSheet(f"""
             QToolButton {{
                 color: {self.ACCENT};
                 background: transparent;
                 border: none;
-                font-size: 10px;
                 font-weight: 600;
             }}
             QToolButton:hover {{
                 color: {self.ACCENT_HOVER};
+            }}
+            QToolButton:focus {{
+                border: 1px solid {self.ACCENT};
             }}
         """)
         self.show_password_btn.clicked.connect(self._toggle_password)
@@ -366,7 +378,6 @@ class LoginDialog(QDialog):
         self.error_label.setStyleSheet(f"""
             QLabel#LoginError {{
                 color: {self.ERROR};
-                font-size: 10px;
                 background: transparent;
                 border: none;
             }}
@@ -465,12 +476,10 @@ class LoginDialog(QDialog):
         root.addLayout(footer)
         parent_layout.addWidget(content, 1)
 
-    @staticmethod
-    def _field_label(text):
+    def _field_label(self, text):
         label = QLabel(text)
-        label.setStyleSheet("""
+        label.setStyleSheet(f"""
             color: {self.SECONDARY};
-            font-size: 10px;
             font-weight: 600;
             background: transparent;
         """)
@@ -485,7 +494,6 @@ class LoginDialog(QDialog):
                 border-radius: 4px;
                 padding: 0 11px;
                 min-height: 39px;
-                font-size: 11px;
                 selection-background-color: {self.ACCENT};
             }}
             QLineEdit:hover {{
@@ -569,10 +577,13 @@ class LoginDialog(QDialog):
         if password_edit is None or toggle is None:
             return
 
-        toggle.setFixedSize(46, 29)
+        width = max(46, toggle.sizeHint().width() + 8)
+        height = min(password_edit.height(), max(29, toggle.sizeHint().height()))
+        password_edit.setTextMargins(0, 0, width + 4, 0)
+        toggle.resize(width, height)
         toggle.move(
-            password_edit.width() - 53,
-            (password_edit.height() - 29) // 2,
+            password_edit.width() - width - 7,
+            (password_edit.height() - height) // 2,
         )
         toggle.raise_()
 
@@ -593,7 +604,10 @@ class LoginDialog(QDialog):
             else QLineEdit.EchoMode.Password
         )
         self.show_password_btn.setText(tr("Hide") if visible else tr("Show"))
-        self.password_edit.setFocus()
+        self.show_password_btn.setAccessibleName(
+            tr("Hide password") if visible else tr("Show password")
+        )
+        self._position_password_toggle()
 
     # ------------------------------------------------------------------
     # Authentication

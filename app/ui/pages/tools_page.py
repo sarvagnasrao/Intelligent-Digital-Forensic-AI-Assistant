@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,24 @@ from app.config import get_config
 
 if TYPE_CHECKING:
     from app.db.session import session_scope
+
+
+def _read_log_tail(path: Path, level: str) -> str:
+    """Show the last 1000 lines, keeping traceback lines with their record."""
+    with path.open("r", encoding="utf-8", errors="replace") as file:
+        lines = deque(file, maxlen=1000)
+    if level == "All":
+        return "".join(lines)
+    result = []
+    include = False
+    levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    for line in lines:
+        fields = line.split("|", 2)
+        if len(fields) >= 3 and fields[1].strip() in levels:
+            include = fields[1].strip() == level
+        if include:
+            result.append(line)
+    return "".join(result)
 
 
 def pyside_version() -> str:
@@ -104,8 +123,9 @@ class ToolsPage(ResponsivePage):
         self.diag_model.setHorizontalHeaderLabels(["Service", "Status", "Details", "Actions"])
         self.diag_table.setModel(self.diag_model)
         self.diag_table.verticalHeader().setVisible(False)
-        self.diag_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.diag_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header_view = self.diag_table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.diag_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.diag_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.diag_table.setAlternatingRowColors(True)
@@ -212,7 +232,8 @@ class ToolsPage(ResponsivePage):
         logs_top_row.addWidget(refresh_logs_btn)
 
         self.log_filter = QComboBox()
-        self.log_filter.addItems(["All", "DEBUG", "INFO", "WARNING", "ERROR"])
+        self.log_filter.addItems(["All", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+        self.log_filter.setToolTip("Filter the last 1,000 log lines by severity.")
         self.log_filter.setMinimumWidth(140)
         self.log_filter.currentTextChanged.connect(self._filter_logs)
         logs_top_row.addWidget(self.log_filter)
@@ -313,7 +334,23 @@ class ToolsPage(ResponsivePage):
             ]
             for item in row:
                 item.setEditable(False)
+                item.setToolTip(item.text())
             self.diag_model.appendRow(row)
+
+        # Resize after populating: Qt's content sizing can otherwise retain the
+        # narrow widths calculated for the initially empty model.
+        for column in (0, 1):
+            self.diag_table.resizeColumnToContents(column)
+            widest = max(
+                (self.diag_table.fontMetrics().horizontalAdvance(
+                    self.diag_model.item(row, column).text()
+                )
+                 for row in range(self.diag_model.rowCount())),
+                default=0,
+            )
+            self.diag_table.setColumnWidth(
+                column, max(self.diag_table.columnWidth(column), widest + 32)
+            )
 
     def _refresh_cache_info(self):
         try:
@@ -363,9 +400,7 @@ class ToolsPage(ResponsivePage):
             config = get_config()
             log_path = Path(config.app.logs_dir) / "idfa.log"
             if log_path.exists():
-                with log_path.open("r", encoding="utf-8") as file:
-                    lines = file.readlines()[-1000:]
-                self.logs_text.setPlainText("".join(lines))
+                self.logs_text.setPlainText(_read_log_tail(log_path, self.log_filter.currentText()))
                 self.logs_text.moveCursor(QTextCursor.MoveOperation.End)
             else:
                 self.logs_text.setPlainText("Log file not found")
@@ -600,7 +635,7 @@ class DatabaseManagementDialog(QDialog):
         layout.addLayout(header)
 
         # Backup section
-        backup_group = QGroupBox("Backup & Restore")
+        backup_group = QGroupBox("Backup && Restore")
         backup_layout = QVBoxLayout(backup_group)
         backup_layout.setContentsMargins(Spacing.MD, Spacing.LG, Spacing.MD, Spacing.MD)
         backup_layout.setSpacing(Spacing.MD)
@@ -875,7 +910,8 @@ class LogViewerDialog(QDialog):
         header.addWidget(filter_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["All", "DEBUG", "INFO", "WARNING", "ERROR"])
+        self.filter_combo.addItems(["All", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+        self.filter_combo.setToolTip("Filter the last 1,000 log lines by severity.")
         self.filter_combo.setMinimumWidth(140)
         self.filter_combo.currentTextChanged.connect(self._filter_logs)
         header.addWidget(self.filter_combo)
@@ -905,9 +941,7 @@ class LogViewerDialog(QDialog):
             config = get_config()
             log_path = Path(config.app.logs_dir) / "idfa.log"
             if log_path.exists():
-                with open(log_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()[-1000:]  # Last 1000 lines
-                self.log_text.setPlainText("".join(lines))
+                self.log_text.setPlainText(_read_log_tail(log_path, self.filter_combo.currentText()))
                 # Scroll to bottom
                 cursor = self.log_text.textCursor()
                 cursor.movePosition(QTextCursor.MoveOperation.End)
@@ -919,9 +953,6 @@ class LogViewerDialog(QDialog):
 
     def _filter_logs(self, level: str):
         self._load_logs()
-        if level != "All":
-            # Simple filtering - hide lines not containing the level
-            pass  # Could implement filtering
 
 
 class SystemInfoDialog(QDialog):

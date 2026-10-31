@@ -27,6 +27,8 @@ from app.config import get_config
 TEMPLATE_FORMAT = "idfa-report-template"
 TEMPLATE_VERSION = 1
 BUILTIN_DEFAULT_ID = "court-admissible-v1"
+BUILTIN_EXTRA_IDS = ("forensic-examination-v1", "evidence-custody-v1", "expert-findings-v1")
+BUILTIN_IDS = (BUILTIN_DEFAULT_ID, *BUILTIN_EXTRA_IDS)
 
 #: Section keys in the order the reports page offers them.  A template chooses
 #: which of these appear and in what order.
@@ -112,7 +114,7 @@ class ReportTemplate:
     @property
     def source_label(self) -> str:
         if self.builtin:
-            return "Built-in default template"
+            return "Built-in template"
         return self.source_path or "Uploaded template"
 
     def resolved_sections(self, selected: list[str] | None = None) -> list[str]:
@@ -173,56 +175,6 @@ def get_default_template() -> ReportTemplate:
     organization = _config_organization()
     jurisdiction = _config_jurisdiction()
 
-    authority = """This report documents the forensic examination of digital evidence in Case {{case_id}} - {{case_title}}. It has been prepared by {{examiner}} of {{organization}} at the request of the case owner and is intended to be relied upon in judicial or quasi-judicial proceedings.
-
-**Scope of examination.** The examination was confined to the evidence items recorded in the Evidence Inventory and to the questions recorded in the case file. No other device, account, or data source was examined. This report is intended to be read as a whole and no section should be read in isolation or quoted out of context.
-
-**Authority.** The examination was carried out under the authority of the case owner. Where the examiner was directed to examine specific material only, that direction is reflected in the scope above.
-
-**Standards and guidance.** The examination and this report have been prepared with reference to ISO/IEC 27037:2012 (identification, collection, acquisition and preservation of digital evidence), ISO/IEC 27041:2015 (assurance of investigative methods), NIST SP 800-86 (integrating forensic techniques into incident response), and the SWGDE Best Practices for Digital Evidence."""
-
-    declaration = """I, {{examiner}}, declare that:
-
-1. I am a digital forensic examiner engaged by {{organization}} and have the training, experience and competence to conduct the examination described in this report and to express the opinions contained in it.
-
-2. The evidence described in this report was identified, acquired and preserved using accepted digital forensic practice. Where a forensic image or working copy was made, its integrity was verified by cryptographic hash as recorded in Appendix A.
-
-3. The analysis was performed using the tools and methods described in the Methodology section, and every material step was recorded in the audit trail reproduced in Appendix B.
-
-4. The findings and opinions in this report are based on the evidence examined and are expressed within a reasonable degree of professional certainty. Where a conclusion depends on an assumption, or is limited by the available data, that limitation is stated.
-
-5. Any content produced with the assistance of artificial intelligence is identified as such. No AI-generated statement has been relied upon as a finding unless it was independently verified by me and recorded as a verified finding.
-
-6. I have no interest in the outcome of the matter and no conflict of interest in relation to the parties."""
-
-    methodology = """The following method was applied to the evidence in this case:
-
-1. **Preservation.** Source evidence was acquired without alteration. A SHA-256 hash was calculated at acquisition and recalculated after processing; the values are recorded in Appendix A. Those hash values are the primary means by which the integrity of the evidence can be independently checked.
-
-2. **Processing.** Evidence was parsed at partition and file-system level using read-only libraries (pytsk3) running on a Linux worker. No write operation was performed against source evidence.
-
-3. **Extraction.** File-system metadata, allocated and deleted entries, and file content were extracted and hashed. Extracted data is stored in the case repository, separate from the source evidence.
-
-4. **Analysis.** Extracted artifacts were searched, correlated and reviewed by the examiner. Keyword and semantic indexes were used only to locate material; each cited artifact was opened and reviewed before being relied upon.
-
-5. **Verification.** Findings were reviewed and marked verified by the examiner before inclusion in the Findings and Opinions section. Findings that were not verified are placed in a separate, clearly marked subsection and were not relied upon for any opinion.
-
-6. **Artificial intelligence.** Where used, the locally hosted AI assistant was applied only to summarise or locate material (triage assistance). Its output is unverified by design and is identified as such in this report. No external or cloud AI service was used.
-
-All times are expressed in UTC unless stated otherwise. The examination environment and tool versions are recorded in the audit trail."""
-
-    certification = """I certify that:
-
-1. The contents of this report are true and accurate to the best of my knowledge, information and belief.
-
-2. This report has been prepared in accordance with accepted digital forensic practice and the standards referred to in the Authority, Scope and Purpose section.
-
-3. This report, together with its appendices, is a complete and accurate record of the examination carried out, and no material fact known to me has been withheld.
-
-4. The evidence referred to in this report has been preserved and remains available for independent examination, subject to any lawful direction of the court.
-
-This report is issued under my hand. The signed original is the authoritative version; electronic copies are uncontrolled once distributed."""
-
     limitations = """1. **Scope.** This report addresses only the evidence items listed in the Evidence Inventory and the questions recorded in the case file. It does not address any other device, account or data source.
 
 2. **Preservation limits.** Deleted, encrypted or damaged data, data in unallocated space, and data held by third-party or cloud providers may be partly or wholly unrecoverable. The absence of an artifact from this report is not proof that it never existed.
@@ -240,7 +192,7 @@ This report is issued under my hand. The signed original is the authoritative ve
     signature_lines = [
         "Examiner signature: ______________________________________",
         "Name: {{examiner}}",
-        "Designation: Digital Forensic Examiner, {{organization}}",
+        "Designation: ____________________________________________",
         "Place: __________________________________________________",
         "Date (UTC): {{generated_date}}",
         "",
@@ -252,7 +204,7 @@ This report is issued under my hand. The signed original is the authoritative ve
 
     return ReportTemplate(
         template_id=BUILTIN_DEFAULT_ID,
-        name="Court-Admissible Forensic Report (default)",
+        name="Court-Oriented Forensic Report (default)",
         description=(
             "Default court-oriented template with authority and scope, examiner "
             "declaration, methodology and standards, evidence integrity hashes, "
@@ -279,14 +231,50 @@ This report is issued under my hand. The signed original is the authoritative ve
             "integrity",
             "audit_trail",
         ],
-        authority=authority,
-        methodology=methodology,
-        declaration=declaration,
-        certification=certification,
+        authority="Authority and scope are not recorded in this template; verify them against the case file.",
+        methodology="Review the recorded examination jobs. Actual methods, tool versions, settings and deviations require investigator documentation and verification.",
+        declaration="Examiner qualifications, independence and declaration: not recorded; supply and review separately.",
+        certification="Investigator and reviewer: verify this report and complete any required declaration before signing.",
         limitations=limitations,
         signature_lines=signature_lines,
         builtin=True,
     )
+
+
+def get_builtin_templates() -> list[ReportTemplate]:
+    """Return focused layouts using recorded data, not assumed examination facts."""
+    base = get_default_template()
+    common = dict(
+        authority=("Authority, instructions and scope: not recorded in this template. "
+                   "The investigator must document and verify them against the case file."),
+        methodology=("Review the recorded examination jobs and their results below. "
+                     "Actual methods, tool versions, settings and deviations must be "
+                     "documented and independently checked by the investigator."),
+        declaration="Examiner qualifications, independence and declaration: not recorded; supply and review separately.",
+        certification="Investigator and reviewer: verify this report and complete any required declaration before signing.",
+        limitations=("This report reflects only records available to IDFA and the selected sections. "
+                     "Missing records are not evidence that an event did not occur. "
+                     "Application logs do not establish a complete physical chain of custody. "
+                     "AI-assisted material requires independent verification. Investigator and legal "
+                     "review is required under the applicable jurisdiction's rules; admissibility "
+                     "and weight are determined by the court, not guaranteed by this template."),
+        signature_lines=["Examiner signature: __________________________", "Name: __________________________",
+                         "Date: __________________________", "Reviewer signature: __________________________"],
+    )
+    layouts = [
+        (BUILTIN_EXTRA_IDS[0], "Forensic Examination", "Forensic Examination Report",
+         "Examination-focused layout with recorded jobs, artifacts and findings.",
+         ["cover", "authority_scope", "case_summary", "methodology", "evidence", "examinations", "artifacts", "findings", "limitations", "certification", "integrity", "audit_trail"]),
+        (BUILTIN_EXTRA_IDS[1], "Evidence and Custody", "Evidence and Custody Report",
+         "Evidence inventory, recorded hashes and application audit history; not a complete custody record.",
+         ["cover", "authority_scope", "case_summary", "evidence", "integrity", "audit_trail", "limitations", "certification"]),
+        (BUILTIN_EXTRA_IDS[2], "Expert Findings", "Expert Findings Report",
+         "Finding-oriented layout separating verified and unverified entries with linked evidence.",
+         ["cover", "authority_scope", "examiner_declaration", "case_summary", "evidence", "examinations", "findings", "limitations", "certification", "integrity"]),
+    ]
+    return [base, *(replace(base, template_id=tid, name=name, report_type=report_type,
+                            description=description, sections=sections, **common)
+                    for tid, name, report_type, description, sections in layouts)]
 
 
 def build_context(
@@ -370,9 +358,9 @@ def template_from_dict(data: dict[str, Any], source_path: str | None = None) -> 
     template_id = str(data.get("template_id") or _slugify(name)).strip()
     if not template_id:
         template_id = _slugify(name)
-    if template_id == BUILTIN_DEFAULT_ID:
+    if template_id in BUILTIN_IDS:
         raise TemplateError(
-            f"Template id '{BUILTIN_DEFAULT_ID}' is reserved for the built-in default template."
+            f"Template id '{template_id}' is reserved for a built-in template."
         )
 
     def text_field(key: str, fallback: str) -> str:
@@ -588,7 +576,7 @@ def _template_from_narrative(path: Path, narrative: str) -> ReportTemplate:
     sections.insert(sections.index(anchor) + 1, "narrative")
     suffix = path.suffix.lower().lstrip(".").upper()
     template_id = _slugify(path.stem)
-    if template_id == BUILTIN_DEFAULT_ID:
+    if template_id in BUILTIN_IDS:
         template_id = f"custom-{template_id}"
     template = ReportTemplate(
         template_id=template_id,
@@ -674,7 +662,7 @@ class TemplateStore:
         self.directory.mkdir(parents=True, exist_ok=True)
 
     def list_templates(self) -> list[ReportTemplate]:
-        templates = [get_default_template()]
+        templates = get_builtin_templates()
         if self.directory.is_dir():
             for path in sorted(self.directory.glob("*.json")):
                 try:
@@ -682,7 +670,7 @@ class TemplateStore:
                 except TemplateError:
                     # A broken upload must not break the reports page.
                     continue
-                if template.template_id == BUILTIN_DEFAULT_ID:
+                if template.template_id in BUILTIN_IDS:
                     continue
                 templates.append(template)
         return templates
@@ -710,11 +698,14 @@ class TemplateStore:
         return stored
 
     def delete_template(self, template_id: str) -> bool:
-        if template_id == BUILTIN_DEFAULT_ID:
-            raise TemplateError("The built-in default template cannot be deleted.")
+        if template_id in BUILTIN_IDS:
+            raise TemplateError("Built-in templates cannot be deleted.")
         if not self.directory.is_dir():
             return False
         for path in self.directory.glob("*.json"):
+            # Never follow a template-file symlink outside the managed directory.
+            if path.is_symlink() or path.resolve().parent != self.directory.resolve():
+                continue
             try:
                 template = load_template_file(path)
             except TemplateError:
@@ -734,7 +725,7 @@ class TemplateStore:
         if template.builtin:
             # An exported default becomes an editable copy: the reserved
             # built-in id must not be reused when the copy is uploaded again.
-            data["template_id"] = "custom-court-admissible"
+            data["template_id"] = f"custom-{template.template_id}"
             data["name"] = f"{template.name} (copy)"
         data["notes"] = [
             "IDFA report template. Edit the text, then upload this file on the "

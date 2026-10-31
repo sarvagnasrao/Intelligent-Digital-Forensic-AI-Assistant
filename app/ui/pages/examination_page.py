@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -114,7 +115,7 @@ class JobTableModel(QStandardItemModel):
             if job.status == JobStatus.RUNNING:
                 status_item.setForeground(
                     Color.WARNING if display_status in ("paused", "cancelling")
-                    else Color.PRIMARY
+                    else Color.TEXT_PRIMARY
                 )
             elif job.status == JobStatus.COMPLETED:
                 status_item.setForeground(Color.SUCCESS)
@@ -184,6 +185,7 @@ class ExaminationPage(ResponsivePage):
         self.evidence_service: EvidenceService | None = None
         self._selected_job: ExaminationJob | None = None
         self._evidence_list: list[Evidence] = []
+        self._evidence_load_failed = False
         # ORM jobs in the same order as the jobs table rows.
         self._jobs: list[ExaminationJob] = []
         self._starting = False
@@ -196,7 +198,15 @@ class ExaminationPage(ResponsivePage):
         self.start_finished.connect(self._finish_start)
 
     def _setup_layout(self):
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(self.scroll_area)
+        content = QWidget()
+        self.scroll_area.setWidget(content)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.LG)
 
@@ -251,28 +261,28 @@ class ExaminationPage(ResponsivePage):
         self.jobs_table.verticalHeader().setVisible(False)
         jobs_header = self.jobs_table.horizontalHeader()
         jobs_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        jobs_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # Keep the evidence column readable at narrow widths; the table can
+        # scroll horizontally rather than compressing its header to one letter.
+        jobs_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         jobs_header.setStretchLastSection(True)
         self.jobs_table.selectionModel().selectionChanged.connect(self._on_job_selected)
         self.jobs_table.setMinimumHeight(190)
         layout.addWidget(self.jobs_table, 3)
 
         # Action buttons
-        btn_row = QHBoxLayout()
+        btn_row = QGridLayout()
         
         self.new_job_btn = QPushButton("Choose examination and start")
         self.new_job_btn.setToolTip(
             "Choose an examination for the selected verified evidence and start it."
         )
         self.new_job_btn.clicked.connect(self._on_new_job)
-        btn_row.addWidget(self.new_job_btn)
 
         self.start_btn = QPushButton("Retry selected job")
         self.start_btn.setToolTip(
             "Run the selected pending or failed job on the forensic worker."
         )
         self.start_btn.clicked.connect(self._on_start)
-        btn_row.addWidget(self.start_btn)
 
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setProperty("secondary", True)
@@ -281,7 +291,6 @@ class ExaminationPage(ResponsivePage):
         )
         self.pause_btn.clicked.connect(self._on_pause_resume)
         self.pause_btn.setEnabled(False)
-        btn_row.addWidget(self.pause_btn)
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setProperty("secondary", True)
@@ -291,7 +300,6 @@ class ExaminationPage(ResponsivePage):
         )
         self.cancel_btn.clicked.connect(self._on_cancel)
         self.cancel_btn.setEnabled(False)
-        btn_row.addWidget(self.cancel_btn)
 
         self.delete_job_btn = QPushButton("Delete Job")
         self.delete_job_btn.setProperty("secondary", True)
@@ -300,15 +308,16 @@ class ExaminationPage(ResponsivePage):
         )
         self.delete_job_btn.clicked.connect(self._on_delete_job)
         self.delete_job_btn.setEnabled(False)
-        btn_row.addWidget(self.delete_job_btn)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setProperty("secondary", True)
         self.refresh_btn.setToolTip("Reload evidence and jobs for this case.")
         self.refresh_btn.clicked.connect(self.refresh)
-        btn_row.addWidget(self.refresh_btn)
-
-        btn_row.addStretch()
+        self._action_layout = btn_row
+        self._action_buttons = (self.new_job_btn, self.start_btn, self.pause_btn,
+                                self.cancel_btn, self.delete_job_btn, self.refresh_btn)
+        self._action_columns = 0
+        self._reflow_actions(620)
         layout.addLayout(btn_row)
 
         # Results/Log pane
@@ -337,6 +346,29 @@ class ExaminationPage(ResponsivePage):
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(750)
         self._progress_timer.timeout.connect(self._refresh_running_progress)
+
+    def _reflow_actions(self, width: int) -> None:
+        """Wrap actions without changing their identity, order, or enabled state."""
+        widths = [button.sizeHint().width() for button in self._action_buttons]
+        spacing = max(0, self._action_layout.horizontalSpacing())
+        available = max(1, width - 2 * Spacing.LG - 20)
+        columns = 1
+        for candidate in range(len(widths), 1, -1):
+            required = sum(max(widths[i::candidate]) for i in range(candidate))
+            required += spacing * (candidate - 1)
+            if required <= available:
+                columns = candidate
+                break
+        if columns == self._action_columns:
+            return
+        self._action_columns = columns
+        for index, button in enumerate(self._action_buttons):
+            self._action_layout.addWidget(button, index // columns, index % columns)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_action_layout"):
+            self._reflow_actions(event.size().width())
 
     def set_case_context(self, context: CaseContext):
         """Set case scope before or after service injection."""
@@ -387,6 +419,7 @@ class ExaminationPage(ResponsivePage):
         self.evidence_combo.clear()
         self.evidence_model.removeRows(0, self.evidence_model.rowCount())
         self._evidence_list = []
+        self._evidence_load_failed = False
 
         if not self.evidence_service or not self.case_context:
             self.evidence_combo.addItem("No evidence available", None)
@@ -405,6 +438,7 @@ class ExaminationPage(ResponsivePage):
                 if item.status != EvidenceStatus.ARCHIVED
             ]
         except Exception as exc:
+            self._evidence_load_failed = True
             self.evidence_combo.addItem("Evidence could not be loaded", None)
             self.evidence_combo.setEnabled(False)
             self.evidence_combo.blockSignals(False)
@@ -477,6 +511,11 @@ class ExaminationPage(ResponsivePage):
         hint = getattr(self, "selector_hint", None)
         if hint is None:
             return
+        if getattr(self, "_evidence_load_failed", False):
+            hint.setText(
+                "Evidence could not be loaded. Check the examination log and refresh."
+            )
+            return
         evidence_list = getattr(self, "_evidence_list", [])
         if not evidence_list:
             hint.setText(
@@ -517,6 +556,9 @@ class ExaminationPage(ResponsivePage):
         index = self.evidence_combo.findData(evidence_pk)
         if index >= 0:
             self.evidence_combo.setCurrentIndex(index)
+            # The combo may not trigger a refresh when the examination service
+            # is unavailable, or when this item was already selected.
+            self.evidence_table.selectRow(index - 1)
 
     def _supported_operations(self) -> list[dict]:
         """Operations offered by the page, falling back to the enum."""
@@ -590,6 +632,8 @@ class ExaminationPage(ResponsivePage):
             return
         self._selected_job = None
         self._update_buttons()
+        self.results_log.clear()
+        self.results_summary.clear()
 
     def _update_buttons(self):
         job = self._selected_job
@@ -633,7 +677,7 @@ class ExaminationPage(ResponsivePage):
             if paused else
             "Pause a running examination at its next safe checkpoint."
         )
-        self.pause_btn.setEnabled(running and not pausing)
+        self.pause_btn.setEnabled(running and not pausing and not cancelling)
         self.delete_job_btn.setEnabled(
             not self._starting
             and not (self._delete_thread and self._delete_thread.isRunning())
@@ -661,6 +705,8 @@ class ExaminationPage(ResponsivePage):
         if not indexes:
             self._selected_job = None
             self._update_buttons()
+            self.results_log.clear()
+            self.results_summary.clear()
             return
         if len(indexes) > 1:
             self._selected_job = None
@@ -862,12 +908,14 @@ class ExaminationPage(ResponsivePage):
             job = self.exam_service.get_job_by_job_id(self._active_job_id)
             if not job:
                 return
-            percent = min(99, max(0, int(job.progress_percent or 0)))
+            running = job.status == JobStatus.RUNNING
+            percent = min(99 if running else 100, max(0, int(job.progress_percent or 0)))
             message = job.progress_message or "Examining evidence"
             elapsed_text, eta_text = _job_time_text(job, now)
             self.operation_progress.setValue(percent)
+            prefix = "~" if running else ""
             self.operation_progress.setFormat(
-                f"~{percent}%  ·  Elapsed {elapsed_text}  ·  ETA {eta_text}  —  {message}"
+                f"{prefix}{percent}%  ·  Elapsed {elapsed_text}  ·  ETA {eta_text}  —  {message}"
             )
             for row, listed_job in enumerate(self._jobs):
                 if listed_job.job_id == self._active_job_id:
@@ -880,10 +928,10 @@ class ExaminationPage(ResponsivePage):
                         ) else _enum_text(job.status)
                     )
                     self.jobs_model.item(row, 3).setText(display_status)
-                    self.jobs_model.item(row, 4).setText(f"~{percent}%")
+                    self.jobs_model.item(row, 4).setText(f"{prefix}{percent}%")
                     self.jobs_model.item(row, 3).setForeground(
                         Color.WARNING if display_status in ("paused", "cancelling")
-                        else Color.PRIMARY
+                        else Color.TEXT_PRIMARY
                     )
                     break
             if message != getattr(self, "_last_progress_message", None):
@@ -899,15 +947,8 @@ class ExaminationPage(ResponsivePage):
         if not self.exam_service:
             return
 
-        # Prefer the live worker job to a stale/table selection, especially
-        # while the examination has just started and the row is being refreshed.
-        job = None
-        if self._active_job_id:
-            active = self.exam_service.get_job_by_job_id(self._active_job_id)
-            if active is not None and active.status == JobStatus.RUNNING:
-                job = active
-        if job is None:
-            job = self._selected_job
+        # Actions must apply to the selected row, not another active job.
+        job = self._selected_job
         if job is None:
             return
 
@@ -1007,7 +1048,7 @@ class ExaminationPage(ResponsivePage):
         from app.ui import qt_threads
         from app.ui.deletion_worker import DeletionWorker
 
-        self._delete_thread = DeletionWorker("examination_batch", [job.id for job in selected], 1)
+        self._delete_thread = DeletionWorker("examination_batch", [job.id for job in selected], user.id)
         qt_threads.track(self._delete_thread)
         self.delete_job_btn.setEnabled(False)
         self.delete_job_btn.setText("Deleting…")
@@ -1156,6 +1197,7 @@ class NewExamJobDialog(QDialog):
         self.form_content = QWidget()
         form_layout = QFormLayout(self.form_content)
         form_layout.setSpacing(Spacing.MD)
+        form_layout.setVerticalSpacing(Spacing.SM)
         form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         form_layout.setContentsMargins(0, 0, 0, 0)
         self.form_scroll.setWidget(self.form_content)
@@ -1295,8 +1337,17 @@ class NewExamJobDialog(QDialog):
     def _apply_profile(self, *_args):
         """Fill the advanced controls from the selected preset."""
         profile_key = self.profile_combo.currentData() or DEFAULT_PROFILE
-        profile = PROFILES.get(profile_key) or PROFILES[DEFAULT_PROFILE]
-        self.profile_description.setText(profile.description)
+        if profile_key == "deep":
+            description = (
+                "Standard extraction plus SQLite table and row text. Embedded PDF "
+                "text is extracted when available; scans and media are not transcribed."
+            )
+        else:
+            description = (
+                "Standard extraction: inventory discovered entries, hash readable files, "
+                "and retain supported text. Fast and Balanced have the same coverage."
+            )
+        self.profile_description.setText(description)
         params = profile_parameters(profile_key)
 
         self.deep_extraction.setChecked(bool(params["deep_extraction"]))

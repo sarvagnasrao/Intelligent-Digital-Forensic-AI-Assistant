@@ -14,6 +14,7 @@ from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -27,10 +28,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QLayout,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -80,6 +83,7 @@ class ReportTableModel(QStandardItemModel):
             ]
             for item in row:
                 item.setEditable(False)
+                item.setToolTip(item.text())
             if report.error_message:
                 row[3].setToolTip(report.error_message)
             self.appendRow(row)
@@ -110,6 +114,23 @@ def _clear_layout(layout) -> None:
         widget = item.widget()
         if widget is not None:
             widget.deleteLater()
+
+
+class _SectionLabel(QLabel):
+    """A wrapping checkbox label that remains clickable."""
+
+    def __init__(self, text: str, checkbox: QCheckBox):
+        super().__init__(text)
+        self.checkbox = checkbox
+        self.setWordWrap(True)
+        self.setMinimumWidth(0)
+        self.setBuddy(checkbox)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self.rect().contains(event.position().toPoint())):
+            self.checkbox.click()
+        super().mouseReleaseEvent(event)
 
 
 class ReportGenerateDialog(QDialog):
@@ -150,6 +171,10 @@ class ReportGenerateDialog(QDialog):
 
         template_row = QHBoxLayout()
         self.template_combo = QComboBox()
+        self.template_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.template_combo.setMinimumContentsLength(10)
         self.template_combo.setToolTip(
             "Choose a layout and review its sections. Admissibility is not guaranteed; "
             "investigator and legal review under applicable jurisdiction rules is required."
@@ -165,6 +190,7 @@ class ReportGenerateDialog(QDialog):
 
         self.template_info = QLabel()
         self.template_info.setWordWrap(True)
+        self.template_info.setMinimumWidth(0)
         self.template_info.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
         layout.addWidget(self.template_info)
 
@@ -172,6 +198,7 @@ class ReportGenerateDialog(QDialog):
         group_layout = QVBoxLayout(self.sections_group)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(0)
         scroll.setMinimumHeight(190)
         self.sections_host = QWidget()
         self.sections_layout = QVBoxLayout(self.sections_host)
@@ -186,6 +213,7 @@ class ReportGenerateDialog(QDialog):
             "keeps a copy in the case data folder so the same layout can be reused."
         )
         note.setWordWrap(True)
+        note.setMinimumWidth(0)
         note.setStyleSheet(f"color: {Color.TEXT_MUTED.name()};")
         layout.addWidget(note)
 
@@ -238,7 +266,9 @@ class ReportGenerateDialog(QDialog):
         self.sections = {}
         for key in template.sections:
             label = SECTION_LABELS.get(key, key)
-            checkbox = QCheckBox(label)
+            checkbox = QCheckBox()
+            checkbox.setAccessibleName(label)
+            checkbox.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             checkbox.setChecked(True)
             if key == "cover":
                 checkbox.setEnabled(False)
@@ -252,7 +282,16 @@ class ReportGenerateDialog(QDialog):
                     "The certification and signature page carries the examiner's declaration."
                 )
             self.sections[key] = checkbox
-            self.sections_layout.addWidget(checkbox)
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            row_layout.addWidget(checkbox, 0, Qt.AlignmentFlag.AlignTop)
+            section_label = _SectionLabel(label, checkbox)
+            section_label.setEnabled(checkbox.isEnabled())
+            section_label.setToolTip(checkbox.toolTip())
+            row_layout.addWidget(section_label, 1)
+            self.sections_layout.addWidget(row)
         self.sections_layout.addStretch()
 
     def _on_upload_template(self) -> None:
@@ -328,14 +367,17 @@ class ReportTemplatesDialog(QDialog):
             "admissibility is not guaranteed. Placeholders such as {{case_id}} are filled in automatically."
         )
         intro.setWordWrap(True)
+        intro.setMinimumWidth(0)
         intro.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
         layout.addWidget(intro)
 
-        body = QHBoxLayout()
+        body = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.body_layout = body
         body.setSpacing(Spacing.MD)
 
         left = QVBoxLayout()
         self.template_list = QListWidget()
+        self.template_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.template_list.setAlternatingRowColors(True)
         self.template_list.currentItemChanged.connect(self._on_selection_changed)
         left.addWidget(self.template_list, 1)
@@ -360,6 +402,8 @@ class ReportTemplatesDialog(QDialog):
         body.addLayout(left, 1)
 
         details_group = QGroupBox("Template details")
+        details_group.setMinimumWidth(0)
+        details_group.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         details_layout = QVBoxLayout(details_group)
         details_scroll = QScrollArea()
         details_scroll.setWidgetResizable(True)
@@ -385,6 +429,13 @@ class ReportTemplatesDialog(QDialog):
         layout.addWidget(buttons)
 
         self._refresh(selected_template_id)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self.body_layout.setDirection(
+            QBoxLayout.Direction.TopToBottom
+            if self.width() < 800 else QBoxLayout.Direction.LeftToRight
+        )
 
     # --------------------------------------------------------------- helpers
     def _refresh(self, selected_template_id: str = "") -> None:
@@ -608,17 +659,22 @@ class ReportsPage(ResponsivePage):
 
     def _setup_layout(self):
         layout = QVBoxLayout(self)
+        # Wide rows must not impose a window minimum before resizeEvent can
+        # switch them to their narrow arrangement.
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.MD)
 
-        header_row = QHBoxLayout()
+        self.header_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        header_row = self.header_row
         title = QLabel("Reports")
         title.setProperty("pageTitle", True)
         title.setFont(QFont(
             Typography.FONT_FAMILY, Typography.HEADING_LG[0], Typography.HEADING_LG[1]
         ))
         header_row.addWidget(title)
-        header_row.addStretch()
+
+        self.header_actions = QBoxLayout(QBoxLayout.Direction.LeftToRight)
 
         self.templates_btn = QPushButton("Report Templates")
         self.templates_btn.setProperty("secondary", True)
@@ -626,11 +682,13 @@ class ReportsPage(ResponsivePage):
             "Choose, upload, inspect or export a court-oriented report template."
         )
         self.templates_btn.clicked.connect(self._on_manage_templates)
-        header_row.addWidget(self.templates_btn)
+        self.header_actions.addWidget(self.templates_btn)
 
         self.generate_btn = QPushButton("Generate Report")
         self.generate_btn.clicked.connect(self._on_generate)
-        header_row.addWidget(self.generate_btn)
+        self.header_actions.addWidget(self.generate_btn)
+        header_row.addStretch()
+        header_row.addLayout(self.header_actions)
 
         layout.addLayout(header_row)
 
@@ -665,19 +723,42 @@ class ReportsPage(ResponsivePage):
         self.table_view.doubleClicked.connect(self._on_open)
         layout.addWidget(self.table_view, 1)
 
-        btn_row = QHBoxLayout()
-        self.open_btn = QPushButton("Open")
+        self.btn_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        btn_row = self.btn_row
+        self.open_btn = QPushButton("Open report")
         self.open_btn.setProperty("secondary", True)
         self.open_btn.clicked.connect(self._on_open)
         btn_row.addWidget(self.open_btn)
 
-        self.export_btn = QPushButton("Export")
+        self.export_btn = QPushButton("Export report")
         self.export_btn.setProperty("secondary", True)
         self.export_btn.clicked.connect(self._on_export)
         btn_row.addWidget(self.export_btn)
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
+        self.table_view.selectionModel().selectionChanged.connect(self._update_report_actions)
+        self._update_report_actions()
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        width = event.size().width()
+        self.header_row.setDirection(
+            QBoxLayout.Direction.TopToBottom if width < 600
+            else QBoxLayout.Direction.LeftToRight
+        )
+        direction = (
+            QBoxLayout.Direction.TopToBottom if width < 380
+            else QBoxLayout.Direction.LeftToRight
+        )
+        self.header_actions.setDirection(direction)
+        self.btn_row.setDirection(direction)
+
+    def _update_report_actions(self, *_args) -> None:
+        """Only offer report actions when a report is selected."""
+        selected = bool(self.table_view.selectionModel().selectedRows())
+        self.open_btn.setEnabled(selected)
+        self.export_btn.setEnabled(selected)
 
     # ------------------------------------------------------------ lifecycle
     def set_case_context(self, context: CaseContext):

@@ -1,18 +1,17 @@
 """Database base and session management."""
 from __future__ import annotations
 
-from contextlib import contextmanager
 import logging
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db.base import Base
 from app.config import get_config
-
+from app.db.base import Base
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
@@ -95,6 +94,12 @@ def session_scope() -> Generator[Session, None, None]:
 def init_db() -> None:
     """Initialize database - create all tables."""
     Base.metadata.create_all(bind=get_engine())
+    try:
+        _ensure_model_indexes()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Could not reconcile model indexes", exc_info=True
+        )
     # create_all only creates missing tables; it never adds columns to a table
     # that already exists, so a database from an earlier build keeps its old
     # columns. Reconcile the few columns added since the initial schema.
@@ -103,6 +108,12 @@ def init_db() -> None:
     except Exception:
         logging.getLogger(__name__).warning(
             "Could not reconcile database columns", exc_info=True
+        )
+    try:
+        _ensure_deletion_indexes()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Could not reconcile evidence cleanup indexes", exc_info=True
         )
     # The FTS table lives outside the SQLAlchemy metadata (it is a virtual
     # table), and the migration that creates it never installed triggers or
@@ -158,6 +169,52 @@ def _ensure_columns() -> None:
             if missing:
                 logging.getLogger(__name__).info(
                     "Added %s columns: %s", table, ", ".join(name for name, _ in missing)
+                )
+
+
+def _ensure_deletion_indexes() -> None:
+    """Repair indexes missing from older databases used by artifact cleanup."""
+    from sqlalchemy import inspect, text
+
+    engine = get_engine()
+    if engine.dialect.name != "sqlite":
+        return
+    indexes = (
+        ("ix_entities_artifact_id", "entities", "artifact_id"),
+        ("ix_timeline_events_artifact_id", "timeline_events", "artifact_id"),
+        ("ix_timeline_events_entity_id", "timeline_events", "entity_id"),
+        ("ix_finding_artifact_links_artifact_id", "finding_artifact_links", "artifact_id"),
+        ("ix_artifacts_evidence_id", "artifacts", "evidence_id"),
+        ("ix_artifacts_examination_job_id", "artifacts", "examination_job_id"),
+    )
+    tables = set(inspect(engine).get_table_names())
+    with engine.begin() as connection:
+        for name, table, column in indexes:
+            if table in tables:
+                connection.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+
+
+def _ensure_model_indexes() -> None:
+    """Create metadata indexes missing from tables in older SQLite databases.
+
+    ``MetaData.create_all`` skips indexes when their table already exists. As
+    a result, an application startup could stamp a newly-added migration as
+    current without actually installing that revision's indexes. ``checkfirst``
+    makes this safe for fresh databases and repeated startups.
+    """
+    engine = get_engine()
+    if engine.dialect.name != "sqlite":
+        return
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            try:
+                index.create(bind=engine, checkfirst=True)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Could not create index %s on %s",
+                    index.name,
+                    table.name,
+                    exc_info=True,
                 )
 
 

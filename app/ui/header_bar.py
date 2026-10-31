@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -39,7 +41,7 @@ class AppHeaderBar(ThemedWidget, QWidget):
         self.setFixedHeight(60)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
-        self._notifications: list[dict[str, str]] = []
+        self._notifications: list[dict] = []
         self._bell_menu: QMenu | None = None
         self._user_menu: QMenu | None = None
         self._current_user = None
@@ -359,6 +361,7 @@ class AppHeaderBar(ThemedWidget, QWidget):
         title: str,
         message: str = "",
         level: str = "info",
+        on_click: Callable[[], None] | None = None,
     ) -> None:
         """Add a notification and update the unread-count badge."""
         self._notifications.insert(
@@ -367,6 +370,7 @@ class AppHeaderBar(ThemedWidget, QWidget):
                 "title": str(title),
                 "message": str(message),
                 "level": str(level),
+                "on_click": on_click,
             },
         )
         self._rebuild_bell_menu()
@@ -429,7 +433,11 @@ class AppHeaderBar(ThemedWidget, QWidget):
                 text += f"\n{message}"
 
             action = QAction(text, self)
-            action.setEnabled(False)
+            callback = notification.get("on_click")
+            action.setEnabled(callback is not None)
+            if callback is not None:
+                action.setToolTip("Open related item")
+                action.triggered.connect(lambda checked=False, fn=callback: fn())
             self._bell_menu.addAction(action)
 
         self._bell_menu.addSeparator()

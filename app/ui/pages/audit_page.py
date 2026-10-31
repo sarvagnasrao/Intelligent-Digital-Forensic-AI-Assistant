@@ -10,6 +10,7 @@ from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QBoxLayout,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -241,6 +243,7 @@ class RecordCustodyDialog(QDialog):
 
 
 class AuditPage(ResponsivePage):
+    RECORD_LIMIT = 10000
     DATE_PRESETS = (
         ("Any time", "any"), ("Today", "today"), ("Last 7 days", "last7"),
         ("Last 30 days", "last30"), ("Last 90 days", "last90"),
@@ -257,52 +260,70 @@ class AuditPage(ResponsivePage):
 
     def _setup_layout(self):
         layout = QVBoxLayout(self)
+        # The filter row reflows on resize; do not let its wide layout impose a
+        # temporary minimum width that prevents the resize from reaching it.
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.MD)
 
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(Spacing.SM)
+        self.filter_row = QBoxLayout(QBoxLayout.Direction.TopToBottom)
+        self.filter_row.setSpacing(Spacing.SM)
+        type_result_row = QHBoxLayout()
+        type_result_row.setSpacing(Spacing.SM)
         self.type_filter = QComboBox()
         self.type_filter.addItem("All Types")
         self.type_filter.setMinimumWidth(130)
-        filter_row.addWidget(QLabel("Type:"))
-        filter_row.addWidget(self.type_filter)
+        type_result_row.addWidget(QLabel("Type:"))
+        type_result_row.addWidget(self.type_filter)
 
         self.result_filter = QComboBox()
         self.result_filter.addItems(["All Results", "success", "failure", "partial"])
         self.result_filter.setMinimumWidth(130)
-        filter_row.addWidget(QLabel("Result:"))
-        filter_row.addWidget(self.result_filter)
+        type_result_row.addWidget(QLabel("Result:"))
+        type_result_row.addWidget(self.result_filter)
+        type_result_row.addStretch(1)
+        self.filter_row.addLayout(type_result_row)
+
+        user_date_row = QHBoxLayout()
+        user_date_row.setSpacing(Spacing.SM)
 
         self.user_filter = QLineEdit()
         self.user_filter.setPlaceholderText("Filter by user…")
         self.user_filter.setMinimumWidth(150)
-        filter_row.addWidget(self.user_filter, 1)
+        user_date_row.addWidget(self.user_filter, 1)
 
         self.date_preset = QComboBox()
         for label, key in self.DATE_PRESETS:
             self.date_preset.addItem(label, key)
         self.date_preset.setMinimumWidth(145)
-        filter_row.addWidget(QLabel("Date:"))
-        filter_row.addWidget(self.date_preset)
+        user_date_row.addWidget(QLabel("Date:"))
+        user_date_row.addWidget(self.date_preset)
+        self.filter_row.addLayout(user_date_row, 1)
+
+        layout.addLayout(self.filter_row)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(Spacing.SM)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
-        filter_row.addWidget(self.refresh_btn)
+        action_row.addWidget(self.refresh_btn)
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.setProperty("ghost", True)
         self.reset_btn.clicked.connect(self._reset_filters)
-        filter_row.addWidget(self.reset_btn)
+        action_row.addWidget(self.reset_btn)
         self.record_custody_btn = QPushButton("Record Custody Event")
         self.record_custody_btn.setProperty("secondary", True)
         self.record_custody_btn.setVisible(False)
         self.record_custody_btn.clicked.connect(self._record_custody_event)
-        filter_row.addWidget(self.record_custody_btn)
+        action_row.addWidget(self.record_custody_btn)
+        action_row.addStretch(1)
         self.export_btn = QPushButton("Export…")
+        self.export_btn.setToolTip("Export the displayed records in the current tab, after filtering.")
         self.export_btn.setProperty("secondary", True)
         self.export_btn.clicked.connect(self._export_current)
-        filter_row.addWidget(self.export_btn)
-        layout.addLayout(filter_row)
+        action_row.addWidget(self.export_btn)
+        layout.addLayout(action_row)
 
         self.custom_range = QWidget()
         date_row = QHBoxLayout(self.custom_range)
@@ -326,6 +347,7 @@ class AuditPage(ResponsivePage):
 
         self.count_label = QLabel("No events loaded")
         self.count_label.setProperty("caption", True)
+        self.count_label.setWordWrap(True)
         layout.addWidget(self.count_label)
 
         self.tabs = QTabWidget()
@@ -352,6 +374,13 @@ class AuditPage(ResponsivePage):
         self.date_from.dateChanged.connect(self._apply_filters)
         self.date_to.dateChanged.connect(self._apply_filters)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.filter_row.setDirection(
+            QBoxLayout.Direction.LeftToRight if event.size().width() >= 800
+            else QBoxLayout.Direction.TopToBottom
+        )
 
     @staticmethod
     def _make_table(model_type):
@@ -414,10 +443,10 @@ class AuditPage(ResponsivePage):
             # Evidence/Examination services in other sessions are visible.
             self.audit_service.session.rollback()
             self._all_audit_events = self.audit_service.get_case_audit_events(
-                self.case_context.case_id, limit=10000
+                self.case_context.case_id, limit=self.RECORD_LIMIT
             )
             self._all_custody_events = self.audit_service.get_case_custody_events(
-                self.case_context.case_id, limit=10000
+                self.case_context.case_id, limit=self.RECORD_LIMIT
             )
         except Exception as exc:
             try:
@@ -517,15 +546,18 @@ class AuditPage(ResponsivePage):
         if self.tabs.currentIndex() == 0:
             count = self.audit_table.model().rowCount()
             total = len(self._all_audit_events)
-            self.count_label.setText(
-                f"{count} of {total} audit events" if total else "No audit events recorded for this case yet"
-            )
+            name = "audit events"
         else:
             count = self.custody_table.model().rowCount()
             total = len(self._all_custody_events)
-            self.count_label.setText(
-                f"{count} of {total} chain-of-custody records" if total else "No chain-of-custody events recorded for this case yet"
-            )
+            name = "chain-of-custody records"
+        text = f"Showing {count} of {total} loaded {name}. Export includes only displayed records."
+        text += f" Up to the newest {self.RECORD_LIMIT:,} records are loaded per tab before filtering."
+        if total >= self.RECORD_LIMIT:
+            text += " Load limit reached; older records may be omitted from display and export."
+        if self.tabs.currentIndex() == 1:
+            text += " Type and result filters apply only to the audit trail."
+        self.count_label.setText(text)
 
     def _on_tab_changed(self, index: int):
         self.type_filter.setEnabled(index == 0)
@@ -662,7 +694,7 @@ class AuditPage(ResponsivePage):
                     "request_id": event.request_id,
                 })
         if not rows:
-            QMessageBox.information(self, "Nothing to export", "There are no records to export for this case.")
+            QMessageBox.information(self, "Nothing to export", "No records are displayed in this tab. Adjust the filters or refresh to check for records.")
             return
         case_tag = self.case_context.case_id_str or f"case-{self.case_context.case_id}"
         path, selected_filter = QFileDialog.getSaveFileName(

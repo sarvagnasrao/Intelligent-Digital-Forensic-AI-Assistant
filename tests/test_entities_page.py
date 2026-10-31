@@ -86,24 +86,34 @@ def service(session, config_home, data_dir):
 
 
 @pytest.fixture
-def page(qt_app, service, seeded):
+def page(qt_app, service, seeded, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox, QWidget
+
     from app.ui.base import CaseContext
     from app.ui.pages.entities_timeline_page import EntitiesTimelinePage
 
-    case, _user, _evidence, _exam = seeded
-    widget = EntitiesTimelinePage()
+    case, user, _evidence, _exam = seeded
+    shell = QWidget()
+    shell.get_current_user = lambda: user
+    widget = EntitiesTimelinePage(shell)
+
+    def unexpected_error(_parent, title, message):
+        pytest.fail(f"Unexpected dialog: {title}: {message}")
+
+    monkeypatch.setattr(QMessageBox, "critical", unexpected_error)
     widget.set_analysis_service(service)
     widget.set_case_context(
         CaseContext(case.id, case.case_id, case.title, "open", "medium", "T")
     )
     yield widget
     widget.deleteLater()
+    shell.deleteLater()
 
 
 def analyse(service, seeded) -> None:
-    case, _user, evidence, exam = seeded
-    job = service.enqueue_for_examination(case.id, evidence.id, exam.id)
-    asyncio.run(service.run(job.id))
+    case, user, evidence, exam = seeded
+    job = service.enqueue_for_examination(case.id, evidence.id, exam.id, created_by=user)
+    asyncio.run(service.run(job.id, user))
 
 
 def row_texts(model) -> list[tuple[str, ...]]:
@@ -116,6 +126,7 @@ def row_texts(model) -> list[tuple[str, ...]]:
 def test_an_empty_case_explains_what_will_happen(page):
     assert "No entities yet" in page.entity_summary.text()
     assert "No relationships yet" in page.rel_detail.text()
+    assert page.rel_detail_panel.isHidden()
 
 
 def test_entities_appear_after_analysis(page, service, seeded):
@@ -181,6 +192,31 @@ def test_a_relationship_lists_its_supporting_artifacts(page, service, seeded):
     assert "ART-0001-0001" in detail
     assert "ART-0001-0002" in detail
     assert "rahul@example.org" in detail
+    assert detail.count("rahul@example.org") >= 3  # identifier and both source excerpts
+    assert "/Users/a/chat_1.txt" in detail
+    assert "/Users/a/chat_2.txt" in detail
+    assert "E-1 — disk.img" in detail
+    assert "Evidence ids:" not in detail
+    assert "does not establish identity or ownership" in page.rel_detail.text()
+    assert "confirmation records your review, not identity proof" in page.rel_hint.text()
+
+
+def test_provenance_labels_identify_removed_and_unavailable_sources(page, session, seeded):
+    from app.artifacts.models import Artifact
+
+    _case, _user, evidence, _exam = seeded
+    artifact = session.query(Artifact).first()
+    evidence.removed_at = datetime.now(timezone.utc)
+    session.flush()
+
+    assert page._evidence_labels([evidence.id, 987654, "invalid"]) == [
+        "E-1 — disk.img (removed from case)",
+        "Evidence unavailable in this case",
+        "Evidence unavailable in this case",
+    ]
+    labels = page._artifact_labels([artifact.id, 987654])
+    assert artifact.artifact_id in labels[0]
+    assert labels[1] == "Artifact unavailable in this case"
 
 
 def test_confirming_a_relationship_persists(page, service, seeded):
@@ -195,6 +231,21 @@ def test_confirming_a_relationship_persists(page, service, seeded):
     service.session.expire_all()
     confirmed = service.list_relationships(seeded[0].id, status=None)
     assert any(row.status.value == "confirmed" for row in confirmed)
+
+
+def test_rejecting_a_relationship_persists(page, service, seeded):
+    from app.analysis.models import RelationshipStatus
+
+    analyse(service, seeded)
+    page.refresh()
+    page.rel_table.selectRow(0)
+    relationship_id = page._selected_relationship().id
+
+    page.reject_btn.click()
+
+    service.session.expire_all()
+    rejected = service.list_relationships(seeded[0].id, status=RelationshipStatus.REJECTED)
+    assert any(row.id == relationship_id for row in rejected)
 
 
 def test_the_timeline_shows_local_time(page, service, seeded):
@@ -225,3 +276,43 @@ def test_run_analysis_now_queues_a_missing_job(page, service, seeded):
 
     assert len(service.list_jobs(seeded[0].id)) == 1
     assert "Queued 1" in page.status_detail.text()
+
+
+def test_manual_analysis_works_when_automatic_queue_is_disabled(page, service, seeded):
+    service.config.analysis.auto_queue = False
+    page._on_run_now()
+    assert len(service.list_jobs(seeded[0].id)) == 1
+    assert "Queued 1" in page.status_detail.text()
+
+
+def test_run_analysis_denies_read_only_user(page, service, seeded, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from app.auth.models import UserRole
+
+    user = seeded[1]
+    user.role = UserRole.READ_ONLY
+    service.session.commit()
+    errors = []
+    monkeypatch.setattr(
+        QMessageBox, "critical", lambda _parent, title, message: errors.append((title, message))
+    )
+
+    page._on_run_now()
+
+    assert service.list_jobs(seeded[0].id) == []
+    assert errors
+    assert errors[0][0] == "Could not queue analysis"
+
+
+def test_removed_evidence_is_not_queued_or_shown_in_analysis(page, service, seeded):
+    case, user, evidence, _exam = seeded
+    analyse(service, seeded)
+    evidence.removed_at = datetime.now(timezone.utc)
+    service.session.commit()
+    page.refresh()
+    assert page.entity_model.rowCount() == 0
+    assert page.timeline_model.rowCount() == 0
+    assert page.rel_model.rowCount() == 0
+    assert sum(service.relationship_counts(case.id).values()) == 0
+    assert service.enqueue_missing(case.id, created_by=user, manual=True) == []

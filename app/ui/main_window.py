@@ -6,15 +6,16 @@ import threading
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor, QPen
 from PySide6.QtWidgets import (
     QApplication,
-    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
 )
@@ -118,15 +119,6 @@ class GlobalShell(QWidget):
         self._refresh_nav()
         sidebar_layout.addWidget(self.nav_list, 1)
 
-        # System status at bottom: subtle strip instead of a bright green block.
-        # Scoped by object name so the style cannot leak to other labels.
-        self.status_label = QLabel("●  All systems operational")
-        self.status_label.setObjectName("SystemStatus")
-
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.status_label.setToolTip("All systems operational")
-        sidebar_layout.addWidget(self.status_label)
-
         splitter.addWidget(self.sidebar)
 
         # Pages stack
@@ -178,14 +170,6 @@ class GlobalShell(QWidget):
         self.sidebar.collapsed = collapsed
         self.branding.set_collapsed(collapsed)
         self.nav_list.set_collapsed(collapsed)
-        self.status_label.setText("●" if collapsed else "●  All systems operational")
-        self.status_label.setProperty("collapsed", collapsed)
-        self.status_label.style().unpolish(self.status_label)
-        self.status_label.style().polish(self.status_label)
-        self.status_label.setAlignment(
-            Qt.AlignmentFlag.AlignCenter if collapsed
-            else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
         width = 68 if collapsed else 260
         self._splitter.setSizes([width, max(1, self._splitter.width() - width)])
 
@@ -309,6 +293,42 @@ _CASE_PAGES = (
     ("audit", "Audit & Custody"),
 )
 
+# Groups organize the sidebar only; page keys and stack order remain stable.
+_CASE_GROUPS = (
+    ("Overview", ("overview",), "overview"),
+    ("Evidence", ("evidence", "examination"), "folder"),
+    ("Explore", ("artifacts", "entities"), "search"),
+    ("Investigation", ("ai", "findings"), "ai"),
+    ("Report & History", ("reports", "audit"), "report"),
+)
+
+
+class _CaseNavDelegate(NavItemDelegate):
+    """Indent pages and mark expandable groups without changing their routes."""
+
+    def paint(self, painter, option, index) -> None:
+        view = self.parent()
+        kind, value = view._case_nav_rows[index.row()]
+        collapsed = bool(getattr(view, "_collapsed", False))
+        adjusted = QStyleOptionViewItem(option)
+        if kind == "page" and not collapsed:
+            adjusted.rect.adjust(18, 0, 0, 0)
+        elif kind == "group" and value != "Overview" and not collapsed:
+            adjusted.rect.adjust(0, 0, -20, 0)
+        super().paint(painter, adjusted, index)
+        if kind == "group" and value != "Overview" and not collapsed:
+            painter.save()
+            painter.setPen(QPen(QColor("#94a3b8"), 1.5))
+            x = option.rect.right() - 20
+            y = option.rect.center().y()
+            if view._case_expanded_group == value:
+                painter.drawLine(x - 4, y - 2, x, y + 2)
+                painter.drawLine(x, y + 2, x + 4, y - 2)
+            else:
+                painter.drawLine(x - 2, y - 4, x + 2, y)
+                painter.drawLine(x + 2, y, x - 2, y + 4)
+            painter.restore()
+
 
 class CaseShell(QWidget):
     """Case shell - shown when a case is opened."""
@@ -319,6 +339,8 @@ class CaseShell(QWidget):
         super().__init__(parent)
         self.nav = nav_controller
         self._case_context: CaseContext | None = None
+        self._current_key = "overview"
+        self._expanded_group: str | None = None
         self._setup_ui()
 
     def get_current_user(self) -> User | None:
@@ -363,13 +385,6 @@ class CaseShell(QWidget):
         self.nav_list.clicked.connect(self._on_nav_clicked)
         self._refresh_nav()
         sidebar_layout.addWidget(self.nav_list, 1)
-
-        # Case context info at bottom (scoped by object name)
-        self.context_label = QLabel("No case loaded")
-        self.context_label.setObjectName("CaseContextInfo")
-        self.context_label.setWordWrap(True)
-
-        sidebar_layout.addWidget(self.context_label)
 
         splitter.addWidget(self.sidebar)
 
@@ -416,15 +431,25 @@ class CaseShell(QWidget):
         self.sidebar.collapsed = collapsed
         self.branding.set_collapsed(collapsed)
         self.nav_list.set_collapsed(collapsed)
-        self.context_label.setVisible(not collapsed)
-        self.context_label.setToolTip(self.context_label.text())
         width = 68 if collapsed else 260
         self._splitter.setSizes([width, max(1, self._splitter.width() - width)])
 
     def _on_nav_clicked(self, index):
+        if not index.isValid():
+            return
         row = index.row()
-        if 0 <= row < len(_CASE_PAGES):
-            self.show_page_by_key(_CASE_PAGES[row][0])
+        if not 0 <= row < len(self._nav_rows):
+            return
+        kind, value = self._nav_rows[row]
+        if kind == "group":
+            group = next(group for group in _CASE_GROUPS if group[0] == value)
+            if len(group[1]) == 1:
+                self.show_page_by_key(group[1][0])
+            else:
+                self._expanded_group = None if self._expanded_group == value else value
+                self._refresh_nav()
+        else:
+            self.show_page_by_key(value)
 
     def show_page_by_key(self, key: str) -> None:
         """Switch case page by key, keeping the sidebar selection in sync."""
@@ -433,12 +458,10 @@ class CaseShell(QWidget):
             return
 
         self.pages_stack.setCurrentWidget(page)
-        model = self.nav_list.model
-        if model is not None:
-            for row, (page_key, _title) in enumerate(_CASE_PAGES):
-                if page_key == key:
-                    self.nav_list.setCurrentIndex(model.index(row, 0))
-                    break
+        self._current_key = key
+        group = next(group for group in _CASE_GROUPS if key in group[1])
+        self._expanded_group = group[0] if len(group[1]) > 1 else None
+        self._refresh_nav()
         # Pages that read from the database reload when they are opened, so
         # evidence/jobs created elsewhere show up without pressing Refresh.
         on_shown = getattr(page, "on_page_shown", None)
@@ -453,19 +476,33 @@ class CaseShell(QWidget):
             starter(evidence_pk)
 
     def _refresh_nav(self) -> None:
-        self.nav_list.set_entries([
-            (tr(title), NavItemDelegate.ICONS.get(title, "•"))
-            for _key, title in _CASE_PAGES
-        ])
+        titles = dict(_CASE_PAGES)
+        if not isinstance(self.nav_list.itemDelegate(), _CaseNavDelegate):
+            self.nav_list.setItemDelegate(_CaseNavDelegate(self.nav_list))
+        self._nav_rows = []
+        entries = []
+        for title, keys, icon in _CASE_GROUPS:
+            self._nav_rows.append(("group", title))
+            entries.append((tr("Evidence & Examination" if title == "Evidence" else title), icon))
+            if title == self._expanded_group and len(keys) > 1:
+                for key in keys:
+                    self._nav_rows.append(("page", key))
+                    entries.append((tr(titles[key]), NavItemDelegate.ICONS[titles[key]]))
+        self.nav_list._case_nav_rows = self._nav_rows
+        self.nav_list._case_expanded_group = self._expanded_group
+        self.nav_list.set_entries(entries)
+        active_group = next(title for title, keys, _ in _CASE_GROUPS if self._current_key in keys)
+        for row, (kind, value) in enumerate(self._nav_rows):
+            if (kind == "page" and value == self._current_key) or (
+                kind == "group" and value == active_group and self._expanded_group != value
+            ):
+                self.nav_list.setCurrentIndex(self.nav_list.model.index(row, 0))
+                break
 
     def retranslate(self) -> None:
         """Re-apply the active language to the case shell."""
         self._refresh_nav()
         retranslate_widgets(self)
-        # "No case loaded" is replaced by the context text as soon as a case is
-        # open, so only restore it while there is no case.
-        if getattr(self, "_case_context", None) is None:
-            self.context_label.setText(tr("No case loaded"))
 
     def _edit_current_case(self) -> None:
         """Open the case edit dialog for the case currently loaded."""
@@ -543,11 +580,6 @@ class CaseShell(QWidget):
             context.case_id_str, context.title, context.status,
             context.priority, context.investigator
         )
-        self.context_label.setText(
-            f"Case: {context.case_id_str}\n{context.title}\n"
-            f"Status: {context.status}  |  Priority: {context.priority}"
-        )
-        self.context_label.setToolTip(self.context_label.text())
         # Pass context to all pages
         for page in self._pages_by_key.values():
             if hasattr(page, "set_case_context"):
@@ -564,9 +596,12 @@ class CaseShell(QWidget):
         # Start the analysis queue for this case. It runs one job at a time in
         # the background and waits whenever an examination is running.
         runner = getattr(self, "_analysis_runner", None)
-        if runner is not None and getattr(context, "case_id", 0):
-            runner.set_case(context.case_id)
-            runner.start()
+        if runner is not None:
+            user = self.nav.get_current_user()
+            user_id = getattr(user, "id", None) if user is not None else None
+            runner.set_case(getattr(context, "case_id", None) or None, user_id)
+            if getattr(context, "case_id", 0) and user_id is not None:
+                runner.start()
 
     def _ensure_case_services(self):
         """Create the case-scoped services once and hand them to the pages.
@@ -716,6 +751,9 @@ class NavigationController(QObject):
         self.case_shell.show_page_by_key("overview")
 
     def show_global(self):
+        runner = getattr(self.case_shell, "_analysis_runner", None)
+        if runner is not None:
+            runner.stop()
         self._stack.setCurrentWidget(self.global_shell)
         # The page title already says "Case Management" in the header, sidebar
         # and page body, so the status bar shows a neutral message instead.
@@ -898,7 +936,7 @@ class MainWindow(QMainWindow):
         width = min(1600, int(avail.width() * 0.94))
         height = min(1000, int(avail.height() * 0.94))
 
-        self.setMinimumSize(min(1200, avail.width()), min(760, avail.height()))
+        self.setMinimumSize(min(960, avail.width()), min(600, avail.height()))
         self.resize(width, height)
         self.move(
             avail.x() + (avail.width() - width) // 2,

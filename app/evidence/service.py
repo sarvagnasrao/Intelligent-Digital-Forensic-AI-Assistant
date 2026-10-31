@@ -28,6 +28,7 @@ class EvidenceService:
     def __init__(self, session: Session):
         self.session = session
         self.config = get_config()
+        self._pending_copies: dict[str, list[Path]] = {}
 
     @staticmethod
     def detect_file_type(path: str | Path) -> tuple[EvidenceType, str]:
@@ -96,6 +97,28 @@ class EvidenceService:
         The user may browse to any segment, so normalize .002/.003/etc. back
         to .001 rather than silently registering only the selected fragment.
         """
+        if (re.fullmatch(r".+\.e[a-z][a-z0-9]", path.name, re.IGNORECASE)
+                and any(p.name.casefold() == (path.stem + ".e01").casefold()
+                        for p in path.parent.iterdir())):
+            raise ValueError("EWF segments beyond E99 are not supported")
+        ewf = re.fullmatch(r"(.+)\.e(\d{2})", path.name, re.IGNORECASE)
+        if ewf:
+            stem = ewf.group(1)
+            parts_by_number = {}
+            for candidate in path.parent.iterdir():
+                match = re.fullmatch(re.escape(stem) + r"\.e(\d{2})", candidate.name, re.IGNORECASE)
+                if match and candidate.is_file():
+                    number = int(match.group(1))
+                    if number < 1 or number in parts_by_number:
+                        raise ValueError(f"Ambiguous EWF segment: {candidate.name}")
+                    parts_by_number[number] = candidate
+            if not parts_by_number or sorted(parts_by_number) != list(range(1, max(parts_by_number) + 1)):
+                raise FileNotFoundError(f"Incomplete EWF segment set for {path.name}")
+            # EWF also supports EAA and later segments; do not silently truncate.
+            if any(re.fullmatch(re.escape(stem) + r"\.e[a-z][a-z0-9]", p.name, re.IGNORECASE)
+                   for p in path.parent.iterdir()):
+                raise ValueError("EWF segments beyond E99 are not supported")
+            return [parts_by_number[n] for n in sorted(parts_by_number)]
         match = re.search(r"\.(\d{3})$", path.name)
         if not match:
             return [path]
@@ -137,11 +160,7 @@ class EvidenceService:
     def _remove_unregistered_copy(self, stored_path: str) -> None:
         """Remove only the copy created for a registration that failed to save."""
         root = Path(self.config.worker.evidence_root_windows).resolve()
-        path = Path(stored_path)
-        try:
-            parts = self._split_image_parts(path)
-        except (FileNotFoundError, OSError):
-            parts = [path]
+        parts = self._pending_copies.pop(stored_path, [])
         for part in parts:
             try:
                 if part.resolve().is_relative_to(root):
@@ -155,11 +174,9 @@ class EvidenceService:
                             progress_callback=None) -> str:
         """Copy evidence file to case storage directory.
 
-        The copy is written to a sibling ``.part`` file and moved into place
-        only once complete, so an interrupted copy can never leave a truncated
-        file at the evidence path. Copying a file onto itself is a no-op:
-        opening the destination with ``"wb"`` would otherwise truncate the
-        source before it is read.
+        Destinations are created exclusively and never overwrite existing files.
+        Failures remove only files created by this call; after a process crash,
+        an orphan blocks reuse rather than being overwritten.
         """
         source = Path(source_path)
         if not source.exists():
@@ -173,27 +190,32 @@ class EvidenceService:
         # Preserve numbered raw-image segments together as one evidence item.
         ext = source.suffix
         dest_path = dest_dir / f"{evidence_id}{ext}"
-        if source.resolve() == dest_path.resolve():
-            return str(dest_path)
+        if any(p.stem.casefold() == evidence_id.casefold() for p in dest_dir.iterdir()):
+            raise FileExistsError(f"Evidence destination already exists for {evidence_id}")
+        if any(item.resolve() == dest_path.resolve() for item in sources):
+            raise ValueError("Source is already at the destination; use reference-only intake")
 
         # Copy in chunks
         chunk_size = self.config.forensics.chunk_size_bytes
         total = sum(item.stat().st_size for item in sources)
         copied = 0
-        for index, item in enumerate(sources, 1):
-            target = dest_path if index == 1 else dest_dir / f"{evidence_id}.{index:03d}"
-            part_path = target.with_name(target.name + ".part")
-            try:
-                with open(item, "rb") as src, open(part_path, "wb") as dst:
+        created = []
+        try:
+            for index, item in enumerate(sources, 1):
+                target = dest_dir / f"{evidence_id}{item.suffix}"
+                with open(item, "rb") as src, open(target, "xb") as dst:
+                    created.append(target)
                     while chunk := src.read(chunk_size):
                         dst.write(chunk)
                         copied += len(chunk)
                         if progress_callback:
                             progress_callback(f"Copying image segment {index}/{len(sources)}", copied, total)
-                os.replace(part_path, target)
-            finally:
-                part_path.unlink(missing_ok=True)
+        except BaseException:
+            for target in created:
+                target.unlink(missing_ok=True)
+            raise
 
+        self._pending_copies[str(dest_path)] = created
         return str(dest_path)
 
     def _calculate_hashes(self, file_path: str, algorithms: list[HashAlgorithm],
@@ -252,6 +274,21 @@ class EvidenceService:
         # Generate evidence ID
         evidence_id = self._generate_evidence_id(case_id)
 
+        # Validate supplied references before copying anything; never silently ignore one.
+        references = {}
+        for algorithm, value in (reference_hashes or {}).items():
+            try:
+                algorithm = HashAlgorithm(algorithm)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Unsupported reference hash algorithm: {algorithm}") from exc
+            expected = hashlib.new(algorithm.value).digest_size * 2
+            if not isinstance(value, str) or len(value.strip()) != expected or any(
+                c not in "0123456789abcdefABCDEF" for c in value.strip()
+            ):
+                raise ValueError(f"Invalid {algorithm.value.upper()} reference hash")
+            references[algorithm] = value.strip()
+        reference_hashes = references
+
         # Copy to case store if requested
         stored_path = None
         if copy_to_store:
@@ -262,118 +299,136 @@ class EvidenceService:
         else:
             hash_path = source_path
 
-        # Get file info
-        stored_parts = self._split_image_parts(Path(hash_path))
-        size_bytes = sum(item.stat().st_size for item in stored_parts)
-        mime_type = detected_mime
-        ext = source.suffix.lower()
-
-        # Calculate hashes
-        algorithms = [HashAlgorithm(a) for a in self.config.forensics.hash_algorithms]
-        calculated_hashes = self._calculate_hashes(hash_path, algorithms, progress_callback)
-
-        # Create evidence record
-        evidence = Evidence(
-            evidence_id=evidence_id,
-            case_id=case_id,
-            name=name,
-            description=description,
-            evidence_type=detected_type,
-            source_path=source_path,
-            stored_path=stored_path,
-            size_bytes=size_bytes,
-            mime_type=mime_type,
-            extension=ext,
-            status=EvidenceStatus.REGISTERED,
-            registered_by_id=registered_by.id if registered_by else 1,
-        )
-        self.session.add(evidence)
         try:
-            self.session.flush()
-        except Exception:
-            self.session.rollback()
-            if stored_path:
-                self._remove_unregistered_copy(stored_path)
-            raise
+            # Get file info
+            try:
+                stored_parts = self._split_image_parts(Path(hash_path))
+                size_bytes = sum(item.stat().st_size for item in stored_parts)
+                mime_type = detected_mime
+                ext = source.suffix.lower()
+                algorithms = list(dict.fromkeys(
+                    [HashAlgorithm(a) for a in self.config.forensics.hash_algorithms] + list(references)
+                ))
+                calculated_hashes = self._calculate_hashes(hash_path, algorithms, progress_callback)
+            except BaseException:
+                if stored_path:
+                    self._remove_unregistered_copy(stored_path)
+                raise
 
-        # Store hash records
-        now = datetime.now(timezone.utc)
-        author_id = registered_by.id if registered_by else 1
-        intake_mismatch = False
-        for algo, hash_value in calculated_hashes.items():
-            supplied = (reference_hashes or {}).get(algo)
-            if supplied:
-                # A hash from the evidence bag was supplied. It must stay the
-                # reference, because that is what later verifications - and the
-                # laboratory - compare against. Storing the value IDFA computed
-                # instead would make the next check compare the file with
-                # itself and quietly report a pass.
-                matched = hash_value.lower() == supplied.strip().lower()
-                intake_mismatch = intake_mismatch or not matched
-                self.session.add(EvidenceHash(
-                    evidence_id=evidence.id,
-                    algorithm=algo,
-                    hash_value=supplied.strip(),
-                    is_reference=True,
-                    calculated_by_id=author_id,
-                    verified_at=now,
-                    verified_by_id=author_id,
-                    match_result=matched,
-                ))
-                self.session.add(EvidenceHash(
-                    evidence_id=evidence.id,
-                    algorithm=algo,
-                    hash_value=hash_value,
-                    is_reference=False,
-                    calculated_by_id=author_id,
-                ))
-            else:
-                # No manifest: the hashes computed at registration are the
-                # baseline that later integrity checks are compared against.
-                # Without this, registered evidence had no reference hashes and
-                # ``verify_integrity`` could never verify anything.
-                self.session.add(EvidenceHash(
-                    evidence_id=evidence.id,
-                    algorithm=algo,
-                    hash_value=hash_value,
-                    is_reference=True,
-                    calculated_by_id=author_id,
-                ))
-
-        if reference_hashes:
-            # The record should say at once that the copy does not match the
-            # bag, rather than waiting for someone to run a verification.
-            evidence.status = (
-                EvidenceStatus.INTEGRITY_FAILED if intake_mismatch
-                else EvidenceStatus.INTEGRITY_VERIFIED
+            # Create evidence record
+            evidence = Evidence(
+                evidence_id=evidence_id,
+                case_id=case_id,
+                name=name,
+                description=description,
+                evidence_type=detected_type,
+                source_path=source_path,
+                stored_path=stored_path,
+                size_bytes=size_bytes,
+                mime_type=mime_type,
+                extension=ext,
+                status=EvidenceStatus.REGISTERED,
+                registered_by_id=registered_by.id if registered_by else 1,
             )
+            self.session.add(evidence)
+            try:
+                self.session.flush()
+            except Exception:
+                self.session.rollback()
+                if stored_path:
+                    self._remove_unregistered_copy(stored_path)
+                raise
 
-        # Custody event
-        custody = CustodyEvent(
-            evidence_id=evidence.id,
-            event_type="registered",
-            description=f"Evidence registered: {name}",
-            performed_by_id=registered_by.id if registered_by else 1,
-            source_location=source_path,
-            destination_location=stored_path,
-            tool_used="idfa_evidence_service",
-        )
-        self.session.add(custody)
+            # Store hash records
+            now = datetime.now(timezone.utc)
+            author_id = registered_by.id if registered_by else 1
+            intake_mismatch = False
+            for algo, hash_value in calculated_hashes.items():
+                supplied = (reference_hashes or {}).get(algo)
+                if supplied:
+                    # A hash from the evidence bag was supplied. It must stay the
+                    # reference, because that is what later verifications - and the
+                    # laboratory - compare against. Storing the value IDFA computed
+                    # instead would make the next check compare the file with
+                    # itself and quietly report a pass.
+                    matched = hash_value.lower() == supplied.strip().lower()
+                    intake_mismatch = intake_mismatch or not matched
+                    self.session.add(EvidenceHash(
+                        evidence_id=evidence.id,
+                        algorithm=algo,
+                        hash_value=supplied.strip(),
+                        is_reference=True,
+                        calculated_by_id=author_id,
+                        verified_at=now,
+                        verified_by_id=author_id,
+                        match_result=matched,
+                    ))
+                    self.session.add(EvidenceHash(
+                        evidence_id=evidence.id,
+                        algorithm=algo,
+                        hash_value=hash_value,
+                        is_reference=False,
+                        calculated_by_id=author_id,
+                    ))
+                else:
+                    # No manifest: the hashes computed at registration are the
+                    # baseline that later integrity checks are compared against.
+                    # Without this, registered evidence had no reference hashes and
+                    # ``verify_integrity`` could never verify anything.
+                    self.session.add(EvidenceHash(
+                        evidence_id=evidence.id,
+                        algorithm=algo,
+                        hash_value=hash_value,
+                        is_reference=True,
+                        calculated_by_id=author_id,
+                    ))
 
-        # Keep the general audit trail alongside the evidence-specific custody
-        # record, in the same transaction as registration.
-        from app.audit.service import AuditService
+            if reference_hashes:
+                # The record should say at once that the copy does not match the
+                # bag, rather than waiting for someone to run a verification.
+                evidence.status = (
+                    EvidenceStatus.INTEGRITY_FAILED if intake_mismatch
+                    else EvidenceStatus.INTEGRITY_VERIFIED
+                )
 
-        AuditService(self.session).log_evidence_register(
-            registered_by,
-            case_id,
-            evidence.id,
-            {"evidence_ref": evidence.evidence_id, "name": evidence.name,
-             "type": evidence.evidence_type.value, "status": evidence.status.value},
-        )
+            # Custody event
+            custody = CustodyEvent(
+                evidence_id=evidence.id,
+                event_type="registered",
+                description=f"Evidence registered: {name}",
+                performed_by_id=registered_by.id if registered_by else 1,
+                source_location=source_path,
+                destination_location=stored_path,
+                tool_used="idfa_evidence_service",
+            )
+            self.session.add(custody)
 
-        self.session.flush()
-        return evidence
+            # Keep the general audit trail alongside the evidence-specific custody
+            # record, in the same transaction as registration.
+            from app.audit.service import AuditService
+
+            try:
+                AuditService(self.session).log_evidence_register(
+                    registered_by,
+                    case_id,
+                    evidence.id,
+                    {"evidence_ref": evidence.evidence_id, "name": evidence.name,
+                     "type": evidence.evidence_type.value, "status": evidence.status.value},
+                )
+                self.session.flush()
+            except Exception:
+                self.session.rollback()
+                if stored_path:
+                    self._remove_unregistered_copy(stored_path)
+                raise
+            return evidence
+        except BaseException:
+            try:
+                self.session.rollback()
+            finally:
+                if stored_path:
+                    self._remove_unregistered_copy(stored_path)
+            raise
 
     def verify_integrity(self, evidence_id: int, verified_by: User,
                          progress_callback=None) -> dict[HashAlgorithm, bool]:
@@ -965,13 +1020,22 @@ class EvidenceService:
         target_dir = Path(destination)
         target_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check every segment before copying any of them.  This also rejects
+        # exporting into the source directory, including hard links and symlinks.
+        targets = [target_dir / part.name for part in parts]
+        target_names: set[str] = set()
+        for target in targets:
+            name = os.path.normcase(os.path.abspath(target))
+            if name in target_names or os.path.lexists(target):
+                raise FileExistsError(f"Export destination already exists: {target}")
+            target_names.add(name)
+
         total = sum(part.stat().st_size for part in parts)
         copied_bytes = 0
         copied: list[Path] = []
         chunk_size = self.config.forensics.chunk_size_bytes
-        for part in parts:
-            target = target_dir / part.name
-            with open(part, "rb") as source_file, open(target, "wb") as target_file:
+        for part, target in zip(parts, targets):
+            with open(part, "rb") as source_file, open(target, "xb") as target_file:
                 while chunk := source_file.read(chunk_size):
                     target_file.write(chunk)
                     copied_bytes += len(chunk)

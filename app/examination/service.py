@@ -407,11 +407,13 @@ class ExaminationService:
             try:
                 from app.analysis.service import AnalysisService
 
-                AnalysisService(self.session).enqueue_for_examination(
+                analysis_service = AnalysisService(self.session)
+                analysis_service.enqueue_for_examination(
                     job.case_id,
                     job.evidence_id,
                     job.id,
-                    parameters={"profile": parameters.get("profile")},
+                    created_by=job.created_by,
+                    parameters=analysis_service._parameters_from_examination(job),
                 )
             except Exception:  # noqa: BLE001 - analysis must not fail an examination
                 import logging
@@ -534,12 +536,45 @@ class ExaminationService:
         next_number = self._next_artifact_number(case_id)
         stats = {"created": 0, "updated": 0}
 
-        existing_rows = self.session.execute(
-            select(Artifact).where(Artifact.evidence_id == evidence_id)
-        ).scalars().all()
-        by_path = {
-            row.source_path: row for row in existing_rows if row.source_path
-        }
+        # Only materialize paths present in this worker batch. SQLite builds
+        # may limit bind parameters to 999, including the evidence id.
+        # Ignore malformed items here so their errors still occur at their
+        # original position in the import loop (and retain committed batches).
+        paths = list(dict.fromkeys(
+            item.get("path") for item in artifacts_data
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+            and item.get("path")
+        ))
+        by_path = {}
+        # With pending ORM changes, the old scan could see an identity-mapped
+        # row whose in-memory path differs from its database value (especially
+        # when autoflush is disabled). Keep that behavior in this rare case.
+        # SQLite may contain non-string values (for example BLOB paths).
+        # The original Python dictionary lookup matched those without coercion.
+        non_string_path = any(
+            isinstance(item, dict) and item.get("path") is not None
+            and not isinstance(item.get("path"), str)
+            for item in artifacts_data
+        )
+        # Multiple targeted queries could observe different database snapshots.
+        # Large batches retain the original single evidence-wide scan instead.
+        if self.session.new or self.session.dirty or non_string_path or len(paths) > 900:
+            existing_rows = self.session.execute(
+                select(Artifact).where(Artifact.evidence_id == evidence_id)
+            ).scalars()
+            by_path.update((row.source_path, row) for row in existing_rows if row.source_path)
+        else:
+            # Execute even for an empty path list, retaining query/autoflush
+            # behavior of the original scan.
+            existing_rows = self.session.execute(
+                select(Artifact).where(
+                    Artifact.evidence_id == evidence_id,
+                    Artifact.source_path.in_(paths),
+                ).order_by(Artifact.id)
+            ).scalars()
+            # The original evidence scan retained the last row for duplicate
+            # paths. Preserve that behavior rather than assuming uniqueness.
+            by_path.update((row.source_path, row) for row in existing_rows)
 
         total_artifacts = len(artifacts_data)
         for item_number, art_data in enumerate(artifacts_data, start=1):

@@ -43,32 +43,33 @@ class WorkflowCard(ThemedWidget, QFrame):
         layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
         layout.setSpacing(Spacing.XS)
 
-        top = QHBoxLayout()
+        top = QVBoxLayout()
+        top.setSpacing(Spacing.XS)
         self.title_label = QLabel(title)
+        self.title_label.setWordWrap(True)
         self.title_label.setFont(
             QFont(Typography.FONT_FAMILY, Typography.BODY_MD[0], QFont.Weight.DemiBold)
         )
-        top.addWidget(self.title_label, 1)
+        top.addWidget(self.title_label)
         self.status_label = QLabel("Not started")
         top.addWidget(self.status_label)
         layout.addLayout(top)
 
         self.value_label = QLabel("—")
+        self.value_label.setWordWrap(True)
         self.value_label.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_MD[0], QFont.Weight.Bold)
         )
         layout.addWidget(self.value_label)
 
-        bottom = QHBoxLayout()
         self.detail_label = QLabel("")
         self.detail_label.setWordWrap(True)
         self.detail_label.setProperty("secondaryText", True)
-        bottom.addWidget(self.detail_label, 1)
+        layout.addWidget(self.detail_label)
         self.open_button = QPushButton("Open")
         self.open_button.setProperty("secondary", True)
         self.open_button.clicked.connect(lambda: self.open_requested.emit(self.route))
-        bottom.addWidget(self.open_button)
-        layout.addLayout(bottom)
+        layout.addWidget(self.open_button, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.set_state("not_started", "—", "")
 
@@ -120,27 +121,29 @@ class OverviewPage(ResponsivePage):
 
         # The shell header already shows case ID, title and investigator.
         # Keep the page header focused on its purpose instead of duplicating it.
-        page_header = QHBoxLayout()
+        page_header = QVBoxLayout()
         title_stack = QVBoxLayout()
         self.title_label = QLabel("Case overview")
+        self.title_label.setWordWrap(True)
         self.title_label.setProperty("pageTitle", True)
         self.title_label.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_LG[0], Typography.HEADING_LG[1])
         )
         title_stack.addWidget(self.title_label)
         self.meta_label = QLabel("Evidence processing, review and case activity")
+        self.meta_label.setWordWrap(True)
         self.meta_label.setProperty("secondaryText", True)
         title_stack.addWidget(self.meta_label)
-        page_header.addLayout(title_stack, 1)
+        page_header.addLayout(title_stack)
         self.edit_btn = QPushButton("Edit Case")
         self.edit_btn.setProperty("secondary", True)
         self.edit_btn.setFixedWidth(120)
         self.edit_btn.clicked.connect(self.edit_case_requested)
-        page_header.addWidget(self.edit_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
+        page_header.addWidget(self.edit_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addLayout(page_header)
 
         # A small set of active-work KPIs. Historical data is summarized below.
-        self.cards_layout = QHBoxLayout()
+        self.cards_layout = QGridLayout()
         self.cards_layout.setSpacing(Spacing.MD)
         self.stat_cards = {
             "evidence": StatCard("Active evidence", "0", "📁", Color.INFO),
@@ -148,8 +151,13 @@ class OverviewPage(ResponsivePage):
             "artifacts": StatCard("Active artifacts", "0", "📄", Color.SUCCESS),
             "indexed": StatCard("Indexed / searchable text", "0/0", "🔍", Color.WARNING),
         }
-        for card in self.stat_cards.values():
-            self.cards_layout.addWidget(card)
+        for index, card in enumerate(self.stat_cards.values()):
+            card.setCursor(Qt.CursorShape.ArrowCursor)
+            card.value_label.setFont(
+                QFont(Typography.FONT_FAMILY, Typography.HEADING_MD[0], QFont.Weight.Bold)
+            )
+            card.layout().setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+            self.cards_layout.addWidget(card, 0, index)
         layout.addLayout(self.cards_layout)
 
         self.history_note = QLabel("")
@@ -159,7 +167,8 @@ class OverviewPage(ResponsivePage):
         self.history_note.hide()
         layout.addWidget(self.history_note)
 
-        self.workflow_heading = QLabel("Case workflow")
+        self.workflow_heading = QLabel("Processing status")
+        self.workflow_heading.setWordWrap(True)
         self.workflow_heading.setProperty("sectionTitle", True)
         self.workflow_heading.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_MD[0], Typography.HEADING_MD[1])
@@ -167,6 +176,7 @@ class OverviewPage(ResponsivePage):
         layout.addWidget(self.workflow_heading)
 
         workflow_grid = QGridLayout()
+        self.workflow_grid = workflow_grid
         workflow_grid.setContentsMargins(0, 0, 0, 0)
         workflow_grid.setSpacing(Spacing.MD)
         workflow_specs = (
@@ -194,10 +204,11 @@ class OverviewPage(ResponsivePage):
         self.recommendation_frame = QFrame()
         self.recommendation_frame.setObjectName("OverviewRecommendation")
         self.recommendation_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        recommendation_layout = QHBoxLayout(self.recommendation_frame)
+        recommendation_layout = QVBoxLayout(self.recommendation_frame)
         recommendation_layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
         recommendation_copy = QVBoxLayout()
         self.recommendation_title = QLabel("Next recommended action")
+        self.recommendation_title.setWordWrap(True)
         self.recommendation_title.setProperty("sectionTitle", True)
         self.recommendation_title.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_SM[0], Typography.HEADING_SM[1])
@@ -207,14 +218,60 @@ class OverviewPage(ResponsivePage):
         self.recommendation_detail.setWordWrap(True)
         self.recommendation_detail.setProperty("secondaryText", True)
         recommendation_copy.addWidget(self.recommendation_detail)
-        recommendation_layout.addLayout(recommendation_copy, 1)
+        recommendation_layout.addLayout(recommendation_copy)
         self.recommendation_button = QPushButton("Register Evidence")
         self.recommendation_button.clicked.connect(self._on_recommendation)
-        recommendation_layout.addWidget(self.recommendation_button)
-        layout.addWidget(self.recommendation_frame)
+        recommendation_layout.addWidget(self.recommendation_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        # Put the actionable guidance before the detailed metrics and stages.
+        layout.insertWidget(1, self.recommendation_frame)
+
+        # Entry guidance only: these links open existing pages, never start jobs.
+        self.entry_guidance_frame = QFrame()
+        self.entry_guidance_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        entry_layout = QVBoxLayout(self.entry_guidance_frame)
+        entry_layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
+        entry_layout.setSpacing(Spacing.SM)
+        self.entry_guidance_heading = QLabel("Automatic processing or manual review")
+        self.entry_guidance_heading.setWordWrap(True)
+        self.entry_guidance_heading.setProperty("sectionTitle", True)
+        entry_layout.addWidget(self.entry_guidance_heading)
+
+        self.automatic_guidance = QLabel(
+            "Automatic stages (available after you start an examination): Register "
+            "evidence in Evidence, then select the evidence, operation and processing "
+            "profile in Examination. Extraction follows those selections; background "
+            "analysis can follow completed examinations when enabled and its required "
+            "services are available. Opening this page does not start processing. "
+            "There is no one-click end-to-end automatic workflow here."
+        )
+        self.automatic_guidance.setWordWrap(True)
+        self.automatic_guidance.setProperty("secondaryText", True)
+        entry_layout.addWidget(self.automatic_guidance)
+        self.automatic_entry_button = QPushButton("Configure Examination")
+        self.automatic_entry_button.setProperty("secondary", True)
+        self.automatic_entry_button.clicked.connect(lambda: self._on_action("examination"))
+        entry_layout.addWidget(self.automatic_entry_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.manual_guidance = QLabel(
+            "Manual review: Open Artifacts & Search to inspect and search extracted "
+            "artifacts (an examination is needed first). Use AI Analysis or Entities "
+            "& Timeline for available leads, then verify sources and record Findings. "
+            "Review findings and generate Reports yourself; processing does not "
+            "automatically verify conclusions or produce a final report. You can "
+            "switch between processing and review at any time."
+        )
+        self.manual_guidance.setWordWrap(True)
+        self.manual_guidance.setProperty("secondaryText", True)
+        entry_layout.addWidget(self.manual_guidance)
+        self.manual_entry_button = QPushButton("Open Artifacts & Search")
+        self.manual_entry_button.setProperty("secondary", True)
+        self.manual_entry_button.clicked.connect(lambda: self._on_action("artifacts"))
+        entry_layout.addWidget(self.manual_entry_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.insertWidget(2, self.entry_guidance_frame)
 
         # Recent activity
         activity_heading = QLabel("Recent activity")
+        activity_heading.setWordWrap(True)
         activity_heading.setProperty("sectionTitle", True)
         activity_heading.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_MD[0], Typography.HEADING_MD[1])
@@ -226,6 +283,7 @@ class OverviewPage(ResponsivePage):
         self.activity_layout.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
         self.activity_layout.setSpacing(Spacing.XS)
         self.activity_empty = QLabel("No activity has been recorded for this case yet.")
+        self.activity_empty.setWordWrap(True)
         self.activity_empty.setProperty("secondaryText", True)
         self.activity_empty.setContentsMargins(Spacing.SM, Spacing.SM, Spacing.SM, Spacing.SM)
         self.activity_layout.addWidget(self.activity_empty)
@@ -253,13 +311,22 @@ class OverviewPage(ResponsivePage):
         except Exception as exc:
             self.update_stats({})
             self.update_workflow({})
+            self.workflow_grid_widget.hide()
+            self.workflow_heading.hide()
+            self.workflow_empty.hide()
             self.update_recommendation({
                 "key": "evidence",
                 "title": "Overview unavailable",
                 "detail": str(exc),
             })
+            self.recommendation_button.hide()
+            self._clear_activity()
+            self.activity_empty = QLabel()
             self.activity_empty.setText(f"Case overview could not be loaded: {exc}")
+            self.activity_empty.setWordWrap(True)
+            self.activity_layout.addWidget(self.activity_empty)
             return
+        self.recommendation_button.show()
         self.update_stats(overview["stats"])
         self.update_workflow(overview["workflow"])
         has_active_evidence = overview["stats"].get("evidence", 0) > 0
@@ -267,14 +334,11 @@ class OverviewPage(ResponsivePage):
         self.workflow_empty.setVisible(not has_active_evidence)
         self.workflow_heading.setVisible(has_active_evidence)
         self.update_recommendation(overview["next_action"])
-        while self.activity_layout.count():
-            item = self.activity_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+        self._clear_activity()
         events = overview["activity"]
         if not events:
             self.activity_empty = QLabel("No activity has been recorded for this case yet.")
+            self.activity_empty.setWordWrap(True)
             self.activity_empty.setStyleSheet(
                 f"color: {Color.TEXT_MUTED.name()}; padding: {Spacing.SM}px;"
             )
@@ -288,6 +352,27 @@ class OverviewPage(ResponsivePage):
             )
             text.setWordWrap(True)
             self.activity_layout.addWidget(text)
+
+    def _clear_activity(self) -> None:
+        while self.activity_layout.count():
+            item = self.activity_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        width = event.size().width()
+        stat_columns = 4 if width >= 1000 else 2 if width >= 500 else 1
+        workflow_columns = 2 if width >= 700 else 1
+        for index, card in enumerate(self.stat_cards.values()):
+            self.cards_layout.addWidget(card, index // stat_columns, index % stat_columns)
+        for index, card in enumerate(self.workflow_cards.values()):
+            self.workflow_grid.addWidget(card, index // workflow_columns, index % workflow_columns)
+        for column in range(4):
+            self.cards_layout.setColumnStretch(column, 1 if column < stat_columns else 0)
+        for column in range(2):
+            self.workflow_grid.setColumnStretch(column, 1 if column < workflow_columns else 0)
 
     def update_stats(self, stats: dict):
         for key, card in self.stat_cards.items():

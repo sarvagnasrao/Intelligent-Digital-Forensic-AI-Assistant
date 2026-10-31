@@ -181,8 +181,8 @@ class AnalysisLLM:
         """
         if not self.available():
             return LLMResult([], "Model extraction is disabled", "")
-        trimmed = (text or "").strip()
-        if len(trimmed) < 40:
+        trimmed = text or ""
+        if len(trimmed.strip()) < 40:
             return LLMResult([], None, "")
 
         width = max(500, int(max_chars))
@@ -202,8 +202,7 @@ class AnalysisLLM:
                 if key in seen:
                     continue
                 seen.add(key)
-                local = window.find(entity.value)
-                entity.start = start + local if local >= 0 else -1
+                entity.start = start + entity.start if entity.start >= 0 else -1
                 entity.end = entity.start + len(entity.value) if entity.start >= 0 else -1
                 entities.append(entity)
         return LLMResult(entities, None, provider)
@@ -222,7 +221,6 @@ def parse_model_answer(answer: str, source: str) -> list[ExtractedEntity]:
         logger.debug("Model answer was not a JSON array: %r", answer[:200])
         return []
 
-    haystack = _squash(source)
     results: list[ExtractedEntity] = []
     seen: set[tuple[EntityType, str]] = set()
 
@@ -239,7 +237,7 @@ def parse_model_answer(answer: str, source: str) -> list[ExtractedEntity]:
         if len(value) > MAX_ENTITY_VALUE:
             continue
         # The quote is the evidence: without it in the source, drop the row.
-        if not quote or _squash(quote) not in haystack:
+        if not quote or quote not in source or value not in quote:
             continue
         if value.lower() in _STOPWORDS:
             continue
@@ -247,26 +245,26 @@ def parse_model_answer(answer: str, source: str) -> list[ExtractedEntity]:
         normalized = normalize_value(mapped, value)
         if (mapped, normalized) in seen:
             continue
-        # A name that appears only inside a longer model quote is fine, but it
-        # must itself occur in the source.
-        position = haystack.find(_squash(value))
-        if position < 0:
-            continue
         seen.add((mapped, normalized))
 
-        occurrences = haystack.count(_squash(value))
+        occurrences = source.count(value)
         confidence = 0.85 if occurrences >= 2 else 0.65
+        value_offset = quote.find(value)
+        # Keep the cited value inside the bounded literal excerpt, including
+        # when it appears near the end of a long model-supplied quote.
+        excerpt_start = max(0, value_offset + len(value) - 300)
+        excerpt = quote[excerpt_start:excerpt_start + 300]
 
         results.append(
             ExtractedEntity(
                 entity_type=mapped,
                 value=value,
                 normalized=normalized,
-                start=-1,
-                end=-1,
+                start=source.find(quote) + quote.find(value),
+                end=source.find(quote) + quote.find(value) + len(value),
                 extractor="llm",
                 confidence=confidence,
-                metadata={"quote": quote[:300], "occurrences": occurrences,
+                metadata={"quote": excerpt, "occurrences": occurrences,
                           "confidence_tier": "higher" if confidence >= 0.8 else "candidate",
                           "provenance": "literal source quote"},
             )

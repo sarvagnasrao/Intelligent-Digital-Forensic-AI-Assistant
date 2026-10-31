@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -26,6 +27,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTableView,
@@ -35,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.analysis.models import RelationshipStatus
+from app.analysis.models import AnalysisJobStatus, RelationshipStatus
 from app.artifacts.models import EntityType
 from app.ui.base import CaseContext, ResponsivePage
 from app.ui.theme.tokens import Color, Spacing, Typography
@@ -57,9 +60,18 @@ def _readable(value: str) -> str:
 def _muted(text: str) -> QLabel:
     label = QLabel(text)
     label.setWordWrap(True)
+    label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
     label.setProperty("muted", True)
     label.setStyleSheet(f"color: {Color.TEXT_MUTED.name()};")
     return label
+
+
+class _ScrollableDescription(QLabel):
+    """Keep wrapped text tall enough for its scroll area at the current width."""
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.setMinimumHeight(max(0, self.heightForWidth(event.size().width())))
 
 
 class EntitiesTimelinePage(ResponsivePage):
@@ -73,6 +85,8 @@ class EntitiesTimelinePage(ResponsivePage):
         self._relationships: list = []
         self._timeline: list = []
         self._jobs: list = []
+        self._queue_counts: dict[str, int] = {}
+        self._result_counts: dict[str, int] = {}
         super().__init__(parent=parent)
 
     # ------------------------------------------------------------------
@@ -87,6 +101,8 @@ class EntitiesTimelinePage(ResponsivePage):
         layout.setContentsMargins(Spacing.XL, Spacing.XL, Spacing.XL, Spacing.XL)
         layout.setSpacing(Spacing.SM)
         heading = QLabel(title)
+        heading.setWordWrap(True)
+        heading.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         heading.setFont(
             QFont(Typography.FONT_FAMILY, Typography.HEADING_SM[0], QFont.Weight.Bold)
@@ -118,19 +134,23 @@ class EntitiesTimelinePage(ResponsivePage):
     def _build_status_bar(self) -> QWidget:
         frame = QFrame()
         frame.setObjectName("AnalysisStatusBar")
+        frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         frame.setFrameShape(QFrame.Shape.StyledPanel)
-        row = QHBoxLayout(frame)
-        row.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
-        row.setSpacing(Spacing.MD)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+        layout.setSpacing(Spacing.SM)
+        row = QHBoxLayout()
+        layout.addLayout(row)
 
-        self.status_label = QLabel("Analysis idle")
+        self.status_label = QLabel("No analysis jobs")
+        self.status_label.setWordWrap(True)
         self.status_label.setFont(
             QFont(Typography.FONT_FAMILY, Typography.BODY_SM[0], QFont.Weight.Bold)
         )
-        row.addWidget(self.status_label)
+        row.addWidget(self.status_label, 1)
 
         self.status_detail = _muted("")
-        row.addWidget(self.status_detail, 1)
+        self.status_detail.hide()
 
         self.queue_progress = QProgressBar()
         self.queue_progress.setRange(0, 100)
@@ -138,17 +158,30 @@ class EntitiesTimelinePage(ResponsivePage):
         self.queue_progress.hide()
         row.addWidget(self.queue_progress)
 
-        self.run_now_btn = QPushButton("Run analysis now")
+        self.run_now_btn = QPushButton("Analyse new examinations")
         self.run_now_btn.setToolTip(
-            "Queue analysis for any examination that has not been analysed yet."
+            "Create jobs only for completed examinations without an analysis job. "
+            "To retry or re-run an existing job, open Analysis Queue."
         )
         self.run_now_btn.clicked.connect(self._on_run_now)
-        row.addWidget(self.run_now_btn)
+        actions = QHBoxLayout()
+        layout.addLayout(actions)
+        actions.addWidget(self.run_now_btn)
 
-        self.pause_btn = QPushButton("Pause")
+        self.manage_jobs_btn = QPushButton("Review / re-run jobs")
+        self.manage_jobs_btn.setProperty("secondary", True)
+        self.manage_jobs_btn.setToolTip("Open Analysis Queue; select a completed job to re-run it.")
+        self.manage_jobs_btn.clicked.connect(self._show_analysis_queue)
+        actions.addWidget(self.manage_jobs_btn)
+
+        self.pause_btn = QPushButton("Pause queue")
         self.pause_btn.setProperty("secondary", True)
+        self.pause_btn.setToolTip("Pause starting new jobs; the current analysis continues.")
         self.pause_btn.clicked.connect(self._on_toggle_pause)
-        row.addWidget(self.pause_btn)
+        actions.addWidget(self.pause_btn)
+        actions.addStretch(1)
+
+        layout.addWidget(self.status_detail)
 
         return frame
 
@@ -173,8 +206,8 @@ class EntitiesTimelinePage(ResponsivePage):
         row.addWidget(self.entity_search, 1)
 
         self.entity_summary = _muted("")
-        row.addWidget(self.entity_summary)
         layout.addLayout(row)
+        layout.addWidget(self.entity_summary)
 
         self.entity_table = QTableView()
         self.entity_model = QStandardItemModel()
@@ -195,6 +228,7 @@ class EntitiesTimelinePage(ResponsivePage):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.entity_table.doubleClicked.connect(self._on_entity_activated)
+        self.entity_table.selectionModel().selectionChanged.connect(self._on_entity_selected)
         self.entity_stack = QStackedWidget()
         self.entity_stack.addWidget(self.entity_table)
         self.entity_empty_state = self._empty_state(
@@ -204,9 +238,15 @@ class EntitiesTimelinePage(ResponsivePage):
         self.entity_stack.addWidget(self.entity_empty_state)
         layout.addWidget(self.entity_stack, 1)
 
+        self.entity_source = QTextEdit()
+        self.entity_source.setReadOnly(True)
+        self.entity_source.setMaximumHeight(120)
+        self.entity_source.setPlaceholderText("Select an entity to inspect its recorded source and context.")
+        layout.addWidget(self.entity_source)
+
         self.entity_hint = _muted(
             "Entities are extracted automatically after each examination. "
-            "Double-click one to see the artifacts it links."
+            "Select an entity to inspect its source; double-click to filter relationships."
         )
         layout.addWidget(self.entity_hint)
         return tab
@@ -217,43 +257,41 @@ class EntitiesTimelinePage(ResponsivePage):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Spacing.MD)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Status:"))
+        self.rel_filters = QGridLayout()
+        self.rel_status_label = QLabel("Status:")
         self.rel_status_filter = QComboBox()
         for label, value in (
-            ("Pending review", RelationshipStatus.PENDING.value),
+            ("Unreviewed", RelationshipStatus.PENDING.value),
             ("Confirmed", RelationshipStatus.CONFIRMED.value),
             ("Rejected", RelationshipStatus.REJECTED.value),
             ("All", ""),
         ):
             self.rel_status_filter.addItem(label, value)
         self.rel_status_filter.currentIndexChanged.connect(self._refresh_relationships)
-        row.addWidget(self.rel_status_filter)
-
-        row.addWidget(QLabel("Kind:"))
+        self.rel_kind_label = QLabel("Kind:")
         self.rel_kind_filter = QComboBox()
         self.rel_kind_filter.addItem("All kinds", "")
         self.rel_kind_filter.addItem("Shared entity", "shared_entity")
         self.rel_kind_filter.addItem("Related artifacts", "related_artifacts")
         self.rel_kind_filter.addItem("Duplicate content", "duplicate_content")
         self.rel_kind_filter.currentIndexChanged.connect(self._refresh_relationships)
-        row.addWidget(self.rel_kind_filter)
 
         self.rel_search = QLineEdit()
         self.rel_search.setPlaceholderText("Filter by entity value…")
         self.rel_search.textChanged.connect(self._refresh_relationships)
-        row.addWidget(self.rel_search, 1)
+        self.rel_search.setMinimumWidth(100)
+        layout.addLayout(self.rel_filters)
+        self._layout_relationship_filters()
 
         self.rel_summary = _muted("")
-        row.addWidget(self.rel_summary)
-        layout.addLayout(row)
+        layout.addWidget(self.rel_summary)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         self.rel_table = QTableView()
         self.rel_model = QStandardItemModel()
         self.rel_model.setHorizontalHeaderLabels(
-            ["Left", "Right", "Kind", "Shared", "Score", "Status"]
+            ["Left", "Right", "Kind", "Shared", "Score", "Review"]
         )
         self.rel_table.setModel(self.rel_model)
         self.rel_table.setAlternatingRowColors(True)
@@ -281,17 +319,25 @@ class EntitiesTimelinePage(ResponsivePage):
         splitter.addWidget(self.relationship_stack)
 
         detail = QFrame()
+        self.rel_detail_panel = detail
         detail.setFrameShape(QFrame.Shape.StyledPanel)
         detail_layout = QVBoxLayout(detail)
         detail_layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
         detail_layout.setSpacing(Spacing.SM)
 
-        self.rel_detail = QLabel("Select a relationship to see the evidence behind it.")
+        self.rel_detail = _ScrollableDescription("Select a relationship to see the evidence behind it.")
         self.rel_detail.setWordWrap(True)
         self.rel_detail.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        detail_layout.addWidget(self.rel_detail)
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        detail_scroll.setWidget(self.rel_detail)
+        detail_scroll.setMinimumHeight(45)
+        detail_scroll.setMaximumHeight(120)
+        detail_layout.addWidget(detail_scroll, 1)
 
         self.rel_evidence = QTextEdit()
         self.rel_evidence.setReadOnly(True)
@@ -315,17 +361,20 @@ class EntitiesTimelinePage(ResponsivePage):
         )
         buttons.addWidget(self.reject_btn)
 
-        self.reset_btn = QPushButton("Back to pending")
+        self.reset_btn = QPushButton("Mark unreviewed")
         self.reset_btn.setProperty("secondary", True)
         self.reset_btn.clicked.connect(
             lambda: self._review_relationship(RelationshipStatus.PENDING)
         )
         buttons.addWidget(self.reset_btn)
         buttons.addStretch()
-        self.rel_review_note = _muted("")
-        buttons.addWidget(self.rel_review_note)
         self.rel_review_controls = QWidget()
-        self.rel_review_controls.setLayout(buttons)
+        review_layout = QVBoxLayout(self.rel_review_controls)
+        review_layout.setContentsMargins(0, 0, 0, 0)
+        review_layout.setSpacing(Spacing.SM)
+        review_layout.addLayout(buttons)
+        self.rel_review_note = _muted("")
+        review_layout.addWidget(self.rel_review_note)
         detail_layout.addWidget(self.rel_review_controls)
 
         splitter.addWidget(detail)
@@ -336,14 +385,40 @@ class EntitiesTimelinePage(ResponsivePage):
         splitter.setSizes([620, 130])
         self.rel_evidence.hide()
         self.rel_review_controls.hide()
+        self.rel_detail_panel.hide()
         layout.addWidget(splitter, 1)
 
         self.rel_hint = _muted(
-            "Links are analysis suggestions. Review their source artifacts before confirming; "
-            "common identifiers are suppressed to reduce weak connections."
+            "Unreviewed links are automatic candidates, not investigator conclusions. "
+            "Links are leads, not proof of identity or ownership. Review the source artifacts "
+            "and their context before deciding; confirmation records your review, not identity proof."
         )
         layout.addWidget(self.rel_hint)
         return tab
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if hasattr(self, "rel_filters"):
+            self._layout_relationship_filters()
+
+    def _layout_relationship_filters(self) -> None:
+        """Keep filters on one row when they fit; wrap search on narrow pages."""
+        widgets = (self.rel_status_label, self.rel_status_filter,
+                   self.rel_kind_label, self.rel_kind_filter, self.rel_search)
+        required = sum(widget.sizeHint().width() for widget in widgets) + 100
+        narrow = self.width() < max(760, required)
+        for widget in widgets:
+            self.rel_filters.removeWidget(widget)
+        for column in range(5):
+            self.rel_filters.setColumnStretch(column, 0)
+        for column, widget in enumerate(widgets[:4]):
+            self.rel_filters.addWidget(widget, 0, column)
+        if narrow:
+            self.rel_filters.addWidget(self.rel_search, 1, 0, 1, 4)
+            self.rel_filters.setColumnStretch(3, 1)
+        else:
+            self.rel_filters.addWidget(self.rel_search, 0, 4)
+            self.rel_filters.setColumnStretch(4, 1)
 
     def _build_timeline_tab(self) -> QWidget:
         tab = QWidget()
@@ -358,13 +433,13 @@ class EntitiesTimelinePage(ResponsivePage):
         row.addWidget(self.tl_type_filter)
 
         self.tl_search = QLineEdit()
-        self.tl_search.setPlaceholderText("Filter timeline…")
+        self.tl_search.setPlaceholderText("Filter title, path or source artifact…")
         self.tl_search.textChanged.connect(self._refresh_timeline)
         row.addWidget(self.tl_search, 1)
 
         self.tl_summary = _muted("")
-        row.addWidget(self.tl_summary)
         layout.addLayout(row)
+        layout.addWidget(self.tl_summary)
 
         self.timeline_table = QTableView()
         self.timeline_model = QStandardItemModel()
@@ -388,7 +463,7 @@ class EntitiesTimelinePage(ResponsivePage):
         self.timeline_stack.addWidget(self.timeline_table)
         self.timeline_empty_state = self._empty_state(
             "No timeline events yet",
-            "File timestamps are added after analysis. Event times use the computer's local time zone.",
+            "File timestamps are added after analysis. Times use IDFA's display time zone (IST by default).",
         )
         self.timeline_stack.addWidget(self.timeline_empty_state)
         layout.addWidget(self.timeline_stack, 1)
@@ -435,6 +510,9 @@ class EntitiesTimelinePage(ResponsivePage):
         self.queue_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.queue_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.selectionModel().selectionChanged.connect(self._update_queue_actions)
+        self.retry_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
         header = self.queue_table.horizontalHeader()
         for column in (0, 1, 2, 3, 4, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
@@ -443,7 +521,7 @@ class EntitiesTimelinePage(ResponsivePage):
         self.queue_stack.addWidget(self.queue_table)
         self.queue_empty_state = self._empty_state(
             "No analysis jobs",
-            "Jobs are created for completed examinations. Use Run analysis now to queue any examinations still awaiting analysis.",
+            "Use Analyse new examinations for completed examinations without an analysis job.",
         )
         self.queue_stack.addWidget(self.queue_empty_state)
         layout.addWidget(self.queue_stack, 1)
@@ -474,8 +552,9 @@ class EntitiesTimelinePage(ResponsivePage):
 
     def set_case_context(self, context: CaseContext):
         self.case_context = context
-        if self.runner is not None:
-            self.runner.set_case(getattr(context, "case_id", None))
+        self._result_counts = {}
+        self._set_status_detail("")
+        self.queue_progress.hide()
         self.refresh()
 
     # ------------------------------------------------------------------
@@ -484,10 +563,10 @@ class EntitiesTimelinePage(ResponsivePage):
     def refresh(self) -> None:
         if self.analysis_service is None or self.case_context is None:
             return
+        self._refresh_queue()
         self._refresh_entities()
         self._refresh_relationships()
         self._refresh_timeline()
-        self._refresh_queue()
 
     def _refresh_entities(self) -> None:
         if self.analysis_service is None or self.case_context is None:
@@ -502,8 +581,11 @@ class EntitiesTimelinePage(ResponsivePage):
         )
         counts = self.analysis_service.entity_type_counts(case_id)
         total = sum(counts.values())
+        self._result_counts["entities"] = total
+        self._sync_analysis_status()
 
         self.entity_model.removeRows(0, self.entity_model.rowCount())
+        self.entity_source.clear()
         for entity in self._entities:
             artifact_name = ""
             artifact = getattr(entity, "artifact", None)
@@ -568,8 +650,10 @@ class EntitiesTimelinePage(ResponsivePage):
         query = self.rel_search.text().strip().lower()
 
         rows = self.analysis_service.list_relationships(
-            case_id, status=status, kind=kind, limit=RELATIONSHIP_TAB_LIMIT
+            case_id, status=status, kind=kind, limit=RELATIONSHIP_TAB_LIMIT + 1
         )
+        truncated = len(rows) > RELATIONSHIP_TAB_LIMIT
+        rows = rows[:RELATIONSHIP_TAB_LIMIT]
         if query:
             rows = [
                 row for row in rows
@@ -590,7 +674,8 @@ class EntitiesTimelinePage(ResponsivePage):
                 QStandardItem(_readable(row.kind.value)),
                 QStandardItem(str(row.shared_count)),
                 QStandardItem(f"{float(row.score):.2f}"),
-                QStandardItem(_readable(row.status.value)),
+                QStandardItem("Unreviewed" if row.status == RelationshipStatus.PENDING
+                              else _readable(row.status.value)),
             ]
             details = _loads(row.details_json)
             tooltip = details.get("sample") or ""
@@ -601,11 +686,19 @@ class EntitiesTimelinePage(ResponsivePage):
             self.rel_model.appendRow(cells)
 
         counts = self.analysis_service.relationship_counts(case_id)
+        self._result_counts["relationships"] = sum(counts.values())
+        self._sync_analysis_status()
         self.rel_summary.setText(
-            f"{len(rows):,} shown — {counts.get('pending', 0):,} pending, "
-            f"{counts.get('confirmed', 0):,} confirmed, "
+            f"{len(rows):,} shown · {counts.get('pending', 0):,} unreviewed · "
+            f"{counts.get('confirmed', 0):,} confirmed · "
             f"{counts.get('rejected', 0):,} rejected"
         )
+        if truncated:
+            self.rel_summary.setText(
+                self.rel_summary.text()
+                + f" · Search covers only the top {RELATIONSHIP_TAB_LIMIT:,} by score"
+                " for the selected status and kind; change those filters to see other candidates"
+            )
         self.relationship_stack.setCurrentIndex(1 if not rows else 0)
         if not rows:
             if sum(counts.values()):
@@ -619,8 +712,20 @@ class EntitiesTimelinePage(ResponsivePage):
                 self.relationship_empty_state.empty_title.setText(
                     "No relationship candidates yet"
                 )
+                job_states = {
+                    job.status for job in self._jobs
+                    if job.evidence is not None and job.evidence.removed_at is None
+                }
+                if job_states & {AnalysisJobStatus.RUNNING, AnalysisJobStatus.PENDING}:
+                    guidance = "Analysis is queued or running. Results will appear here when ready."
+                elif job_states & {AnalysisJobStatus.FAILED, AnalysisJobStatus.INTERRUPTED}:
+                    guidance = "Analysis stopped. Open Analysis Queue to inspect the job and retry it."
+                elif AnalysisJobStatus.COMPLETED in job_states:
+                    guidance = "Analysis completed without relationship candidates. Review entities and timeline for other results."
+                else:
+                    guidance = "Examine evidence first, then queue any missing analysis."
                 self.relationship_empty_state.empty_description.setText(
-                    "Run analysis after examining evidence. Candidate links appear here with their supporting artifacts for review."
+                    guidance
                 )
             if sum(counts.values()):
                 self.rel_detail.setText(
@@ -633,6 +738,7 @@ class EntitiesTimelinePage(ResponsivePage):
             self.rel_evidence.clear()
             self.rel_evidence.hide()
             self.rel_review_controls.hide()
+            self.rel_detail_panel.hide()
         elif self._selected_relationship() is None:
             self.rel_detail.setText(
                 "Select a candidate to inspect its supporting evidence."
@@ -640,12 +746,15 @@ class EntitiesTimelinePage(ResponsivePage):
             self.rel_evidence.clear()
             self.rel_evidence.hide()
             self.rel_review_controls.hide()
+            self.rel_detail_panel.hide()
 
     def _refresh_timeline(self) -> None:
         if self.analysis_service is None or self.case_context is None:
             return
         case_id = self.case_context.case_id
-        rows = self.analysis_service.list_timeline(case_id, limit=TIMELINE_TAB_LIMIT)
+        rows = self.analysis_service.list_timeline(case_id, limit=TIMELINE_TAB_LIMIT + 1)
+        truncated = len(rows) > TIMELINE_TAB_LIMIT
+        rows = rows[:TIMELINE_TAB_LIMIT]
         self._timeline = rows
 
         # Rebuild the event-type filter only when the set of types changed, so
@@ -675,6 +784,7 @@ class EntitiesTimelinePage(ResponsivePage):
                 not query
                 or query in (row.title or "").lower()
                 or query in (row.description or "").lower()
+                or query in self._timeline_source_label(row).lower()
             )
         ]
 
@@ -694,6 +804,12 @@ class EntitiesTimelinePage(ResponsivePage):
             self.timeline_model.appendRow(cells)
 
         self.tl_summary.setText(f"{len(visible):,} of {len(rows):,} events")
+        if truncated:
+            self.tl_summary.setText(
+                self.tl_summary.text()
+                + f" · Filters and event types cover only the most recent {TIMELINE_TAB_LIMIT:,} events"
+                "; older events are not included"
+            )
         if rows and not visible:
             self.timeline_empty_state.empty_title.setText("No events match these filters")
             self.timeline_empty_state.empty_description.setText(
@@ -702,7 +818,7 @@ class EntitiesTimelinePage(ResponsivePage):
         else:
             self.timeline_empty_state.empty_title.setText("No timeline events yet")
             self.timeline_empty_state.empty_description.setText(
-                "File timestamps are added after analysis. Event times use the computer's local time zone."
+                "File timestamps are added after analysis. Times use IDFA's display time zone (IST by default)."
             )
         self.timeline_stack.setCurrentIndex(1 if not visible else 0)
 
@@ -728,8 +844,10 @@ class EntitiesTimelinePage(ResponsivePage):
             evidence = getattr(job, "evidence", None)
             evidence_label = (
                 f"{evidence.evidence_id} — {evidence.name}"
-                if evidence is not None else f"#{job.evidence_id}"
+                if evidence is not None else "Evidence unavailable"
             )
+            if evidence is not None and evidence.removed_at is not None:
+                evidence_label += " (removed from case)"
             detail = job.error_message or job.progress_message or ""
             cells = [
                 QStandardItem(job.job_id),
@@ -746,27 +864,51 @@ class EntitiesTimelinePage(ResponsivePage):
             self.queue_model.appendRow(cells)
 
         counts = self.analysis_service.counts(case_id)
+        self._queue_counts = counts
+        self._sync_analysis_status()
         self.queue_summary.setText(
             f"{counts.get('pending', 0):,} queued, {counts.get('running', 0):,} running, "
             f"{counts.get('completed', 0):,} completed, {counts.get('failed', 0):,} failed"
         )
         self.queue_stack.setCurrentIndex(1 if not self._jobs else 0)
+        self._update_queue_actions()
 
     # ------------------------------------------------------------------
     # Entity → relationship drill-down
     # ------------------------------------------------------------------
+    def _on_entity_selected(self, *_args) -> None:
+        indexes = self.entity_table.selectionModel().selectedRows()
+        if not indexes or not 0 <= indexes[0].row() < len(self._entities):
+            self.entity_source.clear()
+            return
+        entity = self._entities[indexes[0].row()]
+        artifact = getattr(entity, "artifact", None)
+        if artifact is None:
+            source = "Source artifact unavailable"
+        else:
+            source = (f"{getattr(artifact, 'name', '') or 'Artifact'} "
+                      f"({getattr(artifact, 'artifact_id', '') or 'ID unavailable'})\n"
+                      f"Path: {getattr(artifact, 'source_path', '') or 'not recorded'}")
+        self.entity_source.setPlainText(
+            f"{source}\n\nRecorded context (verify against the source):\n"
+            f"{entity.context_snippet or 'No quote/context recorded.'}"
+        )
+
     def _on_entity_activated(self, index) -> None:
         if not (0 <= index.row() < len(self._entities)):
             return
         entity = self._entities[index.row()]
+        self.rel_status_filter.setCurrentIndex(self.rel_status_filter.findData(""))
+        self.rel_kind_filter.setCurrentIndex(self.rel_kind_filter.findData(""))
         self.rel_search.setText(entity.value)
         self.tabs.setCurrentIndex(0)
         if not self._relationships:
             QMessageBox.information(
                 self,
                 "No links yet",
-                f"'{entity.value}' is recorded in this case, but nothing else "
-                "is linked to it yet.",
+                f"No displayed links match '{entity.value}'. Search covers only "
+                f"the top {RELATIONSHIP_TAB_LIMIT:,} candidates by score; other "
+                "links may exist outside that limit.",
             )
 
     # ------------------------------------------------------------------
@@ -790,6 +932,7 @@ class EntitiesTimelinePage(ResponsivePage):
             self.rel_evidence.clear()
             self.rel_evidence.hide()
             self.rel_review_controls.hide()
+            self.rel_detail_panel.hide()
             return
 
         details = _loads(relationship.details_json)
@@ -806,7 +949,8 @@ class EntitiesTimelinePage(ResponsivePage):
             self.rel_detail.setText(
                 f"'{details.get('left_name') or relationship.left_value}' and "
                 f"'{details.get('right_name') or relationship.right_value}' "
-                f"mention {relationship.shared_count} of the same identifier(s)."
+                f"mention {relationship.shared_count} of the same identifier(s). "
+                "A shared identifier alone does not establish identity or ownership."
             )
         else:
             sample = details.get("sample")
@@ -815,7 +959,11 @@ class EntitiesTimelinePage(ResponsivePage):
                 f"{_readable(relationship.right_type)} '{relationship.right_value}' "
                 f"appear together in {relationship.shared_count} artifact(s) "
                 f"(coverage {float(relationship.score):.0%})."
-                + (f"\n\n“{sample}”" if sample else "")
+                + (
+                    f"\n\nUnattributed sample (source artifact not recorded; "
+                    f"verify against supporting artifacts):\n“{sample}”"
+                    if sample else ""
+                )
             )
 
         names = self._artifact_labels(artifact_ids)
@@ -832,51 +980,102 @@ class EntitiesTimelinePage(ResponsivePage):
             lines.append("Shared identifiers:")
             for item in details["shared"]:
                 if isinstance(item, dict):
-                    lines.append(
-                        f"  • {_readable(item.get('type', ''))}: {item.get('value', '')}"
+                    count = item.get("case_artifact_count")
+                    frequency = (
+                        f" (seen in {count} case artifact(s))" if isinstance(count, int) else ""
                     )
+                    lines.append(
+                        f"  • {_readable(item.get('type', ''))}: {item.get('value', '')}{frequency}"
+                    )
+                    for excerpt in item.get("excerpts", []):
+                        if isinstance(excerpt, dict) and excerpt.get("text"):
+                            labels = self._artifact_labels([excerpt.get("artifact_id")])
+                            label = labels[0] if labels else "Artifact unavailable"
+                            lines.append(f"    {label}: {excerpt['text']}")
+                    if not item.get("excerpts"):
+                        lines.append("    Source excerpts unavailable; inspect artifacts directly.")
+            lines.append("Counts reflect extracted mentions, not independent sources or identity.")
         lines.append("")
-        lines.append(
-            "Evidence ids: " + (", ".join(str(value) for value in evidence_ids) or "—")
-        )
+        lines.append("Evidence sources:")
+        evidence_labels = self._evidence_labels(evidence_ids)
+        lines.extend(f"  • {label}" for label in evidence_labels)
+        if not evidence_labels:
+            lines.append("  No evidence sources recorded.")
         if details.get("paths"):
             lines.append("")
             lines.append("Copies:")
             lines.extend(f"  • {path}" for path in details["paths"][:20])
         self.rel_evidence.setPlainText("\n".join(lines))
+        self.rel_detail_panel.show()
         self.rel_evidence.show()
         self.rel_review_controls.show()
 
+        self.confirm_btn.setVisible(relationship.status != RelationshipStatus.CONFIRMED)
+        self.reject_btn.setVisible(relationship.status != RelationshipStatus.REJECTED)
+        self.reset_btn.setVisible(relationship.status != RelationshipStatus.PENDING)
         if relationship.status != RelationshipStatus.PENDING:
             self.rel_review_note.setText(
                 f"Reviewed: {_readable(relationship.status.value)}"
             )
         else:
-            self.rel_review_note.setText("")
+            self.rel_review_note.setText("Unreviewed — verify the sources before deciding")
 
     def _artifact_labels(self, artifact_ids: list) -> list[str]:
         """Resolve artifact primary keys to readable names."""
-        if not artifact_ids or self.analysis_service is None:
+        if not artifact_ids or self.analysis_service is None or self.case_context is None:
             return []
         from sqlalchemy import select
 
         from app.artifacts.models import Artifact
 
         session = self.analysis_service.session
+        ids = [int(value) for value in artifact_ids if str(value).isdigit()]
         try:
             rows = session.execute(
                 select(Artifact.id, Artifact.artifact_id, Artifact.name, Artifact.source_path)
-                .where(Artifact.id.in_([int(value) for value in artifact_ids]))
+                .where(Artifact.id.in_(ids), Artifact.case_id == self.case_context.case_id)
             ).all()
         except Exception:
-            return []
+            rows = []
         by_id = {row.id: row for row in rows}
         labels = []
         for value in artifact_ids:
-            row = by_id.get(int(value))
+            row = by_id.get(int(value)) if str(value).isdigit() else None
             if row is None:
+                labels.append("Artifact unavailable in this case")
                 continue
             labels.append(f"{row.name} ({row.artifact_id}) — {row.source_path or 'no path'}")
+        return labels
+
+    def _evidence_labels(self, evidence_ids: list) -> list[str]:
+        """Resolve recorded database keys only within the current case."""
+        if not evidence_ids:
+            return []
+        from sqlalchemy import select
+
+        from app.evidence.models import Evidence
+
+        ids = [int(value) for value in evidence_ids if str(value).isdigit()]
+        rows = []
+        if self.analysis_service is not None and self.case_context is not None:
+            try:
+                rows = self.analysis_service.session.execute(
+                    select(Evidence.id, Evidence.evidence_id, Evidence.name, Evidence.removed_at)
+                    .where(Evidence.case_id == self.case_context.case_id, Evidence.id.in_(ids))
+                ).all()
+            except Exception:  # noqa: BLE001 - provenance must not break review
+                pass
+        by_id = {row.id: row for row in rows}
+        labels = []
+        for value in evidence_ids:
+            row = by_id.get(int(value)) if str(value).isdigit() else None
+            if row is None:
+                labels.append("Evidence unavailable in this case")
+            else:
+                label = f"{row.evidence_id} — {row.name}"
+                if row.removed_at is not None:
+                    label += " (removed from case)"
+                labels.append(label)
         return labels
 
     def _artifact_label_map(self) -> dict[str, str]:
@@ -934,21 +1133,70 @@ class EntitiesTimelinePage(ResponsivePage):
     # ------------------------------------------------------------------
     # Queue actions
     # ------------------------------------------------------------------
+    def _set_status_detail(self, text: str) -> None:
+        self.status_detail.setText(text)
+        self.status_detail.setVisible(bool(text))
+
+    def _sync_analysis_status(self) -> None:
+        counts = self._queue_counts
+        pending = counts.get("pending", 0)
+        running = counts.get("running", 0)
+        completed = counts.get("completed", 0)
+        stopped = sum(counts.get(key, 0) for key in ("failed", "interrupted", "cancelled"))
+        if running or pending:
+            text = f"Analysis: {running:,} running · {pending:,} queued"
+        elif completed:
+            text = f"Analysis complete · {completed:,} completed job(s) · No jobs queued"
+        elif stopped:
+            text = "Analysis stopped · No jobs queued"
+        else:
+            text = "No analysis jobs · Examine evidence to get started"
+        if stopped:
+            text += f" · {stopped:,} stopped (see Analysis Queue)"
+        if self._result_counts:
+            text += " · " + " · ".join(
+                f"{count:,} {name}" for name, count in self._result_counts.items()
+            )
+        if self.runner is not None and self.runner.paused:
+            text = "Queue paused · " + text
+        self.status_label.setText(text)
+        self.manage_jobs_btn.setEnabled(bool(sum(counts.values())))
+
+    def _show_analysis_queue(self) -> None:
+        self.tabs.setCurrentIndex(3)
+        if self._selected_job() is None:
+            for index, job in enumerate(self._jobs):
+                if job.status == AnalysisJobStatus.COMPLETED:
+                    self.queue_table.selectRow(index)
+                    break
+
     def _on_run_now(self) -> None:
         if self.analysis_service is None or self.case_context is None:
             return
         try:
-            created = self.analysis_service.enqueue_missing(self.case_context.case_id)
+            if not self.analysis_service.config.analysis.enabled:
+                self._set_status_detail("Analysis is disabled in Settings.")
+                return
+            from app.auth.models import User
+
+            user_id = _current_user_id(self)
+            user = self.analysis_service.session.get(User, user_id) if user_id is not None else None
+            if user is not None:
+                self.analysis_service.session.refresh(user)
+            created = self.analysis_service.enqueue_missing(
+                self.case_context.case_id, created_by=user, manual=True
+            )
             self.analysis_service.session.commit()
         except Exception as exc:  # noqa: BLE001
             self.analysis_service.session.rollback()
             QMessageBox.critical(self, "Could not queue analysis", str(exc))
             return
         if created:
-            self.status_detail.setText(f"Queued {len(created)} analysis job(s)")
+            self._set_status_detail(f"Queued {len(created)} analysis job(s)")
         else:
-            self.status_detail.setText(
-                "Every examination in this case has already been analysed"
+            self._set_status_detail(
+                "No new examinations need analysis. "
+                "Open Analysis Queue to retry or re-run an existing job."
             )
         if self.runner is not None:
             self.runner.resume()
@@ -962,13 +1210,14 @@ class EntitiesTimelinePage(ResponsivePage):
         else:
             self.runner.pause()
         self._sync_pause_button()
+        self._sync_analysis_status()
 
     def _sync_pause_button(self) -> None:
         if self.runner is None:
             self.pause_btn.setEnabled(False)
             return
         self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Resume" if self.runner.paused else "Pause")
+        self.pause_btn.setText("Resume queue" if self.runner.paused else "Pause queue")
 
     def _selected_job(self):
         indexes = self.queue_table.selectionModel().selectedRows()
@@ -979,13 +1228,50 @@ class EntitiesTimelinePage(ResponsivePage):
             return self._jobs[row]
         return None
 
+    def _update_queue_actions(self, *_args):
+        job = self._selected_job()
+        status = job.status if job else None
+        self.retry_btn.setText("Re-run" if status == AnalysisJobStatus.COMPLETED else "Retry")
+        self.retry_btn.setToolTip(
+            "Run this completed analysis again." if status == AnalysisJobStatus.COMPLETED
+            else "Retry a stopped or failed analysis."
+        )
+        self.retry_btn.setEnabled(status in (
+            AnalysisJobStatus.FAILED, AnalysisJobStatus.CANCELLED,
+            AnalysisJobStatus.INTERRUPTED, AnalysisJobStatus.COMPLETED,
+        ))
+        self.cancel_btn.setEnabled(status in (AnalysisJobStatus.PENDING, AnalysisJobStatus.RUNNING))
+
     def _on_retry(self) -> None:
         job = self._selected_job()
         if job is None or self.analysis_service is None:
             QMessageBox.information(self, "Nothing selected", "Select a job first.")
             return
-        if self.analysis_service.retry(job.id):
-            self.status_detail.setText(f"{job.job_id} queued again")
+        if self.case_context is None:
+            return
+        if job.status in (AnalysisJobStatus.PENDING, AnalysisJobStatus.RUNNING):
+            self._update_queue_actions()
+            return
+        if job.status == AnalysisJobStatus.COMPLETED and QMessageBox.question(
+            self, "Re-run completed analysis?",
+            "Re-run this job? Extracted results may be rebuilt. "
+            "Confirmed and rejected relationship decisions are preserved.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        from app.auth.models import User
+        user_id = _current_user_id(self)
+        user = self.analysis_service.session.get(User, user_id) if user_id is not None else None
+        if user is not None:
+            self.analysis_service.session.refresh(user)
+        try:
+            retried = self.analysis_service.retry(job.id, self.case_context.case_id, user)
+        except PermissionError as exc:
+            QMessageBox.warning(self, "Cannot retry", str(exc))
+            return
+        if retried:
+            self._set_status_detail(f"{job.job_id} queued again")
             if self.runner is not None:
                 self.runner.resume()
         else:
@@ -999,7 +1285,17 @@ class EntitiesTimelinePage(ResponsivePage):
         if job is None or self.analysis_service is None:
             QMessageBox.information(self, "Nothing selected", "Select a job first.")
             return
-        if not self.analysis_service.cancel(job.id):
+        from app.auth.models import User
+        user_id = _current_user_id(self)
+        user = self.analysis_service.session.get(User, user_id) if user_id is not None else None
+        if user is not None:
+            self.analysis_service.session.refresh(user)
+        try:
+            cancelled = self.analysis_service.cancel(job.id, self.case_context.case_id, user)
+        except PermissionError as exc:
+            QMessageBox.warning(self, "Cannot cancel", str(exc))
+            return
+        if not cancelled:
             QMessageBox.information(
                 self,
                 "Cannot cancel",
@@ -1011,7 +1307,12 @@ class EntitiesTimelinePage(ResponsivePage):
     # Runner signals
     # ------------------------------------------------------------------
     def _on_runner_status(self, text: str) -> None:
-        self.status_label.setText(text)
+        # Runner idle messages describe scheduling, not whether results exist.
+        self._sync_analysis_status()
+        if text not in {
+            "Analysis queue empty", "Analysis running", "Analysis paused", "Analysing…"
+        }:
+            self._set_status_detail(text)
         self._sync_pause_button()
 
     def _on_runner_started(self, payload: dict) -> None:
@@ -1024,24 +1325,26 @@ class EntitiesTimelinePage(ResponsivePage):
         percent = int(payload.get("percent") or 0)
         self.queue_progress.setValue(percent)
         message = payload.get("message") or payload.get("stage") or ""
-        self.status_detail.setText(message)
+        self._set_status_detail(message)
 
     def _on_runner_finished(self, summary: dict) -> None:
         self.queue_progress.hide()
         if summary.get("ok"):
             self.status_label.setText("Analysis complete")
-            self.status_detail.setText(summary.get("message") or "")
+            self._set_status_detail(summary.get("message") or "")
         elif summary.get("error"):
             self.status_label.setText("Analysis stopped")
-            self.status_detail.setText(summary["error"])
+            self._set_status_detail(summary["error"])
         else:
             self.status_label.setText("Analysis cancelled")
-            self.status_detail.setText(summary.get("message") or "")
+            self._set_status_detail(summary.get("message") or "")
         self.refresh()
 
     def _on_queue_changed(self, counts: dict) -> None:
         if not isinstance(counts, dict) or not counts:
             return
+        self._queue_counts = counts
+        self._sync_analysis_status()
         self.queue_summary.setText(
             f"{counts.get('pending', 0):,} queued, "
             f"{counts.get('running', 0):,} running, "

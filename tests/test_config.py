@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from app.config import (
     Config,
     check_data_folder,
@@ -27,6 +29,18 @@ def test_legacy_embedding_model_is_migrated():
     assert embedding_model_name("all-MiniLM-L6-v2") == "all-minilm"
     assert embedding_model_name("") == "all-minilm"
     assert embedding_model_name("nomic-embed-text") == "nomic-embed-text"
+
+
+def test_embedding_chunk_configuration_is_validated():
+    from pydantic import ValidationError
+
+    from app.config import EmbeddingConfig
+
+    config = EmbeddingConfig(chunk_size=2400, chunk_overlap=300)
+    assert config.chunk_size == 2400
+    assert config.chunk_overlap == 300
+    with pytest.raises(ValidationError):
+        EmbeddingConfig(chunk_size=1000, chunk_overlap=1000)
 
 
 def test_localhost_is_normalised():

@@ -18,6 +18,13 @@ class FindingService:
     def __init__(self, session: Session):
         self.session = session
 
+    def _require_writer(self, actor: User | None, case_id: int) -> None:
+        from app.auth.service import AuthService
+
+        user = self.session.get(User, actor.id) if actor is not None and actor.id is not None else None
+        if user is None or not user.is_active or not AuthService(self.session).user_can_write_case(user, case_id):
+            raise PermissionError("An active user with write access to the case is required")
+
     def _generate_finding_id(self, case_id: int) -> str:
         """Generate next finding ID for case (F001, F002, ...)."""
         stmt = select(Finding).where(Finding.case_id == case_id).order_by(Finding.id.desc())
@@ -171,6 +178,7 @@ class FindingService:
         finding = self.get_finding(finding_id)
         if not finding:
             return None
+        self._require_writer(verified_by, finding.case_id)
         from app.findings.identity import is_identity_hypothesis, validate_identity_hypothesis
 
         if is_identity_hypothesis(finding):
@@ -190,12 +198,15 @@ class FindingService:
         notes: str | None = None,
         cited_in_ai: bool = False,
         *,
+        actor: User | None = None,
         _identity_creation: bool = False,
     ) -> FindingArtifactLink:
         """Link an artifact to a finding."""
         from app.evidence.models import Evidence
 
         finding = self.get_finding(finding_id)
+        if finding is not None:
+            self._require_writer(actor, finding.case_id)
         from app.findings.identity import is_identity_hypothesis
 
         if finding is not None and is_identity_hypothesis(finding) and not _identity_creation:
@@ -226,11 +237,13 @@ class FindingService:
         self.session.flush()
         return link
 
-    def unlink_artifact(self, finding_id: int, artifact_id: int) -> bool:
+    def unlink_artifact(self, finding_id: int, artifact_id: int, *, actor: User | None = None) -> bool:
         """Remove artifact link from finding."""
         from app.findings.identity import is_identity_hypothesis
 
         finding = self.get_finding(finding_id)
+        if finding is not None:
+            self._require_writer(actor, finding.case_id)
         if finding is not None and is_identity_hypothesis(finding):
             raise ValueError(
                 "Identity sources cannot be changed here; create a new hypothesis "

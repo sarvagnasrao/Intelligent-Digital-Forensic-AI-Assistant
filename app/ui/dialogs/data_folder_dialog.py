@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QTextOption
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QRadioButton,
     QVBoxLayout,
     QWidget,
@@ -127,8 +129,13 @@ class _FolderPicker(QWidget):
         for row, (label, value) in enumerate(_derived_rows(self._base, root)):
             caption = QLabel(label)
             caption.setProperty("muted", True)
-            path_label = QLabel(value)
-            path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            # A read-only line edit keeps long paths selectable and horizontally
+            # scrollable without forcing the whole dialog wider than the screen.
+            path_label = QLineEdit(value)
+            path_label.setReadOnly(True)
+            path_label.setFrame(False)
+            path_label.setStyleSheet("background: transparent; border: none; padding: 0;")
+            path_label.setToolTip(value)
             self.details.addWidget(caption, row, 0)
             self.details.addWidget(path_label, row, 1)
 
@@ -247,8 +254,13 @@ class MissingDataFolderDialog(QDialog):
         heading.setStyleSheet("font-size: 16px; font-weight: 600;")
         layout.addWidget(heading)
 
-        path_label = QLabel(data_dir)
-        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        # Wrap even long, unbroken path components without altering the text
+        # investigators can select and copy. Extra-long paths remain scrollable.
+        path_label = QPlainTextEdit()
+        path_label.setPlainText(data_dir)
+        path_label.setReadOnly(True)
+        path_label.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        path_label.setFixedHeight(70)
         layout.addWidget(path_label)
 
         reason_label = QLabel(reason)
@@ -298,7 +310,7 @@ class ChangeDataFolderDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Change data folder")
         self.setModal(True)
-        self.setMinimumWidth(660)
+        self.setMinimumWidth(640)
         self._config = config
 
         layout = QVBoxLayout(self)
@@ -324,13 +336,14 @@ class ChangeDataFolderDialog(QDialog):
         layout.addWidget(divider)
 
         self.move_radio = QRadioButton(
-            "Move my data here — copy the database and evidence, keep the old folder as a backup"
+            "Move data — copy database and evidence;\n"
+            "keep the old folder as backup"
         )
         self.adopt_radio = QRadioButton(
-            "Use data already in that folder — nothing is copied"
+            "Use data already in that folder\n— nothing is copied"
         )
         self.fresh_radio = QRadioButton(
-            "Start fresh — create an empty database in that folder"
+            "Start fresh — create an empty database\nin that folder"
         )
         self.move_radio.setChecked(True)
 

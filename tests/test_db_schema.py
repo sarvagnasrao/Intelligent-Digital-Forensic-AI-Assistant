@@ -77,6 +77,38 @@ def test_init_db_is_idempotent(database):
     assert recorded_revision(database) == head_revision()
 
 
+def test_cleanup_indexes_are_restored_for_older_databases(database):
+    database.init_db()
+    engine = database.get_engine()
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP INDEX IF EXISTS ix_timeline_events_entity_id")
+        connection.exec_driver_sql("DROP INDEX IF EXISTS ix_artifacts_evidence_id")
+    database._ensure_deletion_indexes()
+    with engine.connect() as connection:
+        indexes = {row[0] for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        )}
+    assert {"ix_timeline_events_entity_id", "ix_artifacts_evidence_id"} <= indexes
+
+
+def test_init_db_restores_indexes_on_existing_tables(database):
+    database.init_db()
+    with database.get_engine().begin() as connection:
+        connection.exec_driver_sql("DROP INDEX IF EXISTS ix_entities_value")
+
+    # create_all alone does not recreate indexes when their table already exists.
+    database.init_db()
+
+    with database.get_engine().connect() as connection:
+        indexes = {
+            row[0]
+            for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+    assert "ix_entities_value" in indexes
+
+
 def test_a_stale_revision_is_moved_to_head(database):
     """The failure seen in the field: schema at 002, revision says 001."""
     database.init_db()

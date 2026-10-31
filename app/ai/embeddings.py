@@ -132,7 +132,7 @@ def embed_texts(texts: list[str], *, batch: int | None = None) -> list[list[floa
             else:
                 response = httpx.post(
                     f"{host()}/api/embed",
-                    json={"model": model_id(), "input": chunk},
+                    json={"model": model_id(), "input": chunk, "options": {"num_gpu": 0}},
                     timeout=_timeout(),
                 )
         except Exception as exc:

@@ -13,7 +13,6 @@
 QWidget {
     background-color: @bg-primary;
     color: @text-primary;
-    font-size: 13px;
 }
 
 /* --------------------------------------------------------------------------
@@ -34,29 +33,29 @@ QMainWindow::separator {
    -------------------------------------------------------------------------- */
 QSplitter::handle {
     background: @bg-tertiary;
-    width: 6px;
-    height: 6px;
+    width: 10px;
+    height: 10px;
 }
 QSplitter::handle:hover {
     background: @accent;
 }
 QSplitter::handle:horizontal {
-    width: 6px;
+    width: 10px;
 }
 QSplitter::handle:vertical {
-    height: 6px;
+    height: 10px;
 }
 QSplitter#NavigationSplitter::handle {
     background: transparent;
-    width: 1px;
+    width: 10px;
 }
 
 /* --------------------------------------------------------------------------
-   Scrollbars - Thin, unobtrusive
+   Scrollbars
    -------------------------------------------------------------------------- */
 QScrollBar:vertical {
     background: transparent;
-    width: 8px;
+    width: 14px;
     margin: 4px 0;
 }
 QScrollBar::handle:vertical {
@@ -79,7 +78,7 @@ QScrollBar::sub-page:vertical {
 
 QScrollBar:horizontal {
     background: transparent;
-    height: 8px;
+    height: 14px;
     margin: 0 4px;
 }
 QScrollBar::handle:horizontal {
@@ -90,6 +89,14 @@ QScrollBar::handle:horizontal {
 }
 QScrollBar::handle:horizontal:hover {
     background: @accent;
+}
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: transparent;
 }
 
 /* --------------------------------------------------------------------------
@@ -124,7 +131,6 @@ QPushButton {
     border: 1px solid @border-default;
     border-radius: 6px;
     padding: 0 16px;
-    font-size: 13px;
     font-weight: 500;
     min-height: 36px;
 }
@@ -436,6 +442,11 @@ QTableView::item:selected, QTreeView::item:selected {
 QTableView::item:hover, QTreeView::item:hover {
     background: @bg-tertiary;
 }
+/* Hover must not obscure the current selection in dense evidence lists. */
+QTableView::item:selected:hover, QTreeView::item:selected:hover {
+    background: @accent-strong;
+    color: @text-primary;
+}
 
 QHeaderView::section {
     background: @bg-card;
@@ -501,13 +512,12 @@ QTabWidget::pane {
 QTabBar::tab {
     background: transparent;
     color: @text-secondary;
-    padding: 10px 20px;
+    padding: 10px 16px;
     margin-right: 4px;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
     font-weight: 500;
     font-size: 13px;
-    min-width: 80px;
 }
 QTabBar::tab:selected {
     background: @accent-strong;
@@ -683,9 +693,9 @@ QLabel[caption="true"] {
     letter-spacing: 0.5px;
 }
 QLabel[fieldLabel="true"] {
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 500;
-    color: @text-muted;
+    color: @text-secondary;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     margin-bottom: 4px;
@@ -1112,6 +1122,10 @@ QRadioButton::indicator:checked {
     background: @bg-input;
     border-color: @accent;
     image: url("@icon-dir/radio-dot.png");
+}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    background: @bg-disabled;
+    border-color: @border-subtle;
 }
 
 /* --------------------------------------------------------------------------

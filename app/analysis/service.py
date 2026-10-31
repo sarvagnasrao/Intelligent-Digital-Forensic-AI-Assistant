@@ -21,7 +21,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.analysis.extractors import (
@@ -93,7 +93,8 @@ class AnalysisService:
             return None
 
         auth_service = AuthService(self.session)
-        if not auth_service.user_can_write_case(created_by, case_id):
+        if (created_by is None or not created_by.is_active
+                or not auth_service.user_can_write_case(created_by, case_id)):
             raise PermissionError("Read-only users cannot perform analysis")
 
         if examination_job_id is not None:
@@ -117,7 +118,9 @@ class AnalysisService:
         self.session.flush()
         return job
 
-    def enqueue_missing(self, case_id: int, created_by: User | None = None, *, manual: bool = False) -> list[AnalysisJob]:
+    def enqueue_missing(
+        self, case_id: int, created_by: User | None = None, *, manual: bool = False
+    ) -> list[AnalysisJob]:
         """Queue analysis for completed examinations that have none.
 
         This is what keeps a growing case current: a new evidence item gets a
@@ -126,16 +129,9 @@ class AnalysisService:
         if not self.config.analysis.enabled or (not self.config.analysis.auto_queue and not manual):
             return []
 
-        # Use a system user if not provided (for background auto-queue)
-        if created_by is None:
-            created_by = self.session.execute(
-                select(User).where(User.is_active == True).order_by(User.id)
-            ).scalars().first()
-            if created_by is None:
-                return []
-
         auth_service = AuthService(self.session)
-        if not auth_service.user_can_write_case(created_by, case_id):
+        if (created_by is None or not created_by.is_active
+                or not auth_service.user_can_write_case(created_by, case_id)):
             raise PermissionError("Read-only users cannot perform analysis")
 
         from app.evidence.models import Evidence
@@ -222,26 +218,37 @@ class AnalysisService:
             totals[status] = count
         return {status.value: value for status, value in totals.items()}
 
-    def cancel(self, job_pk: int) -> bool:
+    def _authorize_job_action(self, job_pk: int, case_id: int, user: User) -> AnalysisJob | None:
+        actor = self.session.get(User, user.id) if user is not None and user.id is not None else None
+        if actor is not None:
+            self.session.refresh(actor)
+        if (case_id is None or actor is None or not actor.is_active
+                or not AuthService(self.session).user_can_write_case(actor, case_id)):
+            raise PermissionError("Case write access required")
         job = self.get_job(job_pk)
+        if job is not None and job.case_id != case_id:
+            raise PermissionError("Analysis job does not belong to the selected case")
+        return job
+
+    def cancel(self, job_pk: int, case_id: int, user: User) -> bool:
+        job = self._authorize_job_action(job_pk, case_id, user)
         if job is None:
             return False
-        _CANCELLED.add(job_pk)
-        if job.status == AnalysisJobStatus.PENDING:
-            job.status = AnalysisJobStatus.CANCELLED
-            job.completed_at = _now()
-            job.progress_message = "Cancelled before it started"
-            self.session.commit()
-            return True
-        if job.status == AnalysisJobStatus.RUNNING:
-            # The loop notices at its next artifact and finishes the job itself.
-            job.progress_message = "Cancelling…"
-            self.session.commit()
-            return True
-        return False
+        result = self.session.execute(update(AnalysisJob).where(
+            AnalysisJob.id == job_pk, AnalysisJob.case_id == case_id,
+            AnalysisJob.status == AnalysisJobStatus.PENDING,
+        ).values(status=AnalysisJobStatus.CANCELLED, completed_at=_now(),
+                 progress_message="Cancelled by investigator"))
+        if not result.rowcount:
+            result = self.session.execute(update(AnalysisJob).where(
+                AnalysisJob.id == job_pk, AnalysisJob.case_id == case_id,
+                AnalysisJob.status == AnalysisJobStatus.RUNNING,
+            ).values(progress_message="Cancelling…"))
+        self.session.commit()
+        return bool(result.rowcount)
 
-    def retry(self, job_pk: int) -> bool:
-        job = self.get_job(job_pk)
+    def retry(self, job_pk: int, case_id: int, user: User) -> bool:
+        job = self._authorize_job_action(job_pk, case_id, user)
         if job is None:
             return False
         if job.status in (AnalysisJobStatus.PENDING, AnalysisJobStatus.RUNNING):
@@ -257,23 +264,6 @@ class AnalysisService:
         self.session.commit()
         return True
 
-    def mark_interrupted(self) -> int:
-        """Mark jobs left running by a previous session.
-
-        Otherwise the queue shows a job that will never move, and the runner
-        keeps waiting on a thread that no longer exists.
-        """
-        rows = self.session.execute(
-            select(AnalysisJob).where(AnalysisJob.status == AnalysisJobStatus.RUNNING)
-        ).scalars().all()
-        for job in rows:
-            job.status = AnalysisJobStatus.INTERRUPTED
-            job.progress_message = "Interrupted when the application closed"
-            job.completed_at = _now()
-        if rows:
-            self.session.commit()
-        return len(rows)
-
     def is_examination_running(self, case_id: int | None = None) -> bool:
         stmt = select(func.count()).select_from(ExaminationJob).where(
             ExaminationJob.status == JobStatus.RUNNING
@@ -286,13 +276,20 @@ class AnalysisService:
     # Running one job
     # ------------------------------------------------------------------
     def _check_cancelled(self, job: AnalysisJob) -> None:
-        if job.id in _CANCELLED:
+        state = self.session.execute(
+            select(AnalysisJob.status, AnalysisJob.progress_message).where(AnalysisJob.id == job.id)
+        ).one_or_none()
+        if (job.id in _CANCELLED or state is None or state[0] != AnalysisJobStatus.RUNNING
+                or state[1] == "Cancelling…"):
             raise AnalysisCancelled("Cancelled by investigator")
 
     def _progress(self, job: AnalysisJob, percent: int, stage: str, message: str) -> None:
-        job.progress_percent = max(0, min(99, percent))
-        job.stage = stage
-        job.progress_message = message
+        result = self.session.execute(update(AnalysisJob).where(
+            AnalysisJob.id == job.id, AnalysisJob.status == AnalysisJobStatus.RUNNING,
+            AnalysisJob.progress_message != "Cancelling…",
+        ).values(progress_percent=max(0, min(99, percent)), stage=stage, progress_message=message))
+        if not result.rowcount:
+            raise AnalysisCancelled("Cancelled by investigator")
         self.session.commit()
 
     async def run(self, job_pk: int, user: User) -> dict:
@@ -300,21 +297,24 @@ class AnalysisService:
         job = self.get_job(job_pk)
         if job is None:
             return {"ok": False, "error": "The analysis job no longer exists."}
-        if job.status not in (AnalysisJobStatus.PENDING, AnalysisJobStatus.RUNNING):
+        if job.status != AnalysisJobStatus.PENDING:
             return {"ok": False, "error": f"Job is {job.status.value}"}
 
         auth_service = AuthService(self.session)
-        if not auth_service.user_can_write_case(user, job.case_id):
+        if (user is None or not user.is_active
+                or not auth_service.user_can_write_case(user, job.case_id)):
             raise PermissionError("Read-only users cannot perform analysis")
 
-        _CANCELLED.discard(job_pk)
-        job.status = AnalysisJobStatus.RUNNING
-        job.started_at = _now()
-        job.error_message = None
-        job.progress_percent = 1
-        job.stage = "loading"
-        job.progress_message = "Loading artifacts"
+        if job_pk in _CANCELLED:
+            return {"ok": False, "cancelled": True, "error": "Cancelled by investigator"}
+        claimed = self.session.execute(update(AnalysisJob).where(
+            AnalysisJob.id == job_pk, AnalysisJob.status == AnalysisJobStatus.PENDING,
+        ).values(status=AnalysisJobStatus.RUNNING, started_at=_now(), error_message=None,
+                 progress_percent=1, stage="loading", progress_message="Loading artifacts"))
         self.session.commit()
+        if not claimed.rowcount:
+            return {"ok": False, "cancelled": True, "error": "Job is no longer pending"}
+        self.session.refresh(job)
 
         try:
             parameters = self._job_parameters(job)
@@ -345,10 +345,7 @@ class AnalysisService:
                     and self.is_examination_running(job.case_id)
                 )
                 if defer:
-                    job.progress_message = (
-                        "Model extraction skipped while an examination runs; "
-                        "re-run this job afterwards to add names."
-                    )
+                    llm_skipped_note = "model extraction skipped while examination runs"
                 elif self._cloud_llm_needs_consent(job.case_id):
                     llm_skipped_note = "cloud model NER skipped (case consent required)"
                 else:
@@ -366,6 +363,8 @@ class AnalysisService:
             return self._finish(job, entity_count=entity_count, message=summary)
 
         except AnalysisCancelled:
+            self.session.rollback()
+            job = self.get_job(job_pk)
             job.status = AnalysisJobStatus.CANCELLED
             job.stage = "cancelled"
             job.completed_at = _now()
@@ -377,6 +376,13 @@ class AnalysisService:
             self.session.rollback()
             job = self.get_job(job_pk)
             if job is not None:
+                if job.progress_message == "Cancelling…" or job_pk in _CANCELLED:
+                    job.status = AnalysisJobStatus.CANCELLED
+                    job.stage = "cancelled"
+                    job.progress_message = "Cancelled by investigator"
+                    job.completed_at = _now()
+                    self.session.commit()
+                    return {"ok": False, "cancelled": True, "error": "Cancelled by investigator"}
                 job.status = AnalysisJobStatus.FAILED
                 job.stage = "failed"
                 job.error_message = str(exc) or exc.__class__.__name__
@@ -409,12 +415,14 @@ class AnalysisService:
         return parameters
 
     def _finish(self, job: AnalysisJob, *, entity_count: int, message: str) -> dict:
-        job.status = AnalysisJobStatus.COMPLETED
-        job.stage = "done"
-        job.progress_percent = 100
-        job.entity_count = entity_count
-        job.progress_message = message
-        job.completed_at = _now()
+        self._check_cancelled(job)
+        result = self.session.execute(update(AnalysisJob).where(
+            AnalysisJob.id == job.id, AnalysisJob.status == AnalysisJobStatus.RUNNING,
+            AnalysisJob.progress_message != "Cancelling…",
+        ).values(status=AnalysisJobStatus.COMPLETED, stage="done", progress_percent=100,
+                 entity_count=entity_count, progress_message=message, completed_at=_now()))
+        if not result.rowcount:
+            raise AnalysisCancelled("Cancelled by investigator")
         self.session.commit()
         return {"ok": True, "entities": entity_count, "message": message}
 
@@ -430,6 +438,7 @@ class AnalysisService:
 
         # Re-analysis replaces the previous result for these artifacts, so a
         # re-examination cannot leave stale entities behind.
+        self._check_cancelled(job)
         artifact_ids = [artifact.id for artifact in artifacts]
         for start in range(0, len(artifact_ids), 500):
             batch = artifact_ids[start:start + 500]
@@ -556,6 +565,7 @@ class AnalysisService:
             result = await llm.extract_named_entities(
                 artifact.content_text or "", max_chars=max_chars
             )
+            self._check_cancelled(job)
             if result.error:
                 failures += 1
                 if failures == 1:
@@ -606,6 +616,7 @@ class AnalysisService:
                 max_shared_artifacts_listed=analysis.max_relationship_artifacts,
             ),
         ).rebuild(job_id=job.id)
+        self._check_cancelled(job)
         job.relationship_count = stats.created + stats.updated
         self.session.commit()
 

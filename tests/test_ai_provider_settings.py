@@ -50,6 +50,23 @@ def test_settings_expose_local_and_cloud_model_dropdowns(config_home, qt_app):
     assert page.cloud_api_key.echoMode() == page.cloud_api_key.EchoMode.Password
 
 
+def test_settings_persist_search_chunking_and_batch_parameters(config_home, qt_app):
+    from app.config import get_config
+    from app.ui.pages.settings_page import SettingsPage
+
+    page = SettingsPage()
+    page.embedding_chunk_size.setValue(1800)
+    page.embedding_chunk_overlap.setValue(250)
+    page.embedding_batch_size.setValue(24)
+
+    page._on_save()
+    config = get_config()
+
+    assert config.embeddings.chunk_size == 1800
+    assert config.embeddings.chunk_overlap == 250
+    assert config.embeddings.batch_size == 24
+
+
 def test_settings_split_into_navigable_panes(config_home, qt_app):
     from app.ui.pages.settings_page import NAV_ITEMS, SettingsPage
 
@@ -63,18 +80,18 @@ def test_settings_split_into_navigable_panes(config_home, qt_app):
     assert page._stack.currentIndex() == 2
 
 
-def test_ai_pane_shows_only_the_selected_mode(config_home, qt_app):
+def test_ai_pane_shows_both_configurations_for_each_analysis_provider(config_home, qt_app):
     from app.ui.pages.settings_page import SettingsPage
 
     page = SettingsPage()
     page.set_ai_mode("ollama")
 
     assert not page._offline_card.isHidden()
-    assert page._cloud_card.isHidden()
+    assert not page._cloud_card.isHidden()
 
     page.set_ai_mode("openai")
 
-    assert page._offline_card.isHidden()
+    assert not page._offline_card.isHidden()
     assert not page._cloud_card.isHidden()
 
 

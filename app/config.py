@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -138,11 +138,63 @@ class OllamaConfig(BaseModel):
     cloud_base_url: str = "https://api.openai.com/v1"
     cloud_api_key: str = ""
     cloud_model: str = "gpt-4o-mini"
+    # None denotes a legacy configuration; an explicit empty list stays empty.
+    chat_local_models: list[str] | None = None
+    chat_cloud_models: list[str] | None = None
+    chat_connections: list[AIConnectionConfig] | None = None
+
+    @model_validator(mode="after")
+    def _migrate_chat_models(self):
+        if self.chat_local_models is None:
+            self.chat_local_models = [self.model] if self.model.strip() else []
+        if self.chat_cloud_models is None:
+            self.chat_cloud_models = [self.cloud_model] if self.cloud_model.strip() else []
+        return self
 
     @field_validator("host")
     @classmethod
     def _normalise_host(cls, value: str) -> str:
         return loopback_url(value)
+
+
+class AIModelConfig(BaseModel):
+    """One explicitly configured chat model; disabled models remain stored."""
+
+    id: str
+    enabled: bool = True
+
+
+class AIConnectionConfig(BaseModel):
+    """Named chat connection. ``api_key`` is DPAPI-protected when saved.
+
+    IDs are stable caller-supplied identifiers; model IDs are provider IDs, not
+    display names. Listing or enabling a connection never changes background AI.
+    Use :func:`connection_api_key` to obtain the usable key.
+    """
+
+    id: str
+    name: str
+    provider: Literal["ollama", "openai"]
+    base_url: str
+    api_key: str = Field(default="", repr=False)
+    enabled: bool = True
+    models: list[AIModelConfig] = Field(default_factory=list)
+
+
+def _legacy_ai_connections(ollama: OllamaConfig) -> list[AIConnectionConfig]:
+    """Materialize legacy settings once; an explicit empty catalog stays empty."""
+    return [
+        AIConnectionConfig(
+            id="local", name="Local Ollama", provider="ollama",
+            base_url=ollama.host,
+            models=[AIModelConfig(id=model) for model in ollama.chat_local_models or []],
+        ),
+        AIConnectionConfig(
+            id="cloud", name="Cloud", provider="openai",
+            base_url=ollama.cloud_base_url, api_key=ollama.cloud_api_key,
+            models=[AIModelConfig(id=model) for model in ollama.chat_cloud_models or []],
+        ),
+    ]
 
 
 class EmbeddingConfig(BaseModel):
@@ -151,6 +203,28 @@ class EmbeddingConfig(BaseModel):
     model_id: str = "all-minilm"
     provider: str = "ollama"
     batch_size: int = 64
+    chunk_size: int = 1200
+    chunk_overlap: int = 200
+
+    @field_validator("chunk_size")
+    @classmethod
+    def _validate_chunk_size(cls, value: int) -> int:
+        if not 100 <= value <= 20_000:
+            raise ValueError("chunk_size must be between 100 and 20000 characters")
+        return value
+
+    @field_validator("chunk_overlap")
+    @classmethod
+    def _validate_chunk_overlap(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("chunk_overlap must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_chunk_relationship(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("chunk_overlap must be smaller than chunk_size")
+        return self
 
     @field_validator("model_id")
     @classmethod
@@ -272,6 +346,8 @@ class Config(BaseModel):
     @model_validator(mode="after")
     def _derive_paths(self) -> Config:
         """Fill every blank path so a partially written YAML is still usable."""
+        if self.ollama.chat_connections is None:
+            self.ollama.chat_connections = _legacy_ai_connections(self.ollama)
         root_text = (self.app.data_dir or "").strip()
         root = Path(root_text).expanduser() if root_text else default_data_dir()
         root = Path(os.path.normpath(str(root)))
@@ -491,6 +567,11 @@ def cloud_api_key(config: Config | None = None) -> str:
     return decrypt_secret(active.ollama.cloud_api_key)
 
 
+def connection_api_key(connection: AIConnectionConfig) -> str:
+    """Return a connection's decrypted key without exposing it in repr/logs."""
+    return decrypt_secret(connection.api_key)
+
+
 def clear_config_cache() -> None:
     """Forget the loaded configuration so the next call re-reads the file.
 
@@ -556,6 +637,12 @@ def save_config(config: Config, config_path: str | Path | None = None) -> None:
     # here covers every caller, and upgrades a plain-text value from an older
     # config the first time settings are saved.
     config.ollama.cloud_api_key = encrypt_secret(config.ollama.cloud_api_key)
+    for connection in config.ollama.chat_connections or []:
+        if connection.api_key:
+            protected = encrypt_secret(connection.api_key)
+            if not protected.startswith("dpapi:"):
+                raise RuntimeError("Unable to protect AI connection key with Windows DPAPI")
+            connection.api_key = protected
 
     target = Path(config_path) if config_path is not None else get_config_path()
     target.parent.mkdir(parents=True, exist_ok=True)

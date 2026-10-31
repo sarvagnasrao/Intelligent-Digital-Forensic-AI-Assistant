@@ -15,14 +15,7 @@ from typing import Any
 
 MB = 1024 * 1024
 
-# Compatibility bounds for old clients. Worker treats these as hints only:
-# inventory and readable text are never silently stopped by a preset cap.
-MAX_FILES_LIMIT = 2_000_000
-MAX_FILE_SIZE_MB_LIMIT = 4096
-MAX_TEXT_CHARS_LIMIT = 2_000_000
 MAX_TIMEOUT_LIMIT = 86_400
-
-HASH_ALGORITHMS = ("sha256", "md5", "sha1")
 
 
 @dataclass(frozen=True)
@@ -32,22 +25,11 @@ class ExaminationProfile:
     key: str
     name: str
     description: str
-    max_files: int
-    max_file_size_mb: int
-    max_text_chars: int
-    include_deleted: bool
-    skip_media: bool
-    hash_large_files: bool
     deep_extraction: bool
 
-    @property
-    def max_file_size_bytes(self) -> int:
-        return self.max_file_size_mb * MB
 
-
-# The legacy caps remain in the request shape for saved-job compatibility but
-# are not enforced: every discovered entry is inventoried and readable text is
-# retained. The only current profile difference is optional SQLite row text.
+# Every profile inventories all discovered entries, hashes every readable file,
+# and retains supported text. The Deep profile adds SQLite cell-value extraction.
 PROFILES: dict[str, ExaminationProfile] = {
     "fast": ExaminationProfile(
         key="fast",
@@ -56,12 +38,6 @@ PROFILES: dict[str, ExaminationProfile] = {
             "Standard extraction: all discovered entries are inventoried and readable "
             "text is retained. Legacy caps are not enforced."
         ),
-        max_files=2_000,
-        max_file_size_mb=2,
-        max_text_chars=4_000,
-        include_deleted=False,
-        skip_media=True,
-        hash_large_files=False,
         deep_extraction=False,
     ),
     "balanced": ExaminationProfile(
@@ -71,12 +47,6 @@ PROFILES: dict[str, ExaminationProfile] = {
             "Standard extraction, with the same coverage as Fast. All discovered "
             "entries and readable text are retained."
         ),
-        max_files=20_000,
-        max_file_size_mb=10,
-        max_text_chars=20_000,
-        include_deleted=True,
-        skip_media=False,
-        hash_large_files=True,
         deep_extraction=False,
     ),
     "deep": ExaminationProfile(
@@ -86,12 +56,6 @@ PROFILES: dict[str, ExaminationProfile] = {
             "Adds SQLite table and row text to standard extraction. Unsupported formats "
             "such as PDFs, scans, and media are inventoried without fabricated text."
         ),
-        max_files=200_000,
-        max_file_size_mb=50,
-        max_text_chars=100_000,
-        include_deleted=True,
-        skip_media=False,
-        hash_large_files=True,
         deep_extraction=True,
     ),
 }
@@ -109,15 +73,8 @@ def profile_parameters(key: str | None) -> dict[str, Any]:
     profile = get_profile(key)
     return {
         "profile": profile.key,
-        "max_files": profile.max_files,
-        "max_file_size": profile.max_file_size_bytes,
-        "max_text_chars": profile.max_text_chars,
-        "include_deleted": profile.include_deleted,
-        "skip_media": profile.skip_media,
-        "hash_large_files": profile.hash_large_files,
         "deep_extraction": profile.deep_extraction,
         "partition_offset": 0,
-        "hash_algorithms": ["sha256"],
         "timeout_seconds": 3600,
     }
 
@@ -155,30 +112,14 @@ def validate_parameters(raw: dict[str, Any] | None) -> dict[str, Any]:
         base = profile_parameters(profile_key)
 
     params = {**base, **data}
+    # Old saved jobs contain throughput knobs which no longer affect evidence
+    # coverage. Strip them so future job payloads express the invariant policy.
+    for obsolete in (
+        "max_files", "max_file_size", "max_text_chars", "include_deleted",
+        "skip_media", "hash_large_files",
+    ):
+        params.pop(obsolete, None)
     params["profile"] = profile_key if profile_key in PROFILES else base["profile"]
-
-    max_files = _as_int(params["max_files"], "max_files")
-    if not 1 <= max_files <= MAX_FILES_LIMIT:
-        raise ValueError(f"max_files must be between 1 and {MAX_FILES_LIMIT:,}")
-    params["max_files"] = max_files
-
-    # Older callers send bytes; the dialog sends MB. Accept either: a value
-    # below the MB limit is ambiguous, so treat anything under 4096 as MB.
-    size = _as_int(params["max_file_size"], "max_file_size")
-    if size < MAX_FILE_SIZE_MB_LIMIT:
-        size *= MB
-    if not MB <= size <= MAX_FILE_SIZE_MB_LIMIT * MB:
-        raise ValueError(
-            f"max_file_size must be between 1 MB and {MAX_FILE_SIZE_MB_LIMIT} MB"
-        )
-    params["max_file_size"] = size
-
-    text_chars = _as_int(params["max_text_chars"], "max_text_chars")
-    if not 0 <= text_chars <= MAX_TEXT_CHARS_LIMIT:
-        raise ValueError(
-            f"max_text_chars must be between 0 and {MAX_TEXT_CHARS_LIMIT:,}"
-        )
-    params["max_text_chars"] = text_chars
 
     offset = _as_int(params.get("partition_offset", 0), "partition_offset")
     if offset < 0:
@@ -190,25 +131,7 @@ def validate_parameters(raw: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError(f"timeout_seconds must be between 30 and {MAX_TIMEOUT_LIMIT}")
     params["timeout_seconds"] = timeout
 
-    for flag in (
-        "include_deleted",
-        "skip_media",
-        "hash_large_files",
-        "deep_extraction",
-    ):
-        params[flag] = _as_bool(params.get(flag))
-
-    algorithms = params.get("hash_algorithms") or ["sha256"]
-    if isinstance(algorithms, str):
-        algorithms = [algorithms]
-    cleaned = [
-        str(name).strip().lower() for name in algorithms
-        if str(name).strip().lower() in HASH_ALGORITHMS
-    ]
-    # SHA-256 is the evidence digest; it is never optional.
-    if "sha256" not in cleaned:
-        cleaned.insert(0, "sha256")
-    params["hash_algorithms"] = cleaned
+    params["deep_extraction"] = _as_bool(params.get("deep_extraction"))
 
     return params
 
@@ -216,18 +139,11 @@ def validate_parameters(raw: dict[str, Any] | None) -> dict[str, Any]:
 def parameter_summary(params: dict[str, Any] | None) -> str:
     """One-line human summary, used in the job log and audit details."""
     params = params or {}
-    size_mb = int(params.get("max_file_size", 10 * MB)) / MB
     parts = [
-        f"up to {int(params.get('max_files', 20_000)):,} files",
-        f"files <= {size_mb:g} MB",
-        f"text <= {int(params.get('max_text_chars', 20_000)):,} chars",
+        "all discovered entries",
+        "full-file hash",
+        "all readable text retained",
     ]
-    if params.get("include_deleted"):
-        parts.append("deleted included")
-    if params.get("skip_media"):
-        parts.append("media skipped")
-    if params.get("hash_large_files"):
-        parts.append("large files hashed")
     if params.get("deep_extraction"):
         parts.append("deep extraction")
     if int(params.get("partition_offset") or 0):

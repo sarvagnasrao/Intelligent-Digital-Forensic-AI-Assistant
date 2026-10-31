@@ -7,6 +7,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from html import escape
 from typing import TYPE_CHECKING
 
 import httpx
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -35,7 +37,7 @@ from app.auth.models import UserRole
 from app.config import cloud_api_key, connection_api_key, get_config
 from app.ui import qt_threads
 from app.ui.base import CaseContext, ResponsivePage
-from app.ui.layouts import configure_detail_pane, configure_detail_splitter
+from app.ui.layouts import DETAIL_PANE_MAX_WIDTH, configure_detail_pane, configure_detail_splitter
 from app.ui.markdown import MarkdownView, looks_like_markdown
 from app.ui.theme.tokens import Color, Spacing, Typography
 
@@ -192,6 +194,13 @@ STATUS_WORDS = {
     "checking": "Checking",
     "unknown": "Unknown",
 }
+STATUS_COLORS = {
+    "ok": "#27864a",
+    "error": "#c83b3b",
+    "partial": "#b57800",
+    "checking": "#b57800",
+    "unknown": "#747d88",
+}
 
 ARTIFACT_REFERENCE = re.compile(r"\bART-\d+-[A-Za-z0-9]+\b", re.IGNORECASE)
 
@@ -300,6 +309,11 @@ class ChatMessageWidget(QFrame):
                     QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
                 )
                 msg = MarkdownView(text)
+                # MarkdownView fits its height to the document; inherited
+                # QTextEdit padding would otherwise clip the bottom of it.
+                msg.setStyleSheet(
+                    "QTextBrowser { background: transparent; border: none; padding: 0; }"
+                )
             else:
                 msg = QLabel(text)
                 msg.setFont(QFont(Typography.FONT_FAMILY, Typography.BODY_MD[0]))
@@ -326,6 +340,8 @@ class ChatMessageWidget(QFrame):
             # Citations
             if citations:
                 cite_label = QLabel(f"Sources: {', '.join(citations)}")
+                cite_label.setTextFormat(Qt.TextFormat.PlainText)
+                cite_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
                 cite_label.setFont(QFont(Typography.FONT_FAMILY, Typography.BODY_SM[0]))
                 cite_label.setStyleSheet(
                     f"color: {Color.TEXT_SECONDARY.name()}; "
@@ -431,23 +447,28 @@ class CitationPanel(QFrame):
             )
             return
 
+        lines = []
         for i, cite in enumerate(citations, 1):
             name = cite.get("name") or cite.get("source") or "Unknown artifact"
             artifact_type = cite.get("artifact_type") or cite.get("type") or "file"
-            self.citation_list.append(f"{i}. {name} ({artifact_type})")
+            lines.append(f"{i}. {name} ({artifact_type})")
             if cite.get("source_number") is not None:
-                self.citation_list.append(f"   Model source: [Source {cite['source_number']}]")
+                lines.append(f"   Model source: [Source {cite['source_number']}]")
             if cite.get("artifact_id"):
-                self.citation_list.append(f"   Artifact: {cite['artifact_id']}")
+                lines.append(f"   Artifact: {cite['artifact_id']}")
             if cite.get("provenance"):
-                self.citation_list.append(f"   Provenance: {cite['provenance']}")
-            if cite.get("chunk_index") is not None:
-                self.citation_list.append(
+                lines.append(f"   Provenance: {cite['provenance']}")
+            if cite.get("synthetic_metadata"):
+                lines.append(
+                    "   Passage: synthesized metadata (offsets are not artifact text offsets)"
+                )
+            elif cite.get("chunk_index") is not None:
+                lines.append(
                     f"   Passage: chunk {cite['chunk_index']} "
                     f"(characters {cite.get('char_start', 0)}–{cite.get('char_end', 0)})"
                 )
             elif cite.get("char_start") is not None:
-                self.citation_list.append(
+                lines.append(
                     f"   Passage: characters {cite.get('char_start', 0)}–"
                     f"{cite.get('char_end', 0)}"
                 )
@@ -456,17 +477,18 @@ class CitationPanel(QFrame):
             except (TypeError, ValueError):
                 score = 0.0
             if score:
-                self.citation_list.append(f"   Score: {score:.3f}")
+                lines.append(f"   Score: {score:.3f}")
             path = cite.get("path") or cite.get("source_path")
             if path:
-                self.citation_list.append(f"   Path: {path}")
+                lines.append(f"   Path: {path}")
             snippet = (cite.get("snippet") or "").strip()
             if snippet:
                 snippet = " ".join(snippet.split())
                 if len(snippet) > 240:
                     snippet = snippet[:237] + "..."
-                self.citation_list.append(f"   Snippet: {snippet}")
-            self.citation_list.append("")
+                lines.append(f"   Snippet: {snippet}")
+            lines.append("")
+        self.citation_list.setPlainText("\n".join(lines))
 
 
 class StatusStrip(QFrame):
@@ -487,11 +509,11 @@ class StatusStrip(QFrame):
         super().__init__(parent)
         self.setObjectName("StatusStrip")
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumHeight(56)
-
-        layout = QHBoxLayout(self)
+        layout = QGridLayout(self)
         layout.setContentsMargins(Spacing.MD, Spacing.XS, Spacing.MD, Spacing.XS)
         layout.setSpacing(Spacing.SM)
+        self._status_layout = layout
+        self._status_columns = 0
 
         config = get_config()
         self._base_tooltips = {
@@ -510,22 +532,25 @@ class StatusStrip(QFrame):
 
         self.services: dict[str, QLabel] = {}
         for service in self.SERVICES:
-            label = QLabel(f"{service} · Unknown")
+            label = QLabel()
             label.setObjectName("AIServiceStatus")
             label.setProperty("status", "unknown")
             label.setFont(QFont(Typography.FONT_FAMILY, Typography.BODY_SM[0]))
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            label.setMinimumHeight(28)
+            label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            # Override the large status pills in the application theme; only the
+            # small indicator is coloured, while the state remains readable text.
+            label.setStyleSheet("background: transparent; border: none; padding: 0px;")
             label.setToolTip(self._base_tooltips[service])
             self.services[service] = label
             layout.addWidget(label)
-
-        layout.addStretch()
+            self.set_status(service)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setObjectName("AIStatusAction")
         self.refresh_btn.setProperty("secondary", True)
-        self.refresh_btn.setFixedHeight(36)
+        self.refresh_btn.setFixedHeight(28)
         self.refresh_btn.setToolTip(
             "Re-check the AI services, models and this case's search index."
         )
@@ -534,7 +559,7 @@ class StatusStrip(QFrame):
         self.download_embedding_btn = QPushButton("Pull Embedding Model")
         self.download_embedding_btn.setObjectName("AIStatusAction")
         self.download_embedding_btn.setProperty("secondary", True)
-        self.download_embedding_btn.setFixedHeight(36)
+        self.download_embedding_btn.setFixedHeight(28)
         self.download_embedding_btn.setToolTip(
             f"Ask Ollama for the {get_config().embeddings.model_id} embedding model. "
             "The offline bundle already includes it, so this is only needed on a "
@@ -542,16 +567,29 @@ class StatusStrip(QFrame):
         )
         self.download_embedding_btn.hide()
         layout.addWidget(self.download_embedding_btn)
+        self._arrange_status(2)
+
+    def _arrange_status(self, columns: int):
+        if columns == self._status_columns:
+            return
+        self._status_columns = columns
+        widgets = [*self.services.values(), self.refresh_btn, self.download_embedding_btn]
+        for index, widget in enumerate(widgets):
+            self._status_layout.addWidget(widget, index // columns, index % columns)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._arrange_status(2 if event.size().width() < 650 else 4 if event.size().width() < 1100 else 8)
 
     def set_status(self, service: str, state: str = "unknown",
                    detail: str = "", tooltip: str = ""):
         label = self.services.get(service)
         if label is None:
             return
-        text = f"{service} · {STATUS_WORDS.get(state, STATUS_WORDS['unknown'])}"
-        if detail and service == "Index":
-            text += f"  {detail}"
-        label.setText(text)
+        text = f"{service} · {detail or STATUS_WORDS.get(state, STATUS_WORDS['unknown'])}"
+        color = STATUS_COLORS.get(state, STATUS_COLORS["unknown"])
+        label.setText(f'<span style="color: {color};">●</span> {escape(text)}')
+        label.setAccessibleName(text)
         label.setProperty("status", state)
         label.style().unpolish(label)
         label.style().polish(label)
@@ -559,10 +597,12 @@ class StatusStrip(QFrame):
         label.setToolTip(f"{base}\n\n{tooltip}".strip() if tooltip else base)
 
     def set_all_unknown(self, detail: str = ""):
+        self.download_embedding_btn.hide()
         for service in self.SERVICES:
             self.set_status(service, "unknown", detail)
 
     def set_all_checking(self):
+        self.download_embedding_btn.hide()
         for service in self.SERVICES:
             self.set_status(service, "checking")
 
@@ -626,20 +666,27 @@ class StatusCheckWorker(QObject):
             try:
                 health = resp.json()
             except Exception:
-                health = {}
-            degraded = [
-                key for key in ("pytsk3", "ollama", "qdrant")
-                if health.get(key) is False
-            ]
-            status["Worker"] = {
-                "state": "partial" if degraded else "ok",
-                "detail": "degraded" if degraded else "ready",
-                "tooltip": (
-                    f"{config.worker.url}/health: "
-                    + (", ".join(f"{key}=false" for key in degraded)
-                       if degraded else "all required components available")
-                ),
-            }
+                health = None
+            fields = ("pytsk3", "pyewf", "ollama", "qdrant", "embeddings")
+            valid = (isinstance(health, dict)
+                     and health.get("status") in ("ok", "degraded")
+                     and all(type(health.get(key)) is bool for key in fields))
+            if not valid:
+                status["Worker"] = {
+                    "state": "unknown", "detail": "invalid health",
+                    "tooltip": f"{config.worker.url}/health returned an invalid or incomplete response.",
+                }
+            else:
+                degraded = [key for key in fields if health[key] is False]
+                status["Worker"] = {
+                    "state": "partial" if degraded or health["status"] != "ok" else "ok",
+                    "detail": "degraded" if degraded or health["status"] != "ok" else "ready",
+                    "tooltip": f"{config.worker.url}/health: " + (
+                        ", ".join(f"{key}=false" for key in degraded)
+                        or ("worker reports degraded" if health["status"] != "ok"
+                            else "all required components available")
+                    ),
+                }
 
         # --- Ollama + models --------------------------------------------
         # Cloud chat plus cloud embeddings is a deliberately Ollama-free setup:
@@ -655,6 +702,7 @@ class StatusCheckWorker(QObject):
             else None
         )
         model_names: list[str] = []
+        tags_valid = False
         if not local_ollama_needed:
             status["Ollama"] = {
                 "state": "ok",
@@ -672,17 +720,22 @@ class StatusCheckWorker(QObject):
             }
         else:
             try:
-                model_names = [
-                    item.get("name", "")
-                    for item in tags.json().get("models", [])
-                ]
+                models = tags.json()["models"]
+                if not isinstance(models, list) or any(
+                    not isinstance(item, dict) or not isinstance(item.get("name"), str)
+                    for item in models
+                ):
+                    raise ValueError("invalid models list")
+                model_names = [item["name"] for item in models]
+                tags_valid = True
             except Exception:
                 model_names = []
             status["Ollama"] = {
-                "state": "ok",
-                "detail": "up",
-                "tooltip": f"{len(model_names)} model(s) available: "
-                           + (", ".join(model_names) or "none"),
+                "state": "ok" if tags_valid else "unknown",
+                "detail": "up" if tags_valid else "invalid model list",
+                "tooltip": (f"{len(model_names)} model(s) available: "
+                            + (", ".join(model_names) or "none")) if tags_valid
+                           else "Ollama returned an invalid model list.",
             }
 
         chat_model = (
@@ -701,12 +754,11 @@ class StatusCheckWorker(QObject):
                     if has_key else "Enter a cloud provider API key in Settings."
                 ),
             }
-        elif "Ollama" in status and status["Ollama"]["state"] == "error":
+        elif not tags_valid:
             status["Model"] = {
                 "state": "unknown",
                 "detail": chat_model,
-                "tooltip": "Ollama is offline, so the chat model cannot be "
-                           "checked.",
+                "tooltip": "Ollama's model list is unavailable, so the chat model cannot be checked.",
             }
         else:
             def normalize_model(value: str) -> str:
@@ -729,12 +781,13 @@ class StatusCheckWorker(QObject):
 
         # Embeddings come from the same Ollama runtime, so this check only asks
         # whether the model is pulled. It never triggers a download.
-        try:
-            from app.ai.embeddings import model_available
-
-            available = model_available()
-        except Exception:
-            available = False
+        if config.embeddings.provider == "openai":
+            available = bool(cloud_api_key(config).strip())
+        else:
+            wanted = (config.embeddings.model_id or "").strip() or "all-minilm"
+            available = tags_valid and any(
+                name == wanted or name.startswith(f"{wanted}:") for name in model_names
+            )
         if available:
             status["Embedding"] = {
                 "state": "ok",
@@ -746,9 +799,15 @@ class StatusCheckWorker(QObject):
                          f"{config.ollama.host}."
                 ),
             }
+        elif config.embeddings.provider != "openai" and not tags_valid:
+            status["Embedding"] = {
+                "state": "unknown", "detail": "cannot check",
+                "tooltip": "Ollama's model list is unavailable; the embedding model cannot be checked.",
+            }
         else:
             status["Embedding"] = {
                 "state": "error",
+                "pull_available": config.embeddings.provider != "openai",
                 "detail": (
                     "API key missing"
                     if config.embeddings.provider == "openai"
@@ -949,6 +1008,7 @@ class AskWorker(QObject):
             "case_id": self.case_id,
             "question": self.question,
             "mode": "conversation" if self.conversation else "analysis",
+            "model": self.model,
             "answer": "",
             "citations": [],
             "error": None,
@@ -1106,7 +1166,8 @@ class AskWorker(QObject):
         # Passage offsets refer to the original stored text, including whitespace.
         content = getattr(artifact, "content_text", "") or ""
 
-        if not content.strip():
+        synthetic_metadata = not content.strip()
+        if synthetic_metadata:
             # Artifacts without extracted text still give the model useful
             # metadata instead of an empty context block.
             parts = [f"{name} ({artifact_type})"]
@@ -1125,9 +1186,9 @@ class AskWorker(QObject):
 
         passage = content
         char_start = 0
+        chunk = None
         if chunk_index is not None:
             from app.artifacts.models import ArtifactChunk
-            chunk = None
             # Use indexed passage text and offsets when the semantic hit carries provenance.
             try:
                 from sqlalchemy import select
@@ -1139,6 +1200,7 @@ class AskWorker(QObject):
                 chunk = None
             if chunk is not None:
                 passage, char_start = chunk.text, chunk.char_start
+                synthetic_metadata = False
         elif content:
             # Keyword-only retrieval still needs an attributable passage, not
             # the beginning of an unrelated long file. Center a bounded window
@@ -1163,10 +1225,12 @@ class AskWorker(QObject):
             "name": name,
             "path": path,
             "artifact_type": artifact_type,
-            "content_warning": (
+            "content_warning": " ".join(filter(None, [
                 "This image's visual contents have not been inspected. Do not infer what it depicts."
-                if str(artifact_type).lower() == "image" else ""
-            ),
+                if str(artifact_type).lower() == "image" else "",
+                "This passage is synthesized from artifact metadata, not extracted artifact text; its character offsets refer only to this synthesized passage."
+                if synthetic_metadata else "",
+            ])),
             "content_text": content,
             "passage_start": char_start,
             "passage_end": char_start + len(content),
@@ -1180,10 +1244,12 @@ class AskWorker(QObject):
             "path": path,
             "score": score,
             "snippet": snippet,
-            "chunk_index": chunk_index,
+            "chunk_index": chunk_index if chunk is not None else None,
             "char_start": char_start,
             "char_end": char_start + len(content),
-            "provenance": "indexed passage" if chunk_index is not None else "artifact text",
+            "provenance": ("synthesized artifact metadata" if synthetic_metadata else
+                           "indexed passage" if chunk_index is not None and chunk is not None else "artifact text"),
+            "synthetic_metadata": synthetic_metadata,
         }
         return {"context": context, "citation": citation}
 
@@ -1205,20 +1271,37 @@ class AskWorker(QObject):
                 EntityRelationship.status == RelationshipStatus.CONFIRMED,
             )).scalars():
                 try:
-                    ids = set(json.loads(row.artifact_ids_json or "[]"))
+                    details = json.loads(row.details_json or "{}")
+                    support = json.loads(row.artifact_ids_json or "[]")
                 except (TypeError, ValueError):
                     continue
+                if not isinstance(details, dict) or details.get("unsupported_after_rebuild"):
+                    continue
+                if not isinstance(support, list) or not support or any(
+                    type(ident) is not int or ident <= 0 for ident in support
+                ):
+                    continue
+                ids = set(support)
                 if ids & seed_ids:
+                    active_ids = set(session.execute(select(Artifact.id).join(
+                        Evidence, Evidence.id == Artifact.evidence_id
+                    ).where(
+                        Artifact.id.in_(ids), Artifact.case_id == self.case_id,
+                        Evidence.case_id == self.case_id, Evidence.removed_at.is_(None),
+                    )).scalars())
+                    if active_ids != ids:
+                        continue
                     linked.update(ids - seed_ids)
             if not linked:
                 return items
             rows = session.execute(select(Artifact).join(
                 Evidence, Evidence.id == Artifact.evidence_id
             ).where(Artifact.id.in_(linked), Artifact.case_id == self.case_id,
+                    Evidence.case_id == self.case_id,
                     Evidence.removed_at.is_(None)).limit(10)).scalars()
             for artifact in rows:
                 item = self._as_item(session, artifact, None, source="graph expansion")
-                item["citation"]["provenance"] = "investigator-enabled entity graph expansion"
+                item["citation"]["provenance"] += "; investigator-enabled entity graph expansion"
                 items.append(item)
         except Exception as exc:
             raise RuntimeError(f"Confirmed relationship expansion failed: {exc}") from exc
@@ -1348,6 +1431,10 @@ class AIAnalysisPage(ResponsivePage):
 
         # Main chat area
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._chat_splitter = splitter
+        # The horizontal panes' combined minimum must not prevent the page
+        # from reaching the width at which we stack them in resizeEvent.
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
         # Left: Chat
         chat_container = QWidget()
@@ -1389,11 +1476,11 @@ class AIAnalysisPage(ResponsivePage):
         self.model_combo.currentIndexChanged.connect(self._remember_model_selection)
         self.graph_expansion_check = QCheckBox("Expand through entity graph")
         self.graph_expansion_check.setToolTip(
-            "Include up to 10 active artifacts linked to retrieved artifacts by recorded entity relationships."
+            "Include up to 10 active artifacts linked by confirmed entity relationships."
         )
         options_column.addWidget(self.graph_expansion_check)
         self.cloud_consent_check = QCheckBox(
-            "Allow this case's evidence text to be sent to configured cloud AI"
+            "Allow this case's evidence text\nto be sent to configured cloud AI"
         )
         self.cloud_consent_check.setToolTip(
             "Per-case consent for sending extracted evidence text to configured cloud chat, "
@@ -1407,7 +1494,7 @@ class AIAnalysisPage(ResponsivePage):
         composer = QFrame()
         composer.setObjectName("ChatComposer")
         composer.setStyleSheet(
-            "QFrame#ChatComposer { background: palette(base); "
+            "QFrame#ChatComposer { background: transparent; "
             "border: 1px solid palette(mid); border-radius: 12px; }"
             "QFrame#ChatComposer QLineEdit { background: transparent; border: none; }"
         )
@@ -1427,6 +1514,16 @@ class AIAnalysisPage(ResponsivePage):
         composer_layout.addWidget(self.input_edit)
         input_row = QHBoxLayout()
         input_row.addWidget(self.model_combo)
+        self.mode_combo = QComboBox()
+        self.mode_combo.setAccessibleName("Question mode")
+        self.mode_combo.addItem("Auto", "auto")
+        self.mode_combo.addItem("Search evidence", "analysis")
+        self.mode_combo.addItem("General chat", "conversation")
+        self.mode_combo.setToolTip(
+            "Auto uses keywords to choose a mode. Select Search evidence for any "
+            "case question, including follow-ups; General chat does not retrieve evidence."
+        )
+        input_row.addWidget(self.mode_combo)
         input_row.addStretch(1)
 
         self.send_btn = QPushButton("Send")
@@ -1434,6 +1531,11 @@ class AIAnalysisPage(ResponsivePage):
         self.send_btn.clicked.connect(self._send_or_stop)
         input_row.addWidget(self.send_btn)
         composer_layout.addLayout(input_row)
+        self.model_source_hint = QLabel()
+        self.model_source_hint.setWordWrap(True)
+        self.model_source_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.model_source_hint.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
+        composer_layout.addWidget(self.model_source_hint)
         chat_layout.addWidget(composer)
 
         action_row = QHBoxLayout()
@@ -1470,6 +1572,19 @@ class AIAnalysisPage(ResponsivePage):
         self._refresh_models()
         self._reset_conversation()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_chat_splitter"):
+            orientation = (Qt.Orientation.Vertical if event.size().width() < 1000
+                           else Qt.Orientation.Horizontal)
+            if self._chat_splitter.orientation() != orientation:
+                self._chat_splitter.setOrientation(orientation)
+                self.citation_panel.setMaximumWidth(
+                    16777215 if orientation == Qt.Orientation.Vertical else DETAIL_PANE_MAX_WIDTH
+                )
+                self._chat_splitter.setSizes([600, 220] if orientation == Qt.Orientation.Vertical
+                                             else [680, 340])
+
     # ------------------------------------------------------------------
     # Case scope and lifecycle
     # ------------------------------------------------------------------
@@ -1490,6 +1605,7 @@ class AIAnalysisPage(ResponsivePage):
         user = getter() if callable(getter) else None
         is_read_only = user is not None and user.role == UserRole.READ_ONLY
         self.model_combo.setEnabled(not is_read_only)
+        self.mode_combo.setEnabled(not is_read_only)
         self.graph_expansion_check.setEnabled(not is_read_only)
         self.cloud_consent_check.setEnabled(not is_read_only)
         if is_read_only:
@@ -1669,6 +1785,20 @@ class AIAnalysisPage(ResponsivePage):
 
     def _remember_model_selection(self):
         self._model_selection = self.model_combo.currentData()
+        if hasattr(self, "model_source_hint"):
+            selection = self._model_selection
+            connections = getattr(get_config().ollama, "chat_connections", None)
+            connection = next(
+                (c for c in connections or [] if selection and c.id == selection[0]), None
+            )
+            provider = connection.provider if connection else (selection[0] if selection else None)
+            if provider == "ollama":
+                source = f"Local Ollama · {selection[1]}"
+            elif provider == "openai":
+                source = f"Cloud AI · {selection[1]} · chat and evidence may leave this machine"
+            else:
+                source = "No chat model selected"
+            self.model_source_hint.setText(f"{source} | AI answers are unverified; check sources.")
         if isinstance(self.model_combo, QComboBox):
             getter = getattr(self.nav, "get_current_user", None)
             user = getter() if callable(getter) else None
@@ -1697,8 +1827,9 @@ class AIAnalysisPage(ResponsivePage):
         self._set_busy(False)
 
         hint = QLabel(
-            "Chat naturally, or ask about this case and I’ll search its examined evidence. "
-            "Case-related AI analysis is unverified until you confirm it."
+            "Ask any question. Choose Search evidence for case questions, including "
+            "follow-ups, or General chat to ask without retrieving evidence. Auto "
+            "chooses using keywords. Verify AI answers against the original sources."
         )
         hint.setWordWrap(True)
         hint.setFont(QFont(Typography.FONT_FAMILY, Typography.BODY_MD[0]))
@@ -1886,8 +2017,10 @@ class AIAnalysisPage(ResponsivePage):
                 entry.get("detail", ""),
                 entry.get("tooltip", ""),
             )
-        embedding_state = (payload.get("Embedding") or {}).get("state")
-        self.status_strip.download_embedding_btn.setVisible(embedding_state == "error")
+        embedding = payload.get("Embedding") or {}
+        self.status_strip.download_embedding_btn.setVisible(
+            embedding.get("state") == "error" and embedding.get("pull_available") is True
+        )
         self.status_hint.setText(self._status_summary(payload))
 
     @staticmethod
@@ -1966,6 +2099,7 @@ class AIAnalysisPage(ResponsivePage):
         self.send_btn.setText("Stop" if busy else "Send")
         self.input_edit.setEnabled(not busy and not is_read_only)
         self.model_combo.setEnabled(not busy and not is_read_only)
+        self.mode_combo.setEnabled(not busy and not is_read_only)
         self.graph_expansion_check.setEnabled(not is_read_only)
         self.cloud_consent_check.setEnabled(not is_read_only)
         self.save_finding_btn.setEnabled(
@@ -2080,8 +2214,11 @@ class AIAnalysisPage(ResponsivePage):
         # Only explicit case-related messages trigger evidence retrieval.
         # Ordinary conversation is answered naturally without adding case
         # details or forcing the user back to the investigation.
-        is_conversation = not (
-            self.CASE_TOPIC_TERMS.search(question) or ARTIFACT_REFERENCE.search(question)
+        selected_mode = self.mode_combo.currentData()
+        is_conversation = selected_mode == "conversation" or (
+            selected_mode == "auto" and not (
+                self.CASE_TOPIC_TERMS.search(question) or ARTIFACT_REFERENCE.search(question)
+            )
         )
         mode = "conversation" if is_conversation else "analysis"
         self._add_message(question, is_user=True)
@@ -2184,6 +2321,7 @@ class AIAnalysisPage(ResponsivePage):
             "question": result.get("question", ""),
             "answer": result.get("answer", ""),
             "citations": citations,
+            "model": result.get("model"),
         }
         self._last_exchange_saved = False
         self.save_finding_btn.setEnabled(True)
@@ -2300,7 +2438,7 @@ class AIAnalysisPage(ResponsivePage):
                 ai_question=question,
                 ai_answer=answer,
                 ai_citations=self._last_exchange["citations"],
-                ai_model=get_config().ollama.model,
+                ai_model=self._last_exchange.get("model"),
             )
             # Link only artifacts that still exist; citations are unique per
             # answer, so a duplicate link cannot occur for a new finding.
@@ -2315,7 +2453,7 @@ class AIAnalysisPage(ResponsivePage):
                     continue
                 service.link_artifact(
                     finding.id, artifact_pk,
-                    relevance="supports", cited_in_ai=True,
+                    relevance="supports", cited_in_ai=True, actor=user,
                 )
                 linked.add(artifact_pk)
             session.commit()

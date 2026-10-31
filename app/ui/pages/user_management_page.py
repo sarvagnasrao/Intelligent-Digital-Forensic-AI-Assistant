@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -443,7 +444,7 @@ class UserManagementPage(ResponsivePage):
         page.addWidget(content, 1)
 
         # Header: page identity and the two page-level actions.
-        header_row = QHBoxLayout()
+        header_row = QVBoxLayout()
         header_row.setSpacing(Spacing.SM)
 
         title = QLabel("User Management")
@@ -456,21 +457,23 @@ class UserManagementPage(ResponsivePage):
             )
         )
         header_row.addWidget(title)
-        header_row.addStretch()
+        header_actions = QHBoxLayout()
+        header_actions.addStretch()
+        header_row.addLayout(header_actions)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setProperty("secondary", True)
         self.refresh_btn.clicked.connect(self.refresh)
-        header_row.addWidget(self.refresh_btn)
+        header_actions.addWidget(self.refresh_btn)
 
         self.new_user_btn = QPushButton("+ New User")
         self.new_user_btn.clicked.connect(self._on_new_user)
-        header_row.addWidget(self.new_user_btn)
+        header_actions.addWidget(self.new_user_btn)
 
         layout.addLayout(header_row)
 
         # Filters.
-        filter_row = QHBoxLayout()
+        filter_row = QGridLayout()
         filter_row.setSpacing(Spacing.SM)
 
         self.search_edit = QLineEdit()
@@ -480,8 +483,8 @@ class UserManagementPage(ResponsivePage):
         self.search_edit.setMaximumWidth(300)
         self.search_edit.setFixedHeight(36)
         self.search_edit.textChanged.connect(self._apply_filters)
-        filter_row.addWidget(QLabel("Search:"))
-        filter_row.addWidget(self.search_edit, 1)
+        filter_row.addWidget(QLabel("Search:"), 0, 0)
+        filter_row.addWidget(self.search_edit, 0, 1, 1, 3)
 
         self.role_filter = QComboBox()
         self.role_filter.addItem("All roles", None)
@@ -489,8 +492,8 @@ class UserManagementPage(ResponsivePage):
             self.role_filter.addItem(ROLE_LABELS[role], role)
         self.role_filter.setFixedHeight(36)
         self.role_filter.currentIndexChanged.connect(self._apply_filters)
-        filter_row.addWidget(QLabel("Role:"))
-        filter_row.addWidget(self.role_filter)
+        filter_row.addWidget(QLabel("Role:"), 1, 0)
+        filter_row.addWidget(self.role_filter, 1, 1)
 
         self.status_filter = QComboBox()
         self.status_filter.addItem("All statuses", None)
@@ -498,10 +501,10 @@ class UserManagementPage(ResponsivePage):
         self.status_filter.addItem("Inactive", False)
         self.status_filter.setFixedHeight(36)
         self.status_filter.currentIndexChanged.connect(self._apply_filters)
-        filter_row.addWidget(QLabel("Status:"))
-        filter_row.addWidget(self.status_filter)
+        filter_row.addWidget(QLabel("Status:"), 2, 0)
+        filter_row.addWidget(self.status_filter, 2, 1)
 
-        filter_row.addStretch()
+        filter_row.setColumnStretch(4, 1)
         layout.addLayout(filter_row)
 
         # Table. Sorting is deliberately off so a row index always maps to the
@@ -551,29 +554,32 @@ class UserManagementPage(ResponsivePage):
         footer.setFrameShape(QFrame.Shape.NoFrame)
         page.addWidget(footer)
 
-        footer_layout = QHBoxLayout(footer)
+        footer_layout = QVBoxLayout(footer)
         footer_layout.setContentsMargins(Spacing.LG, Spacing.SM, Spacing.LG, Spacing.SM)
         footer_layout.setSpacing(Spacing.SM)
 
         self.summary_label = QLabel("")
         self.summary_label.setProperty("muted", True)
+        self.summary_label.setWordWrap(True)
         footer_layout.addWidget(self.summary_label)
-        footer_layout.addStretch()
+        actions = QHBoxLayout()
+        actions.addStretch()
+        footer_layout.addLayout(actions)
 
         self.edit_btn = QPushButton("Edit")
         self.edit_btn.setProperty("secondary", True)
         self.edit_btn.clicked.connect(self._on_edit_selected)
-        footer_layout.addWidget(self.edit_btn)
+        actions.addWidget(self.edit_btn)
 
         self.reset_password_btn = QPushButton("Reset Password")
         self.reset_password_btn.setProperty("secondary", True)
         self.reset_password_btn.clicked.connect(self._on_reset_password)
-        footer_layout.addWidget(self.reset_password_btn)
+        actions.addWidget(self.reset_password_btn)
 
         self.toggle_active_btn = QPushButton("Deactivate")
         self.toggle_active_btn.setProperty("secondary", True)
         self.toggle_active_btn.clicked.connect(self._on_toggle_active)
-        footer_layout.addWidget(self.toggle_active_btn)
+        actions.addWidget(self.toggle_active_btn)
 
         self._update_actions()
         self._update_summary()

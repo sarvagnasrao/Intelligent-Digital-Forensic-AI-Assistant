@@ -70,6 +70,10 @@ embeddings:
   model_id: all-minilm
   provider: ollama
   batch_size: 64
+  # Passage size and overlap used when indexing readable artifact text. Only
+  # artifacts with non-empty extracted content are eligible.
+  chunk_size: 1200
+  chunk_overlap: 200
 
 qdrant:
   url: http://127.0.0.1:6333

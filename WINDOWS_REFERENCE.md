@@ -63,6 +63,14 @@
 | **Generate Report** | `ReportGenerateDialog` | `reports_page.py` | Reports → "Generate Report" |
 | **Report Templates** | `ReportTemplatesDialog` | `reports_page.py` | Reports → "Report Templates" |
 | **Record Custody Event** | `RecordCustodyDialog` | `audit_page.py` | Audit & Custody → Chain of Custody → "Record Custody Event" |
+| **Register Evidence** | `RegisterEvidenceDialog` | `evidence_page.py` | Evidence → Register Evidence |
+| **Remove / Delete Evidence** | `RemoveEvidenceDialog`, `DeleteEvidenceDialog` | `evidence_page.py` | Evidence → Remove or Delete |
+| **Reference Hash** | `ReferenceHashDialog` | `evidence_page.py` | Evidence → Reference Hash |
+| **New Examination Job** | `NewExamJobDialog` | `examination_page.py` | Examination → New Job (Advanced expands every parameter) |
+| **Document Viewer** | `ArtifactDocumentDialog` | `artifacts_search_page.py` | Artifacts & Search → Open viewer |
+| **New Finding / Identity Hypothesis** | `NewFindingDialog`, `IdentityHypothesisDialog` | `findings_page.py` | Findings → New Finding / Identity review |
+| **Physical Devices** | `DeviceDialog` | `app/ui/device_dialog.py` | Evidence → Physical devices |
+| **First Run / Missing or Change Data Folder** | `FirstRunDialog`, `MissingDataFolderDialog`, `ChangeDataFolderDialog` | `app/ui/dialogs/data_folder_dialog.py` | Startup / Settings → Data & Storage |
 
 ---
 
@@ -92,6 +100,8 @@
 | `app/ui/main_window.py` | Navigation controller + shells |
 | `app/ui/header_bar.py` | **AppHeaderBar** – search, bell, user menu |
 | `app/ui/base.py` | Shared UI components (StatCard, NavList, etc.) |
+| `app/processing/service.py` | Explicit-approval, in-memory processing coordinator (not durable) |
+| `app/ai/case_briefing.py` | Deterministic, source-grounded briefing data helper |
 | `app/ui/theme/professional.qss` | Stylesheet |
 | `worker/main.py` | Native Windows FastAPI worker |
 | `config.example.yaml` | Configuration template; the active file is `%APPDATA%\IDFA\config.yaml` |

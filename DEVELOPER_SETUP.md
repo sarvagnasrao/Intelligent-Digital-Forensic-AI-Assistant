@@ -127,8 +127,10 @@ Final_Project/
 │   ├── examination/        # Examination job management
 │   ├── artifacts/          # Artifacts, search, entities, timeline
 │   ├── analysis/           # Background NER + relationships
-│   ├── ai/                 # AI analysis (local Ollama)
-│   ├── findings/           # Findings workflow
+│   ├── ai/                 # AI analysis (local Ollama) + case briefing helper
+│   ├── devices/            # Physical device records and evidence links
+│   ├── processing/         # Explicit-approval processing coordinator
+│   ├── findings/           # Findings workflow and identity hypotheses
 │   ├── reports/            # PDF report generation
 │   ├── audit/              # Audit trail & chain of custody
 │   ├── db/                 # SQLAlchemy models & session
@@ -139,7 +141,8 @@ Final_Project/
 │   ├── main.py             # Forensic + AI endpoints
 │   └── requirements.txt    # Standalone worker deps
 ├── migrations/             # Alembic migrations
-├── scripts/                # Setup/start/stop helpers
+├── scripts/                # Setup/start/stop helpers + demo preparation
+├── tests/                  # pytest suite; demo_case/ holds synthetic datasets
 ├── tools/                  # Runtime binaries (created at setup, NOT in git)
 │   ├── qdrant/qdrant.exe
 │   └── ollama/ollama.exe
@@ -213,6 +216,21 @@ ollama pull phi3:mini
 # Embedding model (all-minilm, 46 MB, 384-dim)
 ollama pull all-minilm
 ```
+
+---
+
+## Synthetic exhibition demo
+
+`tests/demo_case/aurora_fiction/` is a fully fictional FAT12 dataset with a
+deterministic builder, documented sources and a prepared demonstration script.
+`scripts/prepare_aurora_demo.py` creates the labelled case through the services,
+uses the local worker, and persists `llm_enabled=false` analysis parameters
+before dispatch. It performs no indexing or model calls. Never present its graph
+edges or any AI answer as proof of identity, delivery or culpability.
+
+`app/processing/service.py` is an explicit-approval coordinator: nothing runs
+until a caller approves a plan, and its run records are **in-memory only**, not a
+durable queue, audit trail or crash-recovery mechanism.
 
 ---
 
@@ -298,7 +316,7 @@ ollama pull all-minilm
 - **JWT secret:** Generated per install on first run
 - **Chain of custody:** Application-level logging only, not legally binding
 - **AI output:** Explicitly marked "unverified", requires investigator verification
-- **Local-first:** AI generation, embeddings, Qdrant all local; no cloud deps
+- **Local-first:** AI generation, embeddings and Qdrant run locally by default; an OpenAI-compatible cloud provider is optional and requires per-case consent.
 
 ---
 

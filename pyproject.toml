@@ -1,7 +1,7 @@
 [project]
 name = "idfa"
 version = "0.1.0"
-description = "Intelligent Digital Forensic Analysis System"
+description = "Local-first Windows digital forensic analysis with provenance-aware search and analysis"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

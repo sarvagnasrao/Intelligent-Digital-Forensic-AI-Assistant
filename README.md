@@ -19,6 +19,24 @@ git lfs pull
 
 For an air-gapped machine, see [INSTALL_LOCAL.md](INSTALL_LOCAL.md).
 
+## Exhibition demo (synthetic)
+
+`tests/demo_case/` contains fully fictional teaching datasets and their builders.
+The current sample is **Aurora**, a small FAT12 image of invented notes, logs,
+messages and a manifest. Start with `tests/demo_case/README.md` and the dataset
+README for the exact workflow and expected source claims.
+
+Create the labelled case from a terminal (the script refuses an existing case):
+
+```powershell
+.venv\Scripts\python.exe scripts\prepare_aurora_demo.py --create --confirm-gui-not-in-aurora --username admin
+```
+
+The importer uses the local worker, persists explicit no-model analysis
+parameters before dispatch, and performs no embeddings or model calls. The demo
+works with keyword search and source review alone; do not present graph edges or
+AI answers as proof of identity, delivery or culpability.
+
 ## Control services
 
 ```powershell

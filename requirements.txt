@@ -25,6 +25,7 @@ psutil>=5.9.0
 
 # --- reporting ---
 reportlab>=4.2.0
+jinja2>=3.1.4
 
 # --- forensic worker ---
 fastapi>=0.110.0

@@ -127,9 +127,10 @@ Final_Project/
 │   ├── examination/        # Examination job management
 │   ├── artifacts/          # Artifacts, search, entities, timeline
 │   ├── analysis/           # Background NER + relationships
-│   ├── ai/                 # AI analysis (local Ollama) + case briefing helper
+│   ├── ai/                 # Chat + embeddings (local or cloud)
+│   │   └── case_briefing.py # Deterministic, cited briefing data (no model)
 │   ├── devices/            # Physical device records and evidence links
-│   ├── processing/         # Explicit-approval processing coordinator
+│   ├── processing/         # Explicit-approval, in-memory coordinator
 │   ├── findings/           # Findings workflow and identity hypotheses
 │   ├── reports/            # PDF report generation
 │   ├── audit/              # Audit trail & chain of custody
@@ -141,8 +142,10 @@ Final_Project/
 │   ├── main.py             # Forensic + AI endpoints
 │   └── requirements.txt    # Standalone worker deps
 ├── migrations/             # Alembic migrations
-├── scripts/                # Setup/start/stop helpers + demo preparation
-├── tests/                  # pytest suite; demo_case/ holds synthetic datasets
+├── scripts/                # Setup/start/stop helpers
+│   └── prepare_aurora_demo.py # Opt-in synthetic-case importer
+├── tests/                  # pytest suite
+│   └── demo_case/          # Synthetic Aurora, Aurora expanded and Harbor data
 ├── tools/                  # Runtime binaries (created at setup, NOT in git)
 │   ├── qdrant/qdrant.exe
 │   └── ollama/ollama.exe
@@ -221,12 +224,20 @@ ollama pull all-minilm
 
 ## Synthetic exhibition demo
 
-`tests/demo_case/aurora_fiction/` is a fully fictional FAT12 dataset with a
-deterministic builder, documented sources and a prepared demonstration script.
-`scripts/prepare_aurora_demo.py` creates the labelled case through the services,
-uses the local worker, and persists `llm_enabled=false` analysis parameters
-before dispatch. It performs no indexing or model calls. Never present its graph
-edges or any AI answer as proof of identity, delivery or culpability.
+`tests/demo_case/aurora_fiction/` is a fully fictional 11-file FAT12 dataset with
+a deterministic builder, documented sources and a prepared demonstration script.
+`tests/demo_case/aurora_expanded/` is a 36-file companion built the same way; it
+spreads many identifiers across files so the entity and relationship graph has
+real material to show. Both images are checked in. The demonstration is keyword
+search plus source review, not a live AI or embeddings run.
+`scripts/prepare_aurora_demo.py` is opt-in (both `--create` and
+`--confirm-gui-not-in-aurora`), prompts for an existing user's password, refuses
+an existing labelled case, and creates a reference-only case through the
+services. It uses the local worker and persists `llm_enabled=false` analysis
+parameters before dispatch, performs no indexing or model calls, and never
+deletes cases or changes provider settings. Pass `--dataset expanded` for the
+larger image. Never present its graph edges or any AI answer as proof of
+identity, delivery or culpability.
 
 `app/processing/service.py` is an explicit-approval coordinator: nothing runs
 until a caller approves a plan, and its run records are **in-memory only**, not a
@@ -259,14 +270,15 @@ durable queue, audit trail or crash-recovery mechanism.
 - Created on first run from `config.example.yaml`
 - Only `app.data_dir` is stored; database, logs, evidence, Qdrant paths derived from it
 - Environment overrides:
-  - `APP__DATA_DIR`
+  - `APP__DATA_DIR`, `APP__LOGS_DIR`
   - `DATABASE__URL`
-  - `WORKER__URL`
-  - `OLLAMA__HOST`
-  - `QDRANT__URL`
+  - `WORKER__URL`, `WORKER__EVIDENCE_ROOT_WINDOWS`
+  - `OLLAMA__HOST`, `EMBEDDINGS__MODEL_ID`
+  - `QDRANT__URL`, `AUTH__SECRET_KEY`
 
 ### AI Providers
 - `ollama.provider` / `embeddings.provider` = `ollama` (local) or `openai` (any OpenAI-compatible endpoint, e.g., NVIDIA NIM)
+- Named chat connections and enabled model IDs live under `ollama.chat_connections`; the Settings **Chat connections** / **Chat models** cards edit them
 - Cloud settings stored encrypted via DPAPI (`dpapi:<base64>` in config.yaml)
 - Only IDFA-launched Ollama is stopped on exit
 
@@ -283,6 +295,10 @@ durable queue, audit trail or crash-recovery mechanism.
 
 # With coverage
 .\.venv\Scripts\pytest --cov=app
+
+# Synthetic Aurora dataset (offline; no services or model calls)
+.\.venv\Scripts\python.exe tests\demo_case\aurora_fiction\build_image.py
+.\.venv\Scripts\pytest tests\test_aurora_fiction.py -q
 ```
 
 ### Test Config (pyproject.toml)
@@ -334,6 +350,12 @@ durable queue, audit trail or crash-recovery mechanism.
 | `app/db/session.py` | Database session management |
 | `app/examination/profiles.py` | Examination presets & parameter validation |
 | `app/analysis/` | Background NER + relationships pipeline |
+| `app/devices/` | Physical device records and source-backed identifier leads |
+| `app/processing/service.py` | Explicit-approval, in-memory stage coordinator (not durable) |
+| `app/ai/case_briefing.py` | Deterministic, citation-validated briefing data |
+| `app/findings/identity.py` | Investigator-authored identity hypotheses |
+| `tests/demo_case/` | Synthetic Aurora/Harbor exhibition datasets |
+| `scripts/prepare_aurora_demo.py` | Opt-in, non-destructive Aurora importer |
 
 ---
 
@@ -353,8 +375,8 @@ durable queue, audit trail or crash-recovery mechanism.
 - **Windows only** — GUI and worker are both native Windows
 - **Python 3.12+** required
 - **SQLite only** — no PostgreSQL/MySQL support planned
-- **Local-first** — no cloud dependencies
-- **No external API keys required** — all AI runs locally via Ollama
+- **Local-first by default** — AI, embeddings and Qdrant run locally; a cloud provider is optional
+- **No API key required for local mode** — all local AI runs through Ollama
 
 ---
 

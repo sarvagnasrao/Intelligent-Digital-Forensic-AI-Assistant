@@ -7,7 +7,7 @@
 |------------|-------|------|-------------|
 | **MainWindow** | `MainWindow` | `app/ui/main_window.py` | Root `QMainWindow` - holds everything |
 | **GlobalShell** | `GlobalShell` | `app/ui/main_window.py` | Pre-case shell (login → case list) |
-| **CaseShell** | `CaseShell` | `app/ui/main_window.py` | In-case shell (9 tabs + header) |
+| **CaseShell** | `CaseShell` | `app/ui/main_window.py` | In-case shell (grouped sidebar + 9-page stack + header) |
 
 ---
 
@@ -25,23 +25,26 @@
 > `UserRole.ADMIN`, and `show_page_by_key()` refuses to switch a non-admin to it.
 
 ### Case Shell Pages (after opening a case)
-| Short Name | Class | File | Tab Index |
-|------------|-------|------|-----------|
-| **Overview** | `OverviewPage` | `app/ui/pages/overview_page.py` | 0 |
-| **Evidence** | `EvidencePage` | `app/ui/pages/evidence_page.py` | 1 |
-| **Examination** | `ExaminationPage` | `app/ui/pages/examination_page.py` | 2 |
-| **Artifacts & Search** | `ArtifactsSearchPage` | `app/ui/pages/artifacts_search_page.py` | 3 |
-| **AI Analysis** | `AIAnalysisPage` | `app/ui/pages/ai_analysis_page.py` | 4 |
-| **Entities & Timeline** | `EntitiesTimelinePage` | `app/ui/pages/entities_timeline_page.py` | 5 |
-| **Findings** | `FindingsPage` | `app/ui/pages/findings_page.py` | 6 |
-| **Reports** | `ReportsPage` | `app/ui/pages/reports_page.py` | 7 |
-| **Audit & Custody** | `AuditPage` | `app/ui/pages/audit_page.py` | 8 |
+| Short Name | Class | File | Stack Index | Sidebar Group |
+|------------|-------|------|-------------|---------------|
+| **Overview** | `OverviewPage` | `app/ui/pages/overview_page.py` | 0 | Overview |
+| **Evidence** | `EvidencePage` | `app/ui/pages/evidence_page.py` | 1 | Evidence & Examination |
+| **Examination** | `ExaminationPage` | `app/ui/pages/examination_page.py` | 2 | Evidence & Examination |
+| **Artifacts & Search** | `ArtifactsSearchPage` | `app/ui/pages/artifacts_search_page.py` | 3 | Explore |
+| **AI Analysis** | `AIAnalysisPage` | `app/ui/pages/ai_analysis_page.py` | 4 | Investigation |
+| **Entities & Timeline** | `EntitiesTimelinePage` | `app/ui/pages/entities_timeline_page.py` | 5 | Explore |
+| **Findings** | `FindingsPage` | `app/ui/pages/findings_page.py` | 6 | Investigation |
+| **Reports** | `ReportsPage` | `app/ui/pages/reports_page.py` | 7 | Report & History |
+| **Audit & Custody** | `AuditPage` | `app/ui/pages/audit_page.py` | 8 | Report & History |
 
 > Case pages are registered by key in `_CASE_PAGES` (`(key, title)`), so the
-> sidebar labels, the stack contents and `CaseShell.show_page_by_key()` cannot
-> drift apart. `OverviewPage.next_action_requested` is connected to that method,
-> which is how the six **Next Actions** buttons open the page they name, and
-> `OverviewPage.edit_case_requested` drives `CaseShell._edit_current_case()`.
+> page keys and stack order stay stable; `_CASE_GROUPS` only controls the
+> grouped sidebar. A group with more than one page expands when its active page
+> is shown; **Overview** is a single-page group. `CaseShell.show_page_by_key()`
+> keeps the sidebar selection in sync. `OverviewPage.next_action_requested` is
+> connected to that method, which is how the **Next Actions** buttons open the
+> page they name, and `OverviewPage.edit_case_requested` drives
+> `CaseShell._edit_current_case()`.
 
 ---
 
@@ -64,13 +67,17 @@
 | **Report Templates** | `ReportTemplatesDialog` | `reports_page.py` | Reports → "Report Templates" |
 | **Record Custody Event** | `RecordCustodyDialog` | `audit_page.py` | Audit & Custody → Chain of Custody → "Record Custody Event" |
 | **Register Evidence** | `RegisterEvidenceDialog` | `evidence_page.py` | Evidence → Register Evidence |
-| **Remove / Delete Evidence** | `RemoveEvidenceDialog`, `DeleteEvidenceDialog` | `evidence_page.py` | Evidence → Remove or Delete |
-| **Reference Hash** | `ReferenceHashDialog` | `evidence_page.py` | Evidence → Reference Hash |
+| **Remove / Delete Evidence** | `RemoveEvidenceDialog`, `DeleteEvidenceDialog` | `evidence_page.py` | Evidence → row context menu → Remove from case… / Delete permanently… |
+| **Reference Hash** | `ReferenceHashDialog` | `evidence_page.py` | Evidence → row context menu → Set reference hash… |
+| **Edit Evidence Details** | `EditDetailsDialog` | `evidence_page.py` | Evidence → row context menu → Edit details… |
 | **New Examination Job** | `NewExamJobDialog` | `examination_page.py` | Examination → New Job (Advanced expands every parameter) |
-| **Document Viewer** | `ArtifactDocumentDialog` | `artifacts_search_page.py` | Artifacts & Search → Open viewer |
-| **New Finding / Identity Hypothesis** | `NewFindingDialog`, `IdentityHypothesisDialog` | `findings_page.py` | Findings → New Finding / Identity review |
+| **Document Viewer** | `ArtifactDocumentDialog` | `artifacts_search_page.py` | Artifacts & Search → detail pane → Open viewer |
+| **New Finding** | `NewFindingDialog` | `findings_page.py` | Findings → New Finding |
+| **Identity Hypothesis** | `IdentityHypothesisDialog` | `findings_page.py` | Findings → New identity hypothesis |
 | **Physical Devices** | `DeviceDialog` | `app/ui/device_dialog.py` | Evidence → Physical devices |
-| **First Run / Missing or Change Data Folder** | `FirstRunDialog`, `MissingDataFolderDialog`, `ChangeDataFolderDialog` | `app/ui/dialogs/data_folder_dialog.py` | Startup / Settings → Data & Storage |
+| **First Run / Missing or Change Data Folder** | `FirstRunDialog`, `MissingDataFolderDialog`, `ChangeDataFolderDialog` | `app/ui/dialogs/data_folder_dialog.py` | Startup (first run / configured folder unavailable) / Settings → Data & Storage → Change folder… |
+| **Manage Provider** | `QDialog` built inline in `_build_connections_card` | `settings_page.py` | Settings → AI & Models → Chat connections → Connect provider / Edit provider… |
+| **Chat Models** | inline tree in `_build_connections_card` | `settings_page.py` | Settings → AI & Models → Chat models → Add model / Refresh models |
 
 ---
 
@@ -85,9 +92,16 @@
 ### Worker Endpoints (native Windows :8000)
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/health` | GET | Service health |
-| `/examine` | POST | Forensic operations |
-| `/generate` | POST | AI analysis |
+| `/health` | GET | Service health (worker capabilities, Ollama, Qdrant, embeddings) |
+| `/examine` | POST | Start a forensic examination |
+| `/examine/{job_id}/progress` | GET | Poll examination progress |
+| `/examine/{job_id}/batch` | GET | Fetch streamed artifact batches |
+| `/examine/{job_id}/batch/{sequence}/ack` | POST | Acknowledge a received batch |
+| `/examine/{job_id}/cancel` | POST | Stop a running scan between files |
+| `/examine/{job_id}/pause` | POST | Pause a running scan |
+| `/examine/{job_id}/resume` | POST | Resume a paused scan |
+| `/extract-artifact` | POST | Extract one artifact on demand |
+| `/generate` | POST | AI chat / analysis generation |
 | `/search` | POST | Semantic search |
 | `/embed` | POST | Vector indexing |
 
@@ -102,6 +116,12 @@
 | `app/ui/base.py` | Shared UI components (StatCard, NavList, etc.) |
 | `app/processing/service.py` | Explicit-approval, in-memory processing coordinator (not durable) |
 | `app/ai/case_briefing.py` | Deterministic, source-grounded briefing data helper |
+| `app/devices/` | Physical device records and identifier leads |
+| `app/findings/identity.py` | Investigator-authored identity hypotheses |
+| `app/ui/device_dialog.py` | **DeviceDialog** – devices and evidence links |
+| `app/ui/dialogs/data_folder_dialog.py` | First-run, missing-folder and change-folder dialogs |
+| `tests/demo_case/` | Synthetic Aurora/Harbor exhibition datasets |
+| `scripts/prepare_aurora_demo.py` | Opt-in, non-destructive Aurora importer |
 | `app/ui/theme/professional.qss` | Stylesheet |
 | `worker/main.py` | Native Windows FastAPI worker |
 | `config.example.yaml` | Configuration template; the active file is `%APPDATA%\IDFA\config.yaml` |
@@ -126,7 +146,18 @@ STOP_IDFA.bat
 
 ---
 
-### Recent Changes (2026-10-26)
+### Recent Changes (2026-10-31)
+- **Case navigation**: The case sidebar is grouped (`Overview`, `Evidence & Examination`, `Explore`, `Investigation`, `Report & History`). `_CASE_PAGES` still fixes the nine page keys and stack order, and `show_page_by_key()` expands the active group.
+- **Physical devices**: Evidence → **Physical devices** opens `DeviceDialog` (manual records and explicit evidence links; identifier leads are unconfirmed source occurrences, not identity matches).
+- **Identity hypotheses**: Findings → **New identity hypothesis** opens `IdentityHypothesisDialog`; the result is an ordinary draft finding with cited excerpts, not an inferred identity.
+- **Document viewer**: Artifacts & Search → **Open viewer** opens `ArtifactDocumentDialog` with PDF rendering, extracted text and match navigation.
+- **Data folder dialogs**: `FirstRunDialog`, `MissingDataFolderDialog` and `ChangeDataFolderDialog` cover first-run selection, an unreachable folder, and move/adopt/fresh changes from Settings.
+- **Provider management**: Settings → AI & Models → **Chat connections** edits named providers in an inline `QDialog`; **Chat models** adds/enables model IDs. Drafts are kept only after **Save Settings**.
+- **New modules**: `app/devices/` (device records/leads), `app/processing/service.py` (explicit approval, in-memory only — not a durable queue or audit trail), and `app/ai/case_briefing.py` (deterministic, citation-validated briefing data; not an end-to-end AI feature).
+- **Evidence dialogs**: The reference now lists register, edit, reference-hash, remove and permanent-delete dialogs under Evidence.
+- **Exhibition data**: `tests/demo_case/aurora_fiction/` is the 11-file synthetic Aurora image; `tests/demo_case/aurora_expanded/` is the 36-file companion for graph/entity correlation. Both are checked in. The demo is keyword/source review and does not run live AI.
+
+### Earlier Changes (2026-10-26)
 - **Header Bar**: New `AppHeaderBar` with search (420×36), notification bell (popup with "Clear all"), user menu (signed-in name/role, Settings, About, Log out).
 - **Login Dialog**: Custom title bar, "Show"/"Hide" password via QAction in trailing position, footer version shortened to "v0.1.0 • KSIT Bengaluru". The "Forgot password?" link was removed (there is no self-service recovery; admins reset accounts), and the dialog now sizes its height to the laid-out content instead of a hardcoded 535px, which previously let the footer collide with the sign-in button.
 - **Settings Page**: Loads all settings on init, saves all categories (General, Worker, AI, Database, Security), resets to defaults in YAML.

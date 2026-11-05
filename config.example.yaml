@@ -9,7 +9,8 @@
 # another machine. Blank values mean "derive it".
 #
 # Environment overrides still work and win over this file, using the same names:
-#   APP__DATA_DIR, DATABASE__URL, WORKER__URL, OLLAMA__HOST, QDRANT__URL,
+#   APP__DATA_DIR, APP__LOGS_DIR, DATABASE__URL, WORKER__URL,
+#   WORKER__EVIDENCE_ROOT_WINDOWS, OLLAMA__HOST, QDRANT__URL,
 #   AUTH__SECRET_KEY, EMBEDDINGS__MODEL_ID
 
 app:
@@ -62,6 +63,25 @@ ollama:
   # laptop; IDFA_MAX_CONTEXT_TOKENS raises the worker's ceiling if needed.
   max_tokens: 2048
   context_window_tokens: 8192
+  # Chat model catalogs offered by AI Analysis. Omit either list to derive it
+  # from model / cloud_model above; an explicit [] keeps that side empty.
+  chat_local_models:
+    - phi3:mini
+  chat_cloud_models:
+    - gpt-4o-mini
+  # Named chat connections edited under Settings → AI & Models → Chat
+  # connections. Omit this key to derive the legacy Local Ollama and Cloud
+  # entries; an explicit [] disables all chat connections. API keys are
+  # DPAPI-protected on save, so never put a real key in a shared template.
+  # chat_connections:
+  #   - id: local
+  #     name: Local Ollama
+  #     provider: ollama
+  #     base_url: http://127.0.0.1:11434
+  #     enabled: true
+  #     models:
+  #       - id: phi3:mini
+  #         enabled: true
 
 embeddings:
   # Ollama model used for semantic search. all-minilm is the same

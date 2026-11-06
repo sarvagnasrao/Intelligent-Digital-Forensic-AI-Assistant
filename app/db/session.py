@@ -156,6 +156,9 @@ def _ensure_columns() -> None:
         "cases": (
             ("cloud_ai_consent_at", "DATETIME"),
             ("cloud_ai_consent_by_id", "INTEGER"),
+            ("archived_at", "DATETIME"),
+            ("archived_by_id", "INTEGER"),
+            ("archive_reason", "VARCHAR(512)"),
         ),
     }
     with engine.begin() as connection:

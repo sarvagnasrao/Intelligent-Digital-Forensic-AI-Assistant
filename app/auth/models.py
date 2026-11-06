@@ -63,6 +63,11 @@ class Case(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Reversible archive preserves the entire evidence graph and custody trail.
+    # The admin actor is also recorded in the permanent case audit event.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    archived_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    archive_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
     cloud_ai_consent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -91,15 +91,15 @@ def is_encrypted(value: str) -> bool:
 
 
 def encrypt_secret(value: str) -> str:
-    """Encrypt for the current Windows user; plain text is left untouched."""
+    """Encrypt for the current Windows user, failing closed on DPAPI errors."""
     if not value or is_encrypted(value) or not sys.platform.startswith("win"):
         return value
     try:
         protected = _protect(value.encode("utf-8"))
-    except Exception:
-        # Never lose a key because DPAPI refused; the caller still has a
-        # working (if weaker) configuration.
-        return value
+    except Exception as exc:
+        # Never turn a DPAPI failure into a silently persisted plaintext key.
+        # Callers may report the error and retain the previous config file.
+        raise RuntimeError("Windows DPAPI could not protect the secret") from exc
     return PREFIX + base64.b64encode(protected).decode("ascii")
 
 

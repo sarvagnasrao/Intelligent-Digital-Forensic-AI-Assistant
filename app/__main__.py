@@ -6,7 +6,7 @@ import os
 import sys
 import traceback
 
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox
 
 from app.db import load_all_models
 from app.db.session import get_session_factory, init_db
@@ -14,7 +14,7 @@ from app.logging_config import setup_logging
 
 # Load all models to register relationships
 load_all_models()
-from app.auth.models import User
+from app.auth.models import User, UserRole
 from app.auth.service import AuthService
 from app.cases.service import CaseService
 from app.i18n import LanguageManager
@@ -24,20 +24,64 @@ from app.ui.main_window import MainWindow
 from app.ui.theme.manager import ThemeManager
 
 
-def create_default_user() -> None:
-    """Create default admin user if none exists."""
+def create_default_user() -> bool:
+    """Provision a password chosen by the operator on the very first run.
+
+    Existing installations never receive an automatic replacement admin
+    account. In particular, deleting or renaming the old 'admin' user must
+    not silently recreate that account with a known default password.
+    """
     session_factory = get_session_factory()
     with session_factory() as session:
-        auth_service = AuthService(session)
-        if not auth_service.get_user_by_username("admin"):
-            auth_service.create_user(
-                username="admin",
-                email="admin@idfa.local",
-                password="1234",
-                full_name="Administrator",
-                role="admin"  # type: ignore
+        if session.query(User.id).first() is not None:
+            return True
+
+    QMessageBox.information(
+        None,
+        "First-run administrator setup",
+        "No user accounts exist yet. Set an administrator password to secure "
+        "this installation. The password will not be displayed again.",
+    )
+    while True:
+        password, accepted = QInputDialog.getText(
+            None, "Create administrator", "Administrator password (12+ characters):",
+            QLineEdit.EchoMode.Password,
+        )
+        if not accepted:
+            return False
+        if len(password) < 12:
+            QMessageBox.warning(
+                None, "Password too short", "Use a password of at least 12 characters.",
             )
-            session.commit()
+            continue
+        confirmation, accepted = QInputDialog.getText(
+            None, "Confirm administrator password", "Enter the same password again:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not accepted:
+            return False
+        if password != confirmation:
+            QMessageBox.warning(
+                None, "Passwords do not match", "Please choose and confirm the password again.",
+            )
+            continue
+        break
+
+    with session_factory() as session:
+        # A second application process may have provisioned an account while
+        # the operator was viewing the dialog. Never add a default admin then.
+        if session.query(User.id).first() is not None:
+            return True
+        auth_service = AuthService(session)
+        auth_service.create_user(
+            username="admin",
+            email="admin@idfa.local",
+            password=password,
+            full_name="Administrator",
+            role=UserRole.ADMIN,
+        )
+        session.commit()
+    return True
 
 
 def recover_interrupted_jobs() -> int:
@@ -140,7 +184,8 @@ def main() -> int:
     setup_logging()
     # Initialize database
     init_db()
-    create_default_user()
+    if not create_default_user():
+        return 0  # Setup cancelled; no insecure credentials are created.
     # A job cannot still be running: the previous GUI process is gone.
     recover_interrupted_jobs()
 

@@ -54,7 +54,7 @@ After setup you can also use the **IDFA** shortcut on the Desktop / Start Menu.
 
 ### 4. Login
 - **Username:** `admin`
-- **Password:** `1234` (fresh installs; existing accounts are unchanged)
+- **Password:** chosen by the operator at first-run setup (12+ characters); existing accounts remain unchanged.
 
 ---
 
@@ -328,7 +328,7 @@ durable queue, audit trail or crash-recovery mechanism.
 
 ## Security Notes
 
-- **Default admin password:** `1234` on fresh installs — **change immediately**
+- **Initial admin password:** securely chosen during first-run setup; no fixed default credentials are created.
 - **JWT secret:** Generated per install on first run
 - **Chain of custody:** Application-level logging only, not legally binding
 - **AI output:** Explicitly marked "unverified", requires investigator verification

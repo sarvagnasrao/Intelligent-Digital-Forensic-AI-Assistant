@@ -53,7 +53,7 @@ curl.exe -s http://127.0.0.1:8000/health
 
 ### Login
 - **Username**: `admin`
-- **Password**: `1234` on fresh installs (change it after the first sign-in)
+- **Password**: selected during first-run administrator setup (minimum 12 characters); no fixed default password.
 
 ---
 
@@ -384,7 +384,7 @@ Windows worker uses paths unchanged.
 
 ## Security Notes
 
-- **Default admin password**: `1234` on fresh installs (change immediately)
+- **First-run admin password**: operator-selected during account provisioning; never embed default credentials.
 - **JWT secret**: generated per install on first run; override `auth.secret_key` only for a shared fixed value
 - **Chain of custody**: Application-level logging only, not legally binding
 - **AI output**: Explicitly marked "unverified", requires investigator verification

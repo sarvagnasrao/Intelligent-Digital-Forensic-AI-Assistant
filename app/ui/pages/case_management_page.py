@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -302,6 +303,12 @@ class CaseManagementPage(ResponsivePage):
         header_row.addWidget(title)
         header_row.addStretch()
 
+        self.archived_cases_btn = QPushButton("Archived Cases")
+        self.archived_cases_btn.setProperty("secondary", True)
+        self.archived_cases_btn.clicked.connect(self._show_archived_cases)
+        self.archived_cases_btn.setVisible(False)
+        header_row.addWidget(self.archived_cases_btn)
+
         self.new_case_btn = QPushButton("+ New Case")
         self.new_case_btn.clicked.connect(self._on_new_case)
         header_row.addWidget(self.new_case_btn)
@@ -422,6 +429,8 @@ class CaseManagementPage(ResponsivePage):
 
     def set_user(self, user: User):
         self.current_user = user
+        self.archived_cases_btn.setVisible(bool(user and user.is_active and user.role == UserRole.ADMIN))
+        self.new_case_btn.setVisible(bool(user and user.is_active and user.role != UserRole.READ_ONLY))
 
     def set_case_service(self, service: CaseService):
         self.case_service = service
@@ -654,11 +663,12 @@ class CaseManagementPage(ResponsivePage):
 
         menu.addSeparator()
 
-        # Delete action
-        delete_action = QAction("Delete", self)
-        delete_action.setProperty("danger", True)
-        delete_action.triggered.connect(lambda: self._delete_case(case))
-        menu.addAction(delete_action)
+        # Archiving preserves every forensic record; only admins may do it.
+        if self.current_user and self.current_user.is_active and self.current_user.role == UserRole.ADMIN:
+            archive_action = QAction("Archive Case", self)
+            archive_action.setProperty("danger", True)
+            archive_action.triggered.connect(lambda: self._archive_case(case))
+            menu.addAction(archive_action)
 
         menu.exec(self.table_view.viewport().mapToGlobal(pos))
 
@@ -758,29 +768,79 @@ class CaseManagementPage(ResponsivePage):
 
         dialog.exec()
 
-    def _delete_case(self, case):
+    def _archive_case(self, case):
+        if not self.current_user or self.current_user.role != UserRole.ADMIN:
+            QMessageBox.warning(self, "Permission denied", "Only administrators may archive cases.")
+            return
         reply = QMessageBox.question(
-            self, "Delete Case",
-            f"Are you sure you want to delete case '{case.case_id}'?\n"
-            "This will delete all associated evidence, examinations, artifacts, and findings.\n"
-            "This action cannot be undone.",
+            self, "Archive Case",
+            f"Archive case '{case.case_id}'?\n"
+            "The case will be hidden from normal navigation and made read-only.\n"
+            "Evidence, chain of custody, audit history, and reports will be preserved.\n"
+            "An administrator can restore it later.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-
+        reason, accepted = QInputDialog.getText(
+            self, "Archive Reason", "Reason for archiving (optional):",
+        )
+        if not accepted:
+            return
         from app.db.session import session_scope
 
         try:
             with session_scope() as session:
-                case_service = CaseService(session)
-                case_service.delete_case(case.id)
+                changed = CaseService(session).archive_case(case.id, self.current_user, reason)
                 session.commit()
             self.refresh()
-            QMessageBox.information(self, "Success", f"Case '{case.case_id}' deleted successfully")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to delete case: {e}")
+            if changed:
+                QMessageBox.information(self, "Archived", f"Case '{case.case_id}' was archived.")
+            else:
+                QMessageBox.information(self, "No changes", "Case is already archived or unavailable.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to archive case: {exc}")
+
+    def _show_archived_cases(self):
+        if not self.current_user or self.current_user.role != UserRole.ADMIN:
+            QMessageBox.warning(self, "Permission denied", "Only administrators may restore cases.")
+            return
+        from app.db.session import session_scope
+
+        try:
+            with session_scope() as session:
+                archived = CaseService(session).list_archived_cases(self.current_user)
+                archived_rows = [(case.id, case.case_id, case.title) for case in archived]
+            if not archived_rows:
+                QMessageBox.information(self, "Archived Cases", "There are no archived cases.")
+                return
+            labels = [f"{reference} — {title}" for _id, reference, title in archived_rows]
+            choice, accepted = QInputDialog.getItem(
+                self, "Archived Cases", "Select a case to restore:", labels, 0, False,
+            )
+            if not accepted:
+                return
+            selected_index = labels.index(choice)
+            case_id, reference, _title = archived_rows[selected_index]
+            confirm = QMessageBox.question(
+                self, "Restore Case",
+                f"Restore archived case '{reference}' to normal navigation?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            with session_scope() as session:
+                changed = CaseService(session).restore_case(case_id, self.current_user)
+                session.commit()
+            self.refresh()
+            if changed:
+                QMessageBox.information(self, "Restored", f"Case '{reference}' was restored.")
+            else:
+                QMessageBox.information(self, "No changes", "Case was already restored or unavailable.")
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to restore case: {exc}")
 
     def _export_case(self, case):
         path, _ = QFileDialog.getSaveFileName(

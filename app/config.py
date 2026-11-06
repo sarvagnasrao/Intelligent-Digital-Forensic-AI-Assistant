@@ -636,7 +636,11 @@ def save_config(config: Config, config_path: str | Path | None = None) -> None:
     # A cloud API key must not sit in the profile as readable text. Encrypting
     # here covers every caller, and upgrades a plain-text value from an older
     # config the first time settings are saved.
-    config.ollama.cloud_api_key = encrypt_secret(config.ollama.cloud_api_key)
+    if config.ollama.cloud_api_key:
+        protected_legacy_key = encrypt_secret(config.ollama.cloud_api_key)
+        if not protected_legacy_key.startswith("dpapi:"):
+            raise RuntimeError("Unable to protect legacy cloud AI key with Windows DPAPI")
+        config.ollama.cloud_api_key = protected_legacy_key
     for connection in config.ollama.chat_connections or []:
         if connection.api_key:
             protected = encrypt_secret(connection.api_key)

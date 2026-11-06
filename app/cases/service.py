@@ -75,6 +75,8 @@ class CaseService:
         case = self.get_case_by_id(case_id)
         if not case:
             return None
+        if case.archived_at is not None:
+            raise PermissionError("Archived cases are read-only; restore the case before editing")
 
         if title is not None:
             case.title = title
@@ -101,14 +103,77 @@ class CaseService:
         self.session.flush()
         return case
 
-    def delete_case(self, case_id: int) -> bool:
-        """Delete a case (cascades to evidence, examinations, etc.)."""
+    def _require_active_admin(self, actor: User) -> User:
+        """Validate permissions against persisted identity, not a stale UI model."""
+        stored = self.session.get(User, actor.id) if actor is not None else None
+        if stored is None or not stored.is_active or stored.role != UserRole.ADMIN:
+            raise PermissionError("Only an active administrator can archive or restore cases")
+        return stored
+
+    def archive_case(self, case_id: int, actor: User, reason: str = "") -> bool:
+        """Archive without deleting any evidence, audit event, or custody record."""
+        from app.audit.service import AuditService
+
+        admin = self._require_active_admin(actor)
         case = self.get_case_by_id(case_id)
-        if not case:
+        if case is None or case.archived_at is not None:
             return False
-        self.session.delete(case)
+
+        reason = (reason or "").strip()
+        if len(reason) > 512:
+            raise ValueError("Archive reason must be 512 characters or fewer")
+        case.archived_at = datetime.now(timezone.utc)
+        case.archived_by_id = admin.id
+        case.archive_reason = reason or None
+        AuditService(self.session).log_event(
+            event_type="case",
+            action="archive",
+            result="success",
+            user=admin,
+            case_id=case.id,
+            target_type="case",
+            target_id=case.id,
+            details={"case_reference": case.case_id, "reason": reason},
+        )
         self.session.flush()
         return True
+
+    def restore_case(self, case_id: int, actor: User) -> bool:
+        """Restore a case without changing its forensic evidence history."""
+        from app.audit.service import AuditService
+
+        admin = self._require_active_admin(actor)
+        case = self.get_case_by_id(case_id)
+        if case is None or case.archived_at is None:
+            return False
+        previous_reason = case.archive_reason
+        case.archived_at = None
+        case.archived_by_id = None
+        case.archive_reason = None
+        AuditService(self.session).log_event(
+            event_type="case",
+            action="restore",
+            result="success",
+            user=admin,
+            case_id=case.id,
+            target_type="case",
+            target_id=case.id,
+            details={"case_reference": case.case_id, "previous_archive_reason": previous_reason},
+        )
+        self.session.flush()
+        return True
+
+    def delete_case(self, case_id: int) -> bool:
+        """Retired destructive operation: case removal is deliberately disabled."""
+        raise PermissionError("Permanent case deletion is disabled; use archive_case")
+
+    def list_archived_cases(self, user: User) -> list[Case]:
+        """List archived cases for the administrator's restoration interface."""
+        self._require_active_admin(user)
+        return list(self.session.execute(
+            select(Case).where(Case.archived_at.is_not(None))
+            .order_by(Case.archived_at.desc())
+        ).scalars().all())
 
     def list_cases(
         self,
@@ -117,8 +182,14 @@ class CaseService:
         priority: str | None = None,
         assignee_id: int | None = None,
         search: str | None = None,
+        *,
+        include_archived: bool = False,
     ) -> list[Case]:
-        """List cases accessible to user with filters."""
+        """List cases accessible to user; archived cases require admin access."""
+        if not user.is_active:
+            return []
+        if include_archived:
+            self._require_active_admin(user)
         if user.role == UserRole.ADMIN:
             stmt = select(Case)
         else:
@@ -126,6 +197,8 @@ class CaseService:
                 (Case.assignee_id == user.id) | (Case.created_by_id == user.id)
             )
 
+        if not include_archived:
+            stmt = stmt.where(Case.archived_at.is_(None))
         if status:
             stmt = stmt.where(Case.status == status)
         if priority:

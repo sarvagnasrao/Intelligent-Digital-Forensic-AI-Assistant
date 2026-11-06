@@ -31,7 +31,10 @@ class CaseService:
         created_by: User,
         assignee_id: int | None = None,
     ) -> Case:
-        """Create a new case."""
+        """Create a new case for an active investigator or administrator."""
+        actor = self.session.get(User, created_by.id) if created_by is not None else None
+        if actor is None or not actor.is_active or actor.role == UserRole.READ_ONLY:
+            raise PermissionError("An active investigator or administrator is required")
         # Validate assignee
         assignee = None
         if assignee_id:

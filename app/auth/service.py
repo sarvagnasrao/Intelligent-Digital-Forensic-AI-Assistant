@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -15,20 +16,45 @@ from app.cases.models import Case
 from app.config import get_config
 
 
+# PBKDF2-HMAC-SHA256 is available on supported Python builds without a
+# dependency. Legacy salted-SHA256 hashes remain readable and are upgraded on
+# the next successful login.
+_PBKDF2_ITERATIONS = 600_000
+
+
 def hash_password(password: str) -> str:
-    """Simple SHA-256 hash for password (use bcrypt in production)."""
-    salt = secrets.token_hex(16)
-    return f"sha256${salt}${hashlib.sha256((salt + password).encode()).hexdigest()}"
+    """Hash a password with a unique salt and a computationally expensive KDF."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${_PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash."""
+    """Verify a PBKDF2 or legacy SHA-256 digest in constant time."""
     try:
-        algo, salt, hash_val = hashed_password.split("$", 2)
-        if algo == "sha256":
-            return hashlib.sha256((salt + plain_password).encode()).hexdigest() == hash_val
+        if hashed_password.startswith("pbkdf2_sha256$"):
+            algorithm, iterations_text, salt_hex, digest_hex = hashed_password.split("$", 3)
+            iterations = int(iterations_text)
+            # Malformed or attacker-controlled stored hashes must not cause a
+            # huge CPU allocation or be accepted with a trivial work factor.
+            if algorithm != "pbkdf2_sha256" or not 100_000 <= iterations <= 1_500_000:
+                return False
+            salt = bytes.fromhex(salt_hex)
+            stored = bytes.fromhex(digest_hex)
+            if len(salt) < 16 or len(stored) != hashlib.sha256().digest_size:
+                return False
+            actual = hashlib.pbkdf2_hmac(
+                "sha256", plain_password.encode("utf-8"), salt, iterations,
+            )
+            return hmac.compare_digest(actual, stored)
+        if hashed_password.startswith("sha256$"):
+            _, salt, digest_hex = hashed_password.split("$", 2)
+            actual = hashlib.sha256((salt + plain_password).encode("utf-8")).hexdigest()
+            return hmac.compare_digest(actual, digest_hex)
         return False
-    except ValueError:
+    except (ValueError, TypeError, OverflowError):
         return False
 
 
@@ -113,6 +139,11 @@ class AuthService:
             return None
         if not self.verify_password(password, user.password_hash):
             return None
+        # Existing installations keep their accounts: a successful login is
+        # the safest opportunity to migrate their legacy salted SHA-256 hash.
+        if user.password_hash.startswith("sha256$"):
+            user.password_hash = self.hash_password(password)
+            self.session.flush()
         return user
 
     def update_last_login(self, user_id: int) -> None:

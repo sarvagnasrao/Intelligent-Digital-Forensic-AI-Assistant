@@ -217,12 +217,14 @@ class AuthService:
 
     # --- Authorization ---
     def user_can_access_case(self, user: User, case_id: int) -> bool:
-        """Check if user can access a case (admin or assignee)."""
+        """Return active-case visibility; archived cases are held separately."""
+        if user is None or not user.is_active:
+            return False
+        case = self.session.get(Case, case_id)
+        if case is None or case.archived_at is not None:
+            return False
         if user.role == UserRole.ADMIN:
             return True
-        case = self.session.get(Case, case_id)
-        if not case:
-            return False
         return case.assignee_id == user.id or case.created_by_id == user.id
 
     def user_can_modify_case(self, user: User, case_id: int) -> bool:
@@ -236,7 +238,7 @@ class AuthService:
         ADMIN and INVESTIGATOR users can write if they have case access.
         None user returns False.
         """
-        if user is None:
+        if user is None or not user.is_active:
             return False
         if user.role == UserRole.READ_ONLY:
             return False
@@ -246,11 +248,12 @@ class AuthService:
         return user.role == UserRole.ADMIN
 
     def get_user_cases(self, user: User) -> list[Case]:
-        """Get cases accessible to user."""
-        if user.role == UserRole.ADMIN:
-            stmt = select(Case)
-        else:
-            stmt = select(Case).where(
+        """Return non-archived cases for an active user's navigation."""
+        if not user.is_active:
+            return []
+        stmt = select(Case).where(Case.archived_at.is_(None))
+        if user.role != UserRole.ADMIN:
+            stmt = stmt.where(
                 (Case.assignee_id == user.id) | (Case.created_by_id == user.id)
             )
         return list(self.session.execute(stmt.order_by(Case.updated_at.desc())).scalars().all())

@@ -55,6 +55,7 @@ try:
     import pytsk3
     PYTSK3_AVAILABLE = True
 except ImportError:
+    pytsk3 = None  # type: ignore[assignment]
     PYTSK3_AVAILABLE = False
 
 try:
@@ -241,7 +242,7 @@ def _raw_image_parts(path: Path) -> list[Path]:
     return paths
 
 
-class SegmentedRawImgInfo(pytsk3.Img_Info):
+class SegmentedRawImgInfo(pytsk3.Img_Info if PYTSK3_AVAILABLE else object):
     """Read a split raw image as one continuous byte-addressable disk image."""
 
     def __init__(self, paths: list[Path]):
@@ -278,7 +279,7 @@ class SegmentedRawImgInfo(pytsk3.Img_Info):
         return bytes(result)
 
 
-class EWFImgInfo(pytsk3.Img_Info):
+class EWFImgInfo(pytsk3.Img_Info if PYTSK3_AVAILABLE else object):
     """Wrapper for EWF images using pyewf."""
     def __init__(self, ewf_handle):
         self._ewf_handle = ewf_handle

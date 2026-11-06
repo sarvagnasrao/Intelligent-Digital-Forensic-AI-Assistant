@@ -14,7 +14,7 @@ git lfs pull
 ```
 
 - Setup installs the Python environment, local services, and bundled models.
-- On first launch, sign in as **admin** / **1234**, then change the password.
+- On first launch, choose the administrator password in the secure setup prompt, then sign in as **admin**.
 - Open or create a case, add evidence, run an examination, then use **AI Analysis** to ask questions about that case's evidence.
 
 For an air-gapped machine, see [INSTALL_LOCAL.md](INSTALL_LOCAL.md).
@@ -85,6 +85,6 @@ Settings are stored in `%APPDATA%\IDFA\config.yaml` on first run. Case data, log
 ## Default login
 
 - Username: `admin`
-- Password: `1234`
+- Password: the one you chose during first-run administrator setup (minimum 12 characters).
 
 Change this immediately after first login.

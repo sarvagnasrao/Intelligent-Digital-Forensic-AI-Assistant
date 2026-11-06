@@ -154,6 +154,10 @@ class EmbedResponse(BaseModel):
 # Global state
 _img_info: pytsk3.Img_Info | None = None
 _fs_info: pytsk3.FS_Info | None = None
+# pytsk3 image/filesystem handles are process-global in this module. Scans must
+# not overlap until these handles are moved into per-job contexts: otherwise a
+# second scan can reset or close the image backing the first scan mid-walk.
+_examination_lock = threading.Lock()
 _examination_progress: dict[str, dict] = {}
 # Job ids the investigator asked to stop. The scan checks this on every
 # filesystem entry, so a cancel takes effect within a fraction of a second
@@ -1066,7 +1070,7 @@ def _is_disk_image(path: str) -> bool:
                       ".005", ".006", ".007", ".008", ".e01", ".e02"}
 
 
-def _examine_sync(request: ExamineRequest) -> ExamineResponse:
+def _examine_sync_unlocked(request: ExamineRequest) -> ExamineResponse:
     global _img_info, _fs_info
     _img_info = None
     _fs_info = None
@@ -1463,6 +1467,18 @@ def _examine_sync(request: ExamineRequest) -> ExamineResponse:
                 _job_control.notify_all()
         _img_info = None
         _fs_info = None
+
+
+def _examine_sync(request: ExamineRequest) -> ExamineResponse:
+    """Serialize examinations while the filesystem handles are global.
+
+    The underlying scan resets `_img_info` and `_fs_info` at start and end,
+    and uses them during recursive traversal. A second scan in a threadpool
+    would corrupt the first scan's state. Serial execution is deliberately
+    conservative until scan-local handles are implemented.
+    """
+    with _examination_lock:
+        return _examine_sync_unlocked(request)
 
 
 @app.post("/examine", response_model=ExamineResponse)

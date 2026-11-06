@@ -27,9 +27,9 @@ jobs:
       - name: Install portable test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest fastapi httpx pydantic pydantic-settings PyYAML sqlalchemy alembic
+          python -m pip install pytest fastapi httpx pydantic pydantic-settings PyYAML sqlalchemy alembic 'python-jose[cryptography]'
       - name: Compile all Python sources
         run: python -m compileall -q app worker tests
       - name: Run isolation and configuration regression tests
         run: |
-          python -m pytest -q tests/test_worker_examination_serialization.py tests/test_dpapi_fail_closed.py tests/test_config.py
+          python -m pytest -q tests/test_worker_examination_serialization.py tests/test_dpapi_fail_closed.py tests/test_password_security.py tests/test_config.py

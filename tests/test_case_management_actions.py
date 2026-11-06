@@ -1,4 +1,4 @@
-"""Case deletion and export from the Case Management page.
+"""Case archiving, restoration and export from the Case Management page.
 
 Both actions used to die with ``name 'session_scope' is not defined`` because
 the import only existed inside other methods, and the export timestamp used an
@@ -52,45 +52,80 @@ def case_page(qt_app, config_home, data_dir):
     close_db()
 
 
-def test_delete_case_removes_the_record(case_page, monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
+def test_archive_case_preserves_the_record(case_page, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
 
     page, session, _user, case = case_page
     case_id = case.id
     messages: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes,
     )
     monkeypatch.setattr(
-        QMessageBox, "information", lambda *a, **k: messages.append(("info", a[2]))
+        QInputDialog, "getText", lambda *a, **k: ("synthetic case completed", True),
     )
     monkeypatch.setattr(
-        QMessageBox, "critical", lambda *a, **k: messages.append(("critical", a[2]))
+        QMessageBox, "information", lambda *a, **k: messages.append(("info", a[2])),
+    )
+    monkeypatch.setattr(
+        QMessageBox, "critical", lambda *a, **k: messages.append(("critical", a[2])),
     )
 
-    page._delete_case(case)
+    page._archive_case(case)
 
     from app.auth.models import Case
 
-    remaining = session.execute(select(Case).where(Case.id == case_id)).scalars().all()
-    assert remaining == []
+    session.expire_all()
+    stored = session.get(Case, case_id)
+    assert stored is not None
+    assert stored.archived_at is not None
+    assert stored.archive_reason == "synthetic case completed"
     assert messages and messages[0][0] == "info", messages
 
 
-def test_delete_case_can_be_cancelled(case_page, monkeypatch):
+def test_archive_case_can_be_cancelled(case_page, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
 
     page, session, _user, case = case_page
     case_id = case.id
     monkeypatch.setattr(
-        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No,
     )
 
-    page._delete_case(case)
+    page._archive_case(case)
 
     from app.auth.models import Case
 
-    assert session.get(Case, case_id) is not None
+    session.expire_all()
+    stored = session.get(Case, case_id)
+    assert stored is not None
+    assert stored.archived_at is None
+
+
+def test_admin_can_restore_an_archived_case(case_page, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+    page, session, user, case = case_page
+    from app.cases.service import CaseService
+
+    assert CaseService(session).archive_case(case.id, user, "test")
+    session.commit()
+
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        QInputDialog, "getItem", lambda *a, **k: ("CASE-0001 — Export me", True),
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(
+        QMessageBox, "critical",
+        lambda *a, **k: pytest.fail(f"unexpected error dialog: {a[2]}"),
+    )
+
+    page._show_archived_cases()
+    session.expire_all()
+    assert session.get(type(case), case.id).archived_at is None
 
 
 def test_edit_case_saves_every_dialog_field(case_page, monkeypatch):

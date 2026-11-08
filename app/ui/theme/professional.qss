@@ -1158,3 +1158,111 @@ QLabel[link="true"]:hover {
    -------------------------------------------------------------------------- */
    /* Note: CSS 'transition' property not supported by Qt stylesheet engine.
       Use QPropertyAnimation in code for animations instead. */
+
+
+/* --------------------------------------------------------------------------
+   Investigator navigation palette (Ctrl+Shift+P)
+   -------------------------------------------------------------------------- */
+QDialog#QuickSwitcher {
+    background-color: @bg-secondary;
+    color: @text-primary;
+    border: 1px solid @border-default;
+    border-radius: 12px;
+}
+QLabel#QuickSwitcherTitle {
+    color: @text-primary;
+    font-size: 19px;
+    font-weight: 650;
+}
+QLabel#QuickSwitcherShortcut {
+    color: @text-secondary;
+    background: @bg-tertiary;
+    border: 1px solid @border-default;
+    border-radius: 5px;
+    padding: 5px 8px;
+    font-size: 11px;
+}
+QLineEdit#QuickSwitcherSearch {
+    min-height: 42px;
+    background: @bg-input;
+    border: 1px solid @border-strong;
+    border-radius: 8px;
+    padding: 0 14px;
+    font-size: 14px;
+}
+QLineEdit#QuickSwitcherSearch:focus {
+    border: 2px solid @accent;
+}
+QListWidget#QuickSwitcherList {
+    background: @bg-secondary;
+    alternate-background-color: @bg-secondary;
+    border: 1px solid @border-subtle;
+    border-radius: 8px;
+    outline: none;
+    padding: 6px;
+}
+QListWidget#QuickSwitcherList::item {
+    min-height: 36px;
+    padding: 7px 12px;
+    margin: 2px 1px;
+    border-radius: 6px;
+}
+QListWidget#QuickSwitcherList::item:hover {
+    background: @bg-tertiary;
+}
+QListWidget#QuickSwitcherList::item:selected {
+    background: @accent-strong;
+    color: @text-primary;
+    border-left: 3px solid @accent;
+}
+QLabel#QuickSwitcherEmpty {
+    color: @text-secondary;
+    font-size: 13px;
+    padding: 20px;
+}
+QLabel#QuickSwitcherHint {
+    color: @text-secondary;
+    font-size: 12px;
+}
+QFrame#QuickSwitcherDivider {
+    color: @border-subtle;
+    background: @border-subtle;
+    max-height: 1px;
+}
+
+/* --------------------------------------------------------------------------
+   Case dashboard: quiet, precise filtering and actionable empty states
+   -------------------------------------------------------------------------- */
+QLabel#CaseResultsSummary {
+    color: @text-secondary;
+    font-size: 12px;
+    font-weight: 500;
+}
+QFrame#CaseEmptyState {
+    background: @bg-secondary;
+    border: 1px dashed @border-default;
+    border-radius: 12px;
+    margin: 6px 0;
+}
+QFrame#CaseEmptyState QLabel {
+    background: transparent;
+    border: none;
+}
+QLabel#CaseEmptyTitle {
+    color: @text-primary;
+    font-size: 18px;
+    font-weight: 600;
+}
+QFrame#CaseEmptyState QLabel#EmptyStateMessage {
+    color: @text-secondary;
+    font-size: 13px;
+    padding: 0 16px;
+}
+QFrame#CaseEmptyState QPushButton {
+    min-height: 38px;
+    padding: 0 18px;
+}
+QFrame#StatCard:focus {
+    border: 2px solid @accent;
+    background: @bg-card;
+}

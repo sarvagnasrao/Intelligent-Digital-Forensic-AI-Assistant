@@ -1266,3 +1266,22 @@ QFrame#StatCard:focus {
     border: 2px solid @accent;
     background: @bg-card;
 }
+
+
+/* Always-visible, keyboard-accessible entry to investigation navigation. */
+QToolButton#QuickNavigationButton {
+    background: transparent;
+    color: @text-secondary;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    font-size: 11px;
+    padding: 3px 10px;
+}
+QToolButton#QuickNavigationButton:hover {
+    background: @bg-tertiary;
+    border-color: @border-default;
+    color: @text-primary;
+}
+QToolButton#QuickNavigationButton:focus {
+    border-color: @accent;
+}

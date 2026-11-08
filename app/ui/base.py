@@ -673,6 +673,7 @@ class StateStackedWidget(QStackedWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._states = {}
+        self._retry_callback = None
         self._build_states()
 
     def _build_states(self):
@@ -690,28 +691,52 @@ class StateStackedWidget(QStackedWidget):
         elif state == self.STATE_UNAVAILABLE:
             self._show_unavailable(message)
 
+    def _set_state_message(self, widget: QWidget, message: str, default: str) -> None:
+        label = widget.findChild(QLabel, "StateMessage")
+        if label is not None:
+            label.setText(message or default)
+
     def _show_loading(self, message: str):
-        widget = self._get_or_create_state("loading", self._create_loading_widget(message))
+        widget = self._get_or_create_state("loading", lambda: self._create_loading_widget(""))
+        self._set_state_message(widget, message, "Loading...")
         self.setCurrentWidget(widget)
 
     def _show_empty(self, message: str):
-        widget = self._get_or_create_state("empty", self._create_empty_widget(message))
+        widget = self._get_or_create_state("empty", lambda: self._create_empty_widget(""))
+        self._set_state_message(widget, message, "No items to display")
         self.setCurrentWidget(widget)
 
     def _show_error(self, message: str, retry_callback):
-        widget = self._get_or_create_state("error", self._create_error_widget(message, retry_callback))
+        widget = self._get_or_create_state("error", lambda: self._create_error_widget("", None))
+        self._set_state_message(widget, message, "An error occurred")
+        self._retry_callback = retry_callback
+        retry = widget.findChild(QPushButton, "StateRetry")
+        if retry is not None:
+            retry.setVisible(callable(retry_callback))
         self.setCurrentWidget(widget)
 
     def _show_unavailable(self, message: str):
-        widget = self._get_or_create_state("unavailable", self._create_unavailable_widget(message))
+        widget = self._get_or_create_state(
+            "unavailable", lambda: self._create_unavailable_widget("")
+        )
+        self._set_state_message(
+            widget, message, "This feature requires a service that is not currently running"
+        )
         self.setCurrentWidget(widget)
 
     def _get_or_create_state(self, key: str, creator):
+        # A callable is essential: recreating widgets on every update leaks
+        # abandoned children and can leave stale text or button callbacks.
         if key not in self._states:
             widget = creator()
             self._states[key] = widget
             self.addWidget(widget)
         return self._states[key]
+
+    def _run_retry(self) -> None:
+        callback = self._retry_callback
+        if callable(callback):
+            callback()
 
     def _create_loading_widget(self, message: str) -> QWidget:
         w = QWidget()
@@ -727,6 +752,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(spinner, alignment=Qt.AlignmentFlag.AlignCenter)
 
         label = QLabel(message or "Loading...")
+        label.setObjectName("StateMessage")
         label.setFont(QFont(Typography.FONT_FAMILY, Typography.BODY_MD[0]))
         label.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -751,6 +777,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         msg = QLabel(message or "No items to display")
+        msg.setObjectName("StateMessage")
         msg.setObjectName("EmptyStateMessage")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)
@@ -774,16 +801,18 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         msg = QLabel(message or "An error occurred")
+        msg.setObjectName("StateMessage")
         msg.setObjectName("EmptyStateMessage")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)
         layout.addWidget(msg)
 
-        if retry_callback:
-            btn = QPushButton("Retry")
-            btn.clicked.connect(retry_callback)
-            btn.setFixedWidth(120)
-            layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        btn = QPushButton("Retry")
+        btn.setObjectName("StateRetry")
+        btn.clicked.connect(self._run_retry)
+        btn.setFixedWidth(120)
+        btn.setVisible(callable(retry_callback))
+        layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
         return w
 
     def _create_unavailable_widget(self, message: str) -> QWidget:
@@ -803,6 +832,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         msg = QLabel(message or "This feature requires a service that is not currently running")
+        msg.setObjectName("StateMessage")
         msg.setObjectName("EmptyStateMessage")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)

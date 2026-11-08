@@ -5,7 +5,10 @@ from __future__ import annotations
 def _message(widget):
     from PySide6.QtWidgets import QLabel
 
-    label = widget.findChild(QLabel, "StateMessage")
+    label = next(
+        (child for child in widget.findChildren(QLabel) if child.property("stateMessage")),
+        None,
+    )
     assert label is not None
     return label.text()
 

@@ -519,11 +519,17 @@ class CaseManagementPage(ResponsivePage):
         super().resizeEvent(event)
         self._arrange_toolbar(event.size().width() < 900)
 
-    def set_user(self, user: User):
+    def set_user(self, user: User | None):
         self.current_user = user
         self.archived_cases_btn.setVisible(bool(user and user.is_active and user.role == UserRole.ADMIN))
         self.new_case_btn.setVisible(bool(user and user.is_active and user.role != UserRole.READ_ONLY))
         self.empty_action_btn.setVisible(bool(user and user.is_active and user.role != UserRole.READ_ONLY))
+        if user is None:
+            # Never leave the previous investigator's case list visible while
+            # the application is signed out or waiting for a different user.
+            self._cases_cache = []
+            self.table_model.removeRows(0, self.table_model.rowCount())
+            self.clear_filters()
 
     def set_case_service(self, service: CaseService):
         self.case_service = service
@@ -582,7 +588,10 @@ class CaseManagementPage(ResponsivePage):
                 self._empty_action_clears_filters = True
             else:
                 self.empty_title.setText("Your investigation workspace")
-                if self.current_user and self.current_user.role == UserRole.READ_ONLY:
+                if not self.current_user:
+                    self.empty_label.setText("Sign in to access your cases.")
+                    self.empty_action_btn.setVisible(False)
+                elif self.current_user.role == UserRole.READ_ONLY:
                     self.empty_label.setText("No cases are assigned to your account yet.")
                     self.empty_action_btn.setVisible(False)
                 else:

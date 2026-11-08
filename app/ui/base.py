@@ -692,7 +692,13 @@ class StateStackedWidget(QStackedWidget):
             self._show_unavailable(message)
 
     def _set_state_message(self, widget: QWidget, message: str, default: str) -> None:
-        label = widget.findChild(QLabel, "StateMessage")
+        # Keep the legacy styling objectName (EmptyStateMessage) intact;
+        # a dedicated property identifies message labels in all states.
+        label = next(
+            (child for child in widget.findChildren(QLabel)
+             if child.property("stateMessage")),
+            None,
+        )
         if label is not None:
             label.setText(message or default)
 
@@ -752,6 +758,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(spinner, alignment=Qt.AlignmentFlag.AlignCenter)
 
         label = QLabel(message or "Loading...")
+        label.setProperty("stateMessage", True)
         label.setObjectName("StateMessage")
         label.setFont(QFont(Typography.FONT_FAMILY, Typography.BODY_MD[0]))
         label.setStyleSheet(f"color: {Color.TEXT_SECONDARY.name()};")
@@ -777,7 +784,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         msg = QLabel(message or "No items to display")
-        msg.setObjectName("StateMessage")
+        msg.setProperty("stateMessage", True)
         msg.setObjectName("EmptyStateMessage")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)
@@ -801,7 +808,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         msg = QLabel(message or "An error occurred")
-        msg.setObjectName("StateMessage")
+        msg.setProperty("stateMessage", True)
         msg.setObjectName("EmptyStateMessage")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)
@@ -832,7 +839,7 @@ class StateStackedWidget(QStackedWidget):
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         msg = QLabel(message or "This feature requires a service that is not currently running")
-        msg.setObjectName("StateMessage")
+        msg.setProperty("stateMessage", True)
         msg.setObjectName("EmptyStateMessage")
         msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
         msg.setWordWrap(True)

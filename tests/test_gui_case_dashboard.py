@@ -86,3 +86,21 @@ def test_case_dates_sort_chronologically_not_by_displayed_text(qt_app):
     assert [
         proxy.index(row, 0).data() for row in range(proxy.rowCount())
     ] == ["CASE-FEB", "CASE-JUL", "CASE-NOV"]
+
+
+def test_sign_out_clears_previous_users_case_rows(qt_app):
+    from app.ui.pages.case_management_page import CaseManagementPage
+
+    page = CaseManagementPage(nav_controller=None)
+    now = datetime(2026, 1, 7, tzinfo=timezone.utc)
+    page.table_model.populate([_case("PRIVATE-SYNTHETIC-CASE", "open", "high", now)])
+    page._apply_filters()
+    assert page.proxy_model.rowCount() == 1
+
+    page.set_user(None)
+    assert page.table_model.rowCount() == 0
+    assert page.proxy_model.rowCount() == 0
+    assert "Sign in" in page.empty_label.text()
+    assert page.new_case_btn.isHidden()
+    assert page.empty_action_btn.isHidden()
+    page.close()

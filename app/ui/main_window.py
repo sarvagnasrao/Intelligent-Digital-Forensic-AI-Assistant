@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QStyleOptionViewItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -858,6 +859,14 @@ class MainWindow(QMainWindow):
         self._quick_switch_shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
         self._quick_switch_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
         self._quick_switch_shortcut.activated.connect(self._open_quick_switcher)
+        self.quick_navigation_btn = QToolButton(self)
+        self.quick_navigation_btn.setObjectName("QuickNavigationButton")
+        self.quick_navigation_btn.setText("Quick navigation   Ctrl+Shift+P")
+        self.quick_navigation_btn.setAccessibleName("Open quick navigation")
+        self.quick_navigation_btn.setToolTip("Find and open a workspace (Ctrl+Shift+P)")
+        self.quick_navigation_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.quick_navigation_btn.clicked.connect(self._open_quick_switcher)
+        self.status_bar.addPermanentWidget(self.quick_navigation_btn)
 
         # Background refresh: reloads whatever page is open on the interval
         # chosen in Settings instead of leaving the value unused.
@@ -877,6 +886,8 @@ class MainWindow(QMainWindow):
 
     def _open_quick_switcher(self) -> None:
         """Show only routes authorized by the active navigation shell."""
+        if QApplication.activeModalWidget() is not None:
+            return  # Never stack navigation over password or confirmation dialogs.
         nav = self.nav_controller
         if nav.get_current_user() is None:
             return

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal
-from PySide6.QtGui import QAction, QFont, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QAction, QBrush, QFont, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -218,6 +218,28 @@ class CaseTableModel(QStandardItemModel):
                 QStandardItem(format_local_date(case.created_at) if case.created_at else ""),
                 QStandardItem(format_local_date(case.updated_at) if case.updated_at else ""),
             ]
+            # Sort dates by actual timestamps rather than localized text.
+            for column, date in ((5, case.created_at), (6, case.updated_at)):
+                if date is not None:
+                    row[column].setData(date.timestamp(), Qt.ItemDataRole.UserRole)
+
+            # Semantic color helps read case priority/status at a glance without
+            # relying solely on color (the text remains visible and searchable).
+            status_colors = {
+                "open": Color.INFO,
+                "active": Color.SUCCESS,
+                "on_hold": Color.WARNING,
+                "closed": Color.TEXT_MUTED,
+            }
+            priority_colors = {
+                "critical": Color.ERROR,
+                "high": Color.WARNING,
+            }
+            row[2].setForeground(QBrush(status_colors.get(case.status, Color.TEXT_SECONDARY)))
+            row[3].setForeground(QBrush(priority_colors.get(case.priority, Color.TEXT_SECONDARY)))
+            row[2].setToolTip(f"Case status: {case.status.replace('_', ' ')}")
+            row[3].setToolTip(f"Priority: {case.priority}")
+
             # Make non-editable
             for item in row:
                 item.setEditable(False)
@@ -232,11 +254,24 @@ class CaseFilterProxyModel(QSortFilterProxyModel):
         self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.setFilterKeyColumn(-1)  # Search all columns
 
-    def set_filters(self, status: str = None, priority: str = None, search: str = None):
+    def set_filters(
+        self, status: str | None = None, priority: str | None = None,
+        search: str | None = None, kpi_filter: str | None = None,
+    ) -> None:
         self._status_filter = status
         self._priority_filter = priority
         self._search_filter = search or ""
+        self._kpi_filter = kpi_filter
         self.invalidateFilter()
+
+    def lessThan(self, source_left, source_right) -> bool:  # noqa: N802
+        """Correctly sort dates even in locales with non-ISO date formats."""
+        if source_left.column() in (5, 6) and source_left.column() == source_right.column():
+            left = source_left.data(Qt.ItemDataRole.UserRole)
+            right = source_right.data(Qt.ItemDataRole.UserRole)
+            if left is not None and right is not None:
+                return left < right
+        return super().lessThan(source_left, source_right)
 
     def filterAcceptsRow(self, source_row, source_parent) -> bool:
         model = self.sourceModel()
@@ -253,6 +288,19 @@ class CaseFilterProxyModel(QSortFilterProxyModel):
         if hasattr(self, '_priority_filter') and self._priority_filter and self._priority_filter != "All":
             priority_idx = model.index(source_row, 3, source_parent)
             if model.data(priority_idx) != self._priority_filter:
+                return False
+
+        # KPI cards reflect the exact metric definition in CaseService:
+        # 'active' includes open and active; 'needs attention' means an
+        # open case with high or critical priority.
+        if getattr(self, "_kpi_filter", None):
+            current_status = model.data(model.index(source_row, 2, source_parent))
+            current_priority = model.data(model.index(source_row, 3, source_parent))
+            if self._kpi_filter == "active" and current_status not in ("open", "active"):
+                return False
+            if self._kpi_filter == "needs_attention" and not (
+                current_status == "open" and current_priority in ("high", "critical")
+            ):
                 return False
 
         # Search filter
@@ -282,6 +330,7 @@ class CaseManagementPage(ResponsivePage):
         self.case_service: CaseService | None = None
         self.current_user: User | None = None
         self._cases_cache: list = []
+        self._kpi_filter: str | None = None
         
 
     def _setup_layout(self):
@@ -325,7 +374,11 @@ class CaseManagementPage(ResponsivePage):
             "needs_attention": StatCard("Needs Attention", "0", "⚠️", Color.ERROR),
         }
         for key, card in self.stat_cards.items():
-            card.clicked.connect(lambda _, k=key: self._on_stat_card_clicked(k))
+            card.clicked.connect(lambda k=key: self._on_stat_card_clicked(k))
+            card.setToolTip(
+                "Show cases that need attention" if key == "needs_attention"
+                else f"Filter cases by {key.replace('_', ' ')}"
+            )
             self.cards_layout.addWidget(card, 0, self.cards_layout.count())
         layout.addLayout(self.cards_layout)
 
@@ -334,7 +387,8 @@ class CaseManagementPage(ResponsivePage):
         filter_row.setSpacing(Spacing.SM)
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search cases...")
+        self.search_edit.setPlaceholderText("Search case ID, title or investigator…")
+        self.search_edit.setAccessibleName("Search cases")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._on_search_changed)
         self.search_edit.setMinimumWidth(150)
@@ -344,13 +398,15 @@ class CaseManagementPage(ResponsivePage):
 
         self.status_filter = QComboBox()
         self.status_filter.addItems(["All", "open", "active", "on_hold", "closed"])
-        self.status_filter.currentTextChanged.connect(self._apply_filters)
+        self.status_filter.currentTextChanged.connect(self._on_filter_changed)
+        self.status_filter.setAccessibleName("Filter cases by status")
         self.status_filter.setFixedHeight(36)
         status_label = QLabel("Status:")
 
         self.priority_filter = QComboBox()
         self.priority_filter.addItems(["All", "low", "medium", "high", "critical"])
-        self.priority_filter.currentTextChanged.connect(self._apply_filters)
+        self.priority_filter.currentTextChanged.connect(self._on_filter_changed)
+        self.priority_filter.setAccessibleName("Filter cases by priority")
         self.priority_filter.setFixedHeight(36)
         priority_label = QLabel("Priority:")
 
@@ -371,6 +427,22 @@ class CaseManagementPage(ResponsivePage):
         self._arrange_toolbar(True)
         layout.addLayout(filter_row)
 
+        # The results count and a one-click reset make it clear when a KPI
+        # card, text search, or dropdown has narrowed the current table.
+        results_row = QHBoxLayout()
+        self.results_label = QLabel("Showing 0 cases")
+        self.results_label.setObjectName("CaseResultsSummary")
+        self.results_label.setAccessibleName("Number of cases in the current list")
+        results_row.addWidget(self.results_label)
+        results_row.addStretch()
+        self.clear_filters_btn = QPushButton("Clear filters")
+        self.clear_filters_btn.setProperty("ghost", True)
+        self.clear_filters_btn.setToolTip("Remove search, status and priority filters")
+        self.clear_filters_btn.clicked.connect(self.clear_filters)
+        self.clear_filters_btn.setEnabled(False)
+        results_row.addWidget(self.clear_filters_btn)
+        layout.addLayout(results_row)
+
         # Case table
         self.table_view = QTableView()
         self.table_model = CaseTableModel(self.table_view)
@@ -382,6 +454,8 @@ class CaseManagementPage(ResponsivePage):
         self.table_view.setAlternatingRowColors(True)
         self.table_view.verticalHeader().setVisible(False)
         self.table_view.setSortingEnabled(True)
+        self.table_view.setAccessibleName("Cases")
+        self.table_view.setToolTip("Double-click a case to open its investigation workspace")
         # Column sizing: Case ID resize to content, Title stretch, others resize to content
         header = self.table_view.horizontalHeader()
         # Keep the title legible when the narrow table needs horizontal scrolling.
@@ -404,6 +478,7 @@ class CaseManagementPage(ResponsivePage):
         self.empty_label = QLabel("No cases yet. Click + New Case to create one.")
         self.empty_label.setObjectName("EmptyStateMessage")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
         self.empty_label.setStyleSheet(f"color: {Color.TEXT_MUTED.name()}; font-size: 14px; padding: 48px;")
         self.empty_label.hide()
         layout.addWidget(self.empty_label, 1)
@@ -452,50 +527,77 @@ class CaseManagementPage(ResponsivePage):
         self.table_model.populate(self._cases_cache)
         self._apply_filters()
 
-    def _apply_filters(self):
+    def _on_filter_changed(self, _text: str) -> None:
+        self._kpi_filter = None
+        self._apply_filters()
+
+    def _apply_filters(self) -> None:
         status = self.status_filter.currentText()
         priority = self.priority_filter.currentText()
-        search = self.search_edit.text()
+        search = self.search_edit.text().strip()
 
         self.proxy_model.set_filters(
             status=status if status != "All" else None,
             priority=priority if priority != "All" else None,
-            search=search if search else None
+            search=search or None,
+            kpi_filter=self._kpi_filter,
         )
 
-        # Show/hide empty state
-        row_count = self.proxy_model.rowCount()
-        if row_count == 0:
-            if self.table_model.rowCount():
-                self.empty_label.setText("No cases match the current filters.")
+        visible = self.proxy_model.rowCount()
+        total = self.table_model.rowCount()
+        kpi_note = {
+            "active": " · Open and active",
+            "needs_attention": " · Needs attention",
+        }.get(self._kpi_filter, "")
+        self.results_label.setText(f"Showing {visible} of {total} cases{kpi_note}")
+        filtered = bool(search or status != "All" or priority != "All" or self._kpi_filter)
+        self.clear_filters_btn.setEnabled(filtered)
+
+        if visible == 0:
+            if total:
+                self.empty_label.setText(
+                    "No cases match these filters. Clear the filters to see all accessible cases."
+                )
+            elif self.current_user and self.current_user.role == UserRole.READ_ONLY:
+                self.empty_label.setText("No cases are assigned to your account.")
             else:
-                self.empty_label.setText("No cases yet. Click + New Case to create one.")
+                self.empty_label.setText("No cases yet. Create a case to begin an investigation.")
             self.table_view.hide()
             self.empty_label.show()
         else:
             self.table_view.show()
             self.empty_label.hide()
 
+    def clear_filters(self) -> None:
+        """Reset text, dropdown and KPI filters together."""
+        self._kpi_filter = None
+        self.search_edit.clear()
+        self.status_filter.setCurrentText("All")
+        self.priority_filter.setCurrentText("All")
+        self._apply_filters()
+
     def set_search_text(self, text: str) -> None:
-        """Set search text from header and trigger filter."""
+        """Set header search text and bring matching cases into view."""
+        self._kpi_filter = None
         self.search_edit.setText(text)
         self._apply_filters()
 
-    def _on_search_changed(self, text: str):
+    def _on_search_changed(self, _text: str) -> None:
+        self._kpi_filter = None
         self._apply_filters()
 
-    def _on_stat_card_clicked(self, key: str):
-        """Filter table when a stat card is clicked."""
-        status_map = {
-            "total": "All",
-            "active": "active",
-            "on_hold": "on_hold",
-            "closed": "closed",
-            "needs_attention": "high",  # This would need special handling
-        }
-        if key in status_map:
-            self.status_filter.setCurrentText(status_map[key])
-            self._apply_filters()
+    def _on_stat_card_clicked(self, key: str) -> None:
+        """Apply the exact KPI metric as a selectable case filter."""
+        self.clear_filters()
+        if key in ("active", "needs_attention"):
+            self._kpi_filter = key
+        else:
+            status_map = {
+                "on_hold": "on_hold",
+                "closed": "closed",
+            }
+            self.status_filter.setCurrentText(status_map.get(key, "All"))
+        self._apply_filters()
 
     def _export_cases_selected(self):
         """Export selected cases to CSV."""

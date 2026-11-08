@@ -201,6 +201,9 @@ class GlobalShell(QWidget):
         guard in ``show_page_by_key`` change with the role.
         """
         self._user = user
+        # Keep case rows and actions synchronized across logout / re-login.
+        # Previously the page kept the prior user's rows while signed out.
+        self.case_mgmt_page.set_user(user)
         is_admin = self._is_admin(user)
 
         self._visible_keys = [

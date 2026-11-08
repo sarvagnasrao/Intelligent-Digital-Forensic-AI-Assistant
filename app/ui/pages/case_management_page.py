@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from app.auth.models import User, UserRole
 from app.cases.service import CaseService
-from app.ui.base import ResponsivePage, StatCard
+from app.ui.base import OutlineIcon, ResponsivePage, StatCard
 from app.ui.theme.tokens import Color, Spacing, Typography
 from app.util.time import format_local_date
 
@@ -474,14 +474,29 @@ class CaseManagementPage(ResponsivePage):
         self.table_view.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self.table_view, 1)
 
-        # Empty state label (shown when no cases)
-        self.empty_label = QLabel("No cases yet. Click + New Case to create one.")
+        # Helpful empty state for a new workspace or filters with no matches.
+        self.empty_state = QFrame()
+        self.empty_state.setObjectName("CaseEmptyState")
+        empty_layout = QVBoxLayout(self.empty_state)
+        empty_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.setSpacing(Spacing.MD)
+        icon = OutlineIcon("folder")
+        icon.setFixedSize(40, 40)
+        empty_layout.addWidget(icon, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.empty_title = QLabel("Your investigation workspace")
+        self.empty_title.setObjectName("CaseEmptyTitle")
+        self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(self.empty_title)
+        self.empty_label = QLabel("No cases yet. Create a case to begin an investigation.")
         self.empty_label.setObjectName("EmptyStateMessage")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setWordWrap(True)
-        self.empty_label.setStyleSheet(f"color: {Color.TEXT_MUTED.name()}; font-size: 14px; padding: 48px;")
-        self.empty_label.hide()
-        layout.addWidget(self.empty_label, 1)
+        empty_layout.addWidget(self.empty_label)
+        self.empty_action_btn = QPushButton("Create Case")
+        self.empty_action_btn.clicked.connect(self._on_new_case)
+        empty_layout.addWidget(self.empty_action_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        self.empty_state.hide()
+        layout.addWidget(self.empty_state, 1)
 
     def _arrange_toolbar(self, compact: bool):
         if compact == self._compact_layout:
@@ -506,6 +521,7 @@ class CaseManagementPage(ResponsivePage):
         self.current_user = user
         self.archived_cases_btn.setVisible(bool(user and user.is_active and user.role == UserRole.ADMIN))
         self.new_case_btn.setVisible(bool(user and user.is_active and user.role != UserRole.READ_ONLY))
+        self.empty_action_btn.setVisible(bool(user and user.is_active and user.role != UserRole.READ_ONLY))
 
     def set_case_service(self, service: CaseService):
         self.case_service = service
@@ -555,18 +571,38 @@ class CaseManagementPage(ResponsivePage):
 
         if visible == 0:
             if total:
+                self.empty_title.setText("No matching cases")
                 self.empty_label.setText(
-                    "No cases match these filters. Clear the filters to see all accessible cases."
+                    "Try a different search or clear the current filters."
                 )
-            elif self.current_user and self.current_user.role == UserRole.READ_ONLY:
-                self.empty_label.setText("No cases are assigned to your account.")
+                self.empty_action_btn.setText("Clear filters")
+                self.empty_action_btn.setVisible(True)
+                try:
+                    self.empty_action_btn.clicked.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self.empty_action_btn.clicked.connect(self.clear_filters)
             else:
-                self.empty_label.setText("No cases yet. Create a case to begin an investigation.")
+                self.empty_title.setText("Your investigation workspace")
+                if self.current_user and self.current_user.role == UserRole.READ_ONLY:
+                    self.empty_label.setText("No cases are assigned to your account yet.")
+                    self.empty_action_btn.setVisible(False)
+                else:
+                    self.empty_label.setText(
+                        "Create your first case to organize evidence and start an investigation."
+                    )
+                    self.empty_action_btn.setText("Create Case")
+                    self.empty_action_btn.setVisible(True)
+                try:
+                    self.empty_action_btn.clicked.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                self.empty_action_btn.clicked.connect(self._on_new_case)
             self.table_view.hide()
-            self.empty_label.show()
+            self.empty_state.show()
         else:
             self.table_view.show()
-            self.empty_label.hide()
+            self.empty_state.hide()
 
     def clear_filters(self) -> None:
         """Reset text, dropdown and KPI filters together."""

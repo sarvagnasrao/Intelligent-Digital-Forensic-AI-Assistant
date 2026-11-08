@@ -549,6 +549,9 @@ class StatCard(ThemedWidget, QFrame):
         # cards to expand naturally on wider screens.
         self.setMinimumWidth(150)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName(f"{title}: {value}")
+        self.setAccessibleDescription(f"Activate to filter by {title.lower()}")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
@@ -601,6 +604,14 @@ class StatCard(ThemedWidget, QFrame):
 
     def set_value(self, value: str):
         self.value_label.setText(value)
+        self.setAccessibleName(f"{self.title_label.text()}: {value}")
+
+    def keyPressEvent(self, event):  # noqa: N802 - Qt override
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

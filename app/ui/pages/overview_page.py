@@ -152,7 +152,10 @@ class OverviewPage(ResponsivePage):
             "indexed": StatCard("Indexed / searchable text", "0/0", "🔍", Color.WARNING),
         }
         for index, card in enumerate(self.stat_cards.values()):
+            # Overview KPIs are summaries, not filter controls.
             card.setCursor(Qt.CursorShape.ArrowCursor)
+            card.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            card.setAccessibleDescription("Read-only investigation metric")
             card.value_label.setFont(
                 QFont(Typography.FONT_FAMILY, Typography.HEADING_MD[0], QFont.Weight.Bold)
             )

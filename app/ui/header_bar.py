@@ -75,14 +75,15 @@ class AppHeaderBar(ThemedWidget, QWidget):
         self._search_edit = QLineEdit()
         self._search_edit.setObjectName("GlobalSearch")
         self._search_edit.setPlaceholderText(
-            "Search cases, evidence, artifacts..."
+            "Search cases…   Ctrl+K"
         )
         self._search_edit.setMinimumWidth(160)
         self._search_edit.setMaximumWidth(340)
         self._search_edit.setFixedHeight(38)
+        self._search_edit.setAccessibleName("Find cases")
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.setToolTip(
-            "Search across cases, evidence and artifacts"
+            "Search accessible cases by ID, title, priority or investigator (Ctrl+K)"
         )
         self._search_edit.returnPressed.connect(self._on_search_return)
 

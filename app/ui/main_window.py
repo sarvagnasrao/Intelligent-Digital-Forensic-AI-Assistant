@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtGui import QColor, QPen
+from PySide6.QtGui import QColor, QKeySequence, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QLineEdit,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QStyleOptionViewItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +34,7 @@ from app.ui.base import (
     SidebarWidget,
 )
 from app.ui.header_bar import AppHeaderBar
+from app.ui.quick_switcher import QuickSwitcher
 from app.ui.pages import (
     AIAnalysisPage,
     ArtifactsSearchPage,
@@ -199,6 +201,9 @@ class GlobalShell(QWidget):
         guard in ``show_page_by_key`` change with the role.
         """
         self._user = user
+        # Keep case rows and actions synchronized across logout / re-login.
+        # Previously the page kept the prior user's rows while signed out.
+        self.case_mgmt_page.set_user(user)
         is_admin = self._is_admin(user)
 
         self._visible_keys = [
@@ -853,6 +858,19 @@ class MainWindow(QMainWindow):
         self.nav_controller = NavigationController(self)
         self.nav_controller.logged_out.connect(self._on_logged_out)
 
+        # Discoverable, role-aware navigation from every application page.
+        self._quick_switch_shortcut = QShortcut(QKeySequence("Ctrl+Shift+P"), self)
+        self._quick_switch_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._quick_switch_shortcut.activated.connect(self._open_quick_switcher)
+        self.quick_navigation_btn = QToolButton(self)
+        self.quick_navigation_btn.setObjectName("QuickNavigationButton")
+        self.quick_navigation_btn.setText("Quick navigation   Ctrl+Shift+P")
+        self.quick_navigation_btn.setAccessibleName("Open quick navigation")
+        self.quick_navigation_btn.setToolTip("Find and open a workspace (Ctrl+Shift+P)")
+        self.quick_navigation_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.quick_navigation_btn.clicked.connect(self._open_quick_switcher)
+        self.status_bar.addPermanentWidget(self.quick_navigation_btn)
+
         # Background refresh: reloads whatever page is open on the interval
         # chosen in Settings instead of leaving the value unused.
         self.auto_refresh = AutoRefreshController(
@@ -868,6 +886,46 @@ class MainWindow(QMainWindow):
         # Widgets are built in English, so a non-default language has to be
         # applied to them once they exist.
         self.nav_controller.retranslate()
+
+    def _open_quick_switcher(self) -> None:
+        """Show only routes authorized by the active navigation shell."""
+        if QApplication.activeModalWidget() is not None:
+            return  # Never stack navigation over password or confirmation dialogs.
+        nav = self.nav_controller
+        if nav.get_current_user() is None:
+            return
+        in_case = nav._stack.currentWidget() is nav.case_shell
+        entries: list[tuple[str, str, str]] = []
+
+        if in_case:
+            entries.append(("global:cases", "All cases", "Return to case management"))
+            entries.extend(
+                (f"case:{key}", title, "Current investigation workspace")
+                for key, title in _CASE_PAGES
+            )
+            entries.extend(
+                (f"global:{key}", _PAGE_TITLES[key], "Application workspace")
+                for key in nav.global_shell._visible_keys
+                if key != "cases"
+            )
+        else:
+            entries.extend(
+                (f"global:{key}", _PAGE_TITLES[key], "Application workspace")
+                for key in nav.global_shell._visible_keys
+            )
+
+        dialog = QuickSwitcher(entries, parent=self)
+        if dialog.exec() != QuickSwitcher.DialogCode.Accepted:
+            return
+        route = dialog.selected_route
+        if not route:
+            return
+        scope, _, key = route.partition(":")
+        if scope == "case" and in_case and key in dict(_CASE_PAGES):
+            nav.case_shell.show_page_by_key(key)
+        elif scope == "global" and key in nav.global_shell._visible_keys:
+            nav.show_global()
+            nav.global_shell.show_page_by_key(key)
 
     def _apply_ui_settings(self) -> None:
         """Push the saved General settings into the live UI."""

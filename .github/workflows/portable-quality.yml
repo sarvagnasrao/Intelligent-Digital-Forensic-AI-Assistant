@@ -33,3 +33,25 @@ jobs:
       - name: Run isolation and configuration regression tests
         run: |
           python -m pytest -q tests/test_worker_examination_serialization.py tests/test_dpapi_fail_closed.py tests/test_password_security.py tests/test_case_archive_service.py tests/test_db_schema.py tests/test_config.py
+
+  gui-offscreen:
+    name: Windows offscreen GUI smoke (Python 3.12)
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install desktop UI and portable test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest PySide6 fastapi httpx pydantic pydantic-settings PyYAML sqlalchemy alembic jinja2 psutil reportlab 'python-jose[cryptography]'
+      - name: Compile UI sources
+        run: python -m compileall -q app/ui tests
+      - name: Exercise Qt navigation and case dashboard offscreen
+        run: |
+          python -m pytest -q tests/test_gui_quick_switcher.py tests/test_gui_case_dashboard.py tests/test_gui_state_stack.py tests/test_case_management_actions.py

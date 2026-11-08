@@ -331,6 +331,7 @@ class CaseManagementPage(ResponsivePage):
         self.current_user: User | None = None
         self._cases_cache: list = []
         self._kpi_filter: str | None = None
+        self._empty_action_clears_filters = False
         
 
     def _setup_layout(self):
@@ -493,7 +494,7 @@ class CaseManagementPage(ResponsivePage):
         self.empty_label.setWordWrap(True)
         empty_layout.addWidget(self.empty_label)
         self.empty_action_btn = QPushButton("Create Case")
-        self.empty_action_btn.clicked.connect(self._on_new_case)
+        self.empty_action_btn.clicked.connect(self._on_empty_action)
         empty_layout.addWidget(self.empty_action_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         self.empty_state.hide()
         layout.addWidget(self.empty_state, 1)
@@ -577,11 +578,7 @@ class CaseManagementPage(ResponsivePage):
                 )
                 self.empty_action_btn.setText("Clear filters")
                 self.empty_action_btn.setVisible(True)
-                try:
-                    self.empty_action_btn.clicked.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                self.empty_action_btn.clicked.connect(self.clear_filters)
+                self._empty_action_clears_filters = True
             else:
                 self.empty_title.setText("Your investigation workspace")
                 if self.current_user and self.current_user.role == UserRole.READ_ONLY:
@@ -593,16 +590,19 @@ class CaseManagementPage(ResponsivePage):
                     )
                     self.empty_action_btn.setText("Create Case")
                     self.empty_action_btn.setVisible(True)
-                try:
-                    self.empty_action_btn.clicked.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                self.empty_action_btn.clicked.connect(self._on_new_case)
+                self._empty_action_clears_filters = False
             self.table_view.hide()
             self.empty_state.show()
         else:
             self.table_view.show()
             self.empty_state.hide()
+
+    def _on_empty_action(self) -> None:
+        """Use the empty-state action without repeatedly reconnecting signals."""
+        if self._empty_action_clears_filters:
+            self.clear_filters()
+        else:
+            self._on_new_case()
 
     def clear_filters(self) -> None:
         """Reset text, dropdown and KPI filters together."""
